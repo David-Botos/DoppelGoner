@@ -1,0 +1,30 @@
+{
+    "name": "rds-migration",
+    "version": "1.0.0",
+    "description": "Snowflake to RDS migration tool for HSDS data",
+    "main": "dist/index.js",
+    "scripts": {
+        "build": "tsc",
+        "start": "node dist/index.js",
+        "migrate": "node dist/index.js",
+        "validate": "node dist/scripts/validate-migration.js",
+        "setup-db": "psql -h $PG_HOST -U $PG_USER -d $PG_DATABASE -f scripts/setup-postgres.sql"
+    },
+    "dependencies": {
+        "@supabase/supabase-js": "^2.49.1",
+        "dotenv": "^16.0.3",
+        "pg": "^8.9.0",
+        "snowflake-sdk": "^1.6.21",
+        "winston": "^3.8.2"
+    },
+    "devDependencies": {
+        "@types/node": "^18.19.81",
+        "@types/pg": "^8.6.6",
+        "@types/snowflake-sdk": "^1.6.12",
+        "ts-node": "^10.9.2",
+        "typescript": "^5.8.2"
+    },
+    "engines": {
+        "node": ">=16.0.0"
+    }
+}
