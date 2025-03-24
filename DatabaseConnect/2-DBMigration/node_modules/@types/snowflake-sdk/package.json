@@ -1,0 +1,43 @@
+{
+    "name": "@types/snowflake-sdk",
+    "version": "1.6.24",
+    "description": "TypeScript definitions for snowflake-sdk",
+    "homepage": "https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/snowflake-sdk",
+    "license": "MIT",
+    "contributors": [
+        {
+            "name": "Hunter Tunnicliff",
+            "githubUsername": "htunnicliff",
+            "url": "https://github.com/htunnicliff"
+        },
+        {
+            "name": "Mauricio Rojas",
+            "githubUsername": "orellabac",
+            "url": "https://github.com/orellabac"
+        },
+        {
+            "name": "Ron Jones",
+            "githubUsername": "boatilus",
+            "url": "https://github.com/boatilus"
+        },
+        {
+            "name": "Brian Gottfried",
+            "githubUsername": "briangottfried",
+            "url": "https://github.com/briangottfried"
+        }
+    ],
+    "main": "",
+    "types": "index.d.ts",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/DefinitelyTyped/DefinitelyTyped.git",
+        "directory": "types/snowflake-sdk"
+    },
+    "scripts": {},
+    "dependencies": {
+        "@types/node": "*",
+        "generic-pool": "^3.9.0"
+    },
+    "typesPublisherContentHash": "dd04836fbc3c4cfabdbf2188f0d816c756c4ac9113660b7449d1d8186a728c3f",
+    "typeScriptVersion": "4.7"
+}
