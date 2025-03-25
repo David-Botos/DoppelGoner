@@ -1,5 +1,5 @@
 // Utility class for ID conversion
-class IdConverter {
+export class IdConverter {
   private idCache = new Map<string, string>();
 
   constructor(private namespace: string = "migration") {}

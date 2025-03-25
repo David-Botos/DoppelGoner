@@ -1,23 +1,26 @@
 "use strict";
-// Configuration file for database connections and migration settings
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.migrationConfig = exports.postgresConfig = exports.snowflakeConfig = void 0;
+exports.migrationConfig = exports.supabaseConfig = exports.snowflakeConfig = void 0;
+// Configuration file for database connections and migration settings
+const dotenv_1 = __importDefault(require("dotenv"));
+dotenv_1.default.config();
 // Database connection configurations
 exports.snowflakeConfig = {
     account: process.env.SNOWFLAKE_ACCOUNT || "",
-    username: process.env.SNOWFLAKE_USERNAME || "",
+    username: process.env.SNOWFLAKE_USER || "",
     password: process.env.SNOWFLAKE_PASSWORD || "",
     warehouse: process.env.SNOWFLAKE_WAREHOUSE || "",
     database: "NORSE_STAGING",
     schema: "WA211",
+    authenticator: "SNOWFLAKE",
 };
-exports.postgresConfig = {
-    host: process.env.PG_HOST || "localhost",
-    port: parseInt(process.env.PG_PORT || "5432"),
-    database: process.env.PG_DATABASE || "hsds_migration",
-    user: process.env.PG_USER || "postgres",
-    password: process.env.PG_PASSWORD || "",
-    ssl: process.env.PG_SSL === "true",
+exports.supabaseConfig = {
+    url: process.env.SUPABASE_URL || "",
+    key: process.env.SUPABASE_SERVICE_ROLE_KEY || "",
+    schema: "public",
 };
 // Migration configuration
 exports.migrationConfig = {
@@ -30,12 +33,7 @@ exports.migrationConfig = {
         "location",
         "service",
         "service_at_location",
-        "physical_address",
-        "postal_address",
+        "address", // Consolidated address table (replacing physical_address & postal_address)
         "phone",
     ],
-    // Additional validation rules for each table
-    validationRules: {
-    // Define rules per table
-    },
 };

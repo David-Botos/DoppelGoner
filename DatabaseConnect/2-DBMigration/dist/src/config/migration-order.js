@@ -7,33 +7,34 @@ const config_1 = require("./config");
 // Define the dependencies for each table
 exports.tableDependencies = [
     {
-        table: 'organization',
-        dependencies: [] // No dependencies
+        table: "organization",
+        dependencies: [], // No dependencies
     },
     {
-        table: 'location',
-        dependencies: ['organization']
+        table: "location",
+        dependencies: ["organization"],
     },
     {
-        table: 'service',
-        dependencies: ['organization']
+        table: "service",
+        dependencies: ["organization"],
     },
     {
-        table: 'service_at_location',
-        dependencies: ['service', 'location']
+        table: "service_at_location",
+        dependencies: ["service", "location"],
     },
     {
-        table: 'physical_address',
-        dependencies: ['location']
+        table: "address", // Consolidated address table
+        dependencies: ["location"],
     },
     {
-        table: 'postal_address',
-        dependencies: ['location']
+        table: "phone",
+        dependencies: [
+            "location",
+            "service",
+            "organization",
+            "service_at_location",
+        ],
     },
-    {
-        table: 'phone',
-        dependencies: ['location', 'service', 'organization', 'service_at_location']
-    }
 ];
 // Validate the migration order defined in config
 function validateMigrationOrder() {
@@ -42,7 +43,7 @@ function validateMigrationOrder() {
     const migratedTables = new Set();
     for (const table of tables) {
         // Find the dependencies for this table
-        const dependency = exports.tableDependencies.find(d => d.table === table);
+        const dependency = exports.tableDependencies.find((d) => d.table === table);
         if (!dependency) {
             console.error(`No dependency information found for table: ${table}`);
             return false;

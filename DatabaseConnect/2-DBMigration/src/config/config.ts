@@ -1,5 +1,6 @@
 // Configuration file for database connections and migration settings
-
+import dotenv from "dotenv";
+dotenv.config();
 // Database connection configurations
 export const snowflakeConfig = {
   account: process.env.SNOWFLAKE_ACCOUNT || "",
@@ -31,8 +32,4 @@ export const migrationConfig = {
     "address", // Consolidated address table (replacing physical_address & postal_address)
     "phone",
   ],
-  // Additional validation rules for each table
-  validationRules: {
-    // Define rules per table
-  },
 };

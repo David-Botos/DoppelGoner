@@ -40,8 +40,6 @@ The organization table stores information about service providers.
 | description | TEXT | Organization description | No | "A non-profit organization providing food assistance to the community." |
 | email | VARCHAR(255) | Contact email | No | "info@communityfoodbank.org" |
 | url | VARCHAR(255) | Website | No | "https://www.communityfoodbank.org" |
-| tax_status | VARCHAR(255) | Tax status | No | "501(c)(3)" |
-| tax_id | VARCHAR(255) | Tax ID | No | "12-3456789" |
 | year_incorporated | CHAR(4) | Year founded | No | "1995" |
 | legal_status | VARCHAR(255) | Legal designation | No | "Non-profit corporation" |
 | parent_organization_id | CHAR(36) | Foreign key to parent org | No | "440e8400-e29b-41d4-a716-446655550000" |
@@ -464,8 +462,6 @@ ORG123456" |
   "description": "A non-profit organization providing food assistance to the community through multiple programs including a food pantry, mobile distribution, and nutrition education.",
   "email": "info@communityfoodbank.org",
   "url": "https://www.communityfoodbank.org",
-  "tax_status": "501(c)(3)",
-  "tax_id": "12-3456789",
   "year_incorporated": "1995",
   "legal_status": "Non-profit corporation",
   "parent_organization_id": null,

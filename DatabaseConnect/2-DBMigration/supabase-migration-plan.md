@@ -60,8 +60,6 @@
 | description | TEXT | ORGANIZATION_TRANSLATIONS.DESCRIPTION (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English description | |
 | email | VARCHAR(255) | ORGANIZATION.EMAIL | Direct mapping | |
 | url | VARCHAR(255) | ORGANIZATION.WEBSITE | Direct mapping | |
-| tax_status | VARCHAR(255) | NULL | New field per HSDS | |
-| tax_id | VARCHAR(255) | From ORGANIZATION_IDENTIFIER.IDENTIFIER where IDENTIFIER_TYPE='US-EIN' | Extract from identifiers | |
 | year_incorporated | CHAR(4) | ORGANIZATION.YEAR_INCORPORATED | Direct mapping | |
 | legal_status | VARCHAR(255) | ORGANIZATION.LEGAL_STATUS | Direct mapping | |
 | parent_organization_id | UUID | ORGANIZATION.PARENT_ORGANIZATION_ID | Convert to UUID format | |
@@ -192,8 +190,6 @@ CREATE TABLE organization (
   description TEXT,
   email VARCHAR(255),
   url VARCHAR(255),
-  tax_status VARCHAR(255),
-  tax_id VARCHAR(255),
   year_incorporated CHAR(4),
   legal_status VARCHAR(255),
   parent_organization_id UUID,
@@ -507,8 +503,6 @@ const transformOrganization = (data: any[]) => {
       description: translation.description,
       email: item.email,
       url: item.website,
-      tax_status: null,
-      tax_id: null, // Extract from identifiers if available
       year_incorporated: item.year_incorporated,
       legal_status: item.legal_status,
       parent_organization_id: parseUUID(item.parent_organization_id),

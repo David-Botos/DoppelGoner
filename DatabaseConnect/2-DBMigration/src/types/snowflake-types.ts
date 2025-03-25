@@ -7,8 +7,6 @@ export interface SnowflakeOrganization extends SourceData {
   ALTERNATE_NAME: string | null;
   EMAIL: string | null;
   WEBSITE: string | null;
-  TAX_STATUS: string | null;
-  TAX_ID: string | null;
   YEAR_INCORPORATED: string | null;
   LEGAL_STATUS: string | null;
   PARENT_ORGANIZATION_ID: string | null;
@@ -22,8 +20,6 @@ export interface SnowflakeOrganizationTranslation
   LOCALE: string;
   DESCRIPTION: string | null;
   IS_CANONICAL: boolean;
-  LAST_MODIFIED: string;
-  CREATED: string;
 }
 
 // Location table types
@@ -45,8 +41,6 @@ export interface SnowflakeLocationTranslation extends SourceDataTranslations {
   SHORT_DESCRIPTION: string | null;
   TRANSPORTATION: string | null;
   IS_CANONICAL: boolean;
-  LAST_MODIFIED: string;
-  CREATED: string;
 }
 
 // Service table types
@@ -76,8 +70,6 @@ export interface SnowflakeServiceTranslation extends SourceDataTranslations {
   ELIGIBILITY_DESCRIPTION: string | null;
   ALERT: string | null;
   IS_CANONICAL: boolean;
-  LAST_MODIFIED: string;
-  CREATED: string;
 }
 
 // ServiceAtLocation table types
@@ -94,8 +86,6 @@ export interface SnowflakeServiceAtLocationTranslation
   LOCALE: string;
   DESCRIPTION: string | null;
   IS_CANONICAL: boolean;
-  LAST_MODIFIED: string;
-  CREATED: string;
 }
 
 // Address table types
@@ -134,6 +124,4 @@ export interface SnowflakePhoneTranslation extends SourceDataTranslations {
   LOCALE: string;
   DESCRIPTION: string | null;
   IS_CANONICAL: boolean;
-  LAST_MODIFIED: string;
-  CREATED: string;
 }

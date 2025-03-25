@@ -2,8 +2,6 @@ import { SnowflakeClient } from "../services/snowflake-client";
 import {
   SnowflakeOrganization,
   SnowflakeOrganizationTranslation,
-  SourceData,
-  SourceDataTranslations,
 } from "../types";
 import { Extractor } from "./extractor";
 
@@ -24,13 +22,11 @@ export class OrganizationExtractor extends Extractor<
   ): Promise<SnowflakeOrganization[]> {
     const query = `
       SELECT 
-        ID as id,
+        ID,
         NAME,
         ALTERNATE_NAME,
         EMAIL,
         WEBSITE,
-        TAX_STATUS,
-        TAX_ID,
         YEAR_INCORPORATED,
         LEGAL_STATUS,
         PARENT_ORGANIZATION_ID,
@@ -54,13 +50,11 @@ export class OrganizationExtractor extends Extractor<
 
     const query = `
       SELECT 
-        ID as id,
-        ORGANIZATION_ID as parent_id,
+        ID,
+        ORGANIZATION_ID,
         LOCALE,
         DESCRIPTION,
         IS_CANONICAL,
-        LAST_MODIFIED,
-        CREATED
       FROM ${this.sourceTables.translations}
       WHERE ORGANIZATION_ID IN (${formattedIds})
       AND LOCALE = '${locale}'

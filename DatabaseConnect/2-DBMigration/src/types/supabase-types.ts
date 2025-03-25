@@ -8,11 +8,9 @@ export interface SupabaseOrganization extends MigratedData {
   description?: string;
   email?: string;
   url?: string;
-  tax_status?: string;
-  tax_id?: string;
   year_incorporated?: string;
   legal_status?: string;
-  parent_organization_id?: string;
+  parent_organization_id: string | null;
 }
 
 // Service table type
