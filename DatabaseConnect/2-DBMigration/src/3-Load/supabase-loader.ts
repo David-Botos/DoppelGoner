@@ -66,6 +66,27 @@ export class SupabaseLoader implements BaseLoader {
           );
         } else {
           successCount += batch.length;
+
+          // Track metadata for each successfully loaded record
+          for (const record of batch) {
+            try {
+              await this.trackMetadata(
+                record.id,
+                tableName,
+                "insert",
+                "all",
+                "Imported from Snowflake",
+                JSON.stringify(record),
+                "ETL Process",
+                record.original_id || null
+              );
+            } catch (metadataError) {
+              console.error(
+                `Failed to track metadata for record ${record.id}: ${metadataError}`
+              );
+              // Don't fail the whole process for metadata tracking failures
+            }
+          }
         }
       } catch (error) {
         errors.push(error instanceof Error ? error : new Error(String(error)));
@@ -118,6 +139,29 @@ export class SupabaseLoader implements BaseLoader {
         );
         successCount += result.success;
         errors.push(...result.errors);
+
+        // For successful records, track metadata
+        if (result.success > 0) {
+          for (const record of batch) {
+            try {
+              await this.trackMetadata(
+                record.id,
+                tableName,
+                "upsert",
+                "all",
+                "Imported from Snowflake",
+                JSON.stringify(record),
+                "ETL Process",
+                record.original_id || null
+              );
+            } catch (metadataError) {
+              console.error(
+                `Failed to track metadata for record ${record.id}: ${metadataError}`
+              );
+              // Don't fail the whole process for metadata tracking failures
+            }
+          }
+        }
       } catch (error) {
         errors.push(error instanceof Error ? error : new Error(String(error)));
       }
@@ -267,10 +311,50 @@ export class SupabaseLoader implements BaseLoader {
     data: Partial<TableTypes[T]>
   ): Promise<{ success: boolean; error?: string }> {
     try {
+      // First get the current record to compare values
+      const { data: existingRecord, error: fetchError } = await this.client
+        .from(tableName)
+        .select("*")
+        .eq("id", id)
+        .single();
+
+      if (fetchError) {
+        return {
+          success: false,
+          error: fetchError.message,
+        };
+      }
+
+      // Perform the update
       const { error } = await this.client
         .from(tableName)
         .update(data)
         .eq("id", id);
+
+      if (!error) {
+        // Track metadata for each changed field
+        for (const [fieldName, newValue] of Object.entries(data)) {
+          const oldValue = existingRecord[fieldName];
+
+          // Only track if the value actually changed
+          if (oldValue !== newValue) {
+            await this.trackMetadata(
+              id,
+              tableName.toString(),
+              "update",
+              fieldName,
+              oldValue !== null && oldValue !== undefined
+                ? String(oldValue)
+                : "null",
+              newValue !== null && newValue !== undefined
+                ? String(newValue)
+                : "null",
+              "ETL Process",
+              existingRecord.original_id || null
+            );
+          }
+        }
+      }
 
       return {
         success: !error,
@@ -318,6 +402,125 @@ export class SupabaseLoader implements BaseLoader {
       return {
         success: false,
         count: 0,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
+   * Track metadata for loaded records
+   * @param resourceId ID of the resource being tracked
+   * @param resourceType Type of resource (table name)
+   * @param actionType Type of action performed (insert, update, delete)
+   * @param fieldName Name of the field being modified
+   * @param previousValue Previous value of the field
+   * @param replacementValue New value of the field
+   * @param updatedBy User or process that made the change
+   * @param originalId Original ID from the source system (optional)
+   * @returns Success flag and error if any
+   */
+  async trackMetadata(
+    resourceId: string,
+    resourceType: string,
+    actionType: string,
+    fieldName: string,
+    previousValue: string,
+    replacementValue: string,
+    updatedBy: string,
+    originalId?: string
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const metadataRecord = {
+        id: crypto.randomUUID(), // Generate UUID for metadata record
+        resource_id: resourceId,
+        resource_type: resourceType,
+        last_action_date: new Date().toISOString(),
+        last_action_type: actionType,
+        field_name: fieldName,
+        previous_value: previousValue,
+        replacement_value: replacementValue,
+        updated_by: updatedBy,
+        created: new Date().toISOString(),
+        last_modified: new Date().toISOString(),
+        original_id: originalId || null,
+      };
+
+      const { error } = await this.client
+        .from("metadata")
+        .insert(metadataRecord);
+
+      return {
+        success: !error,
+        error: error?.message,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
+   * Get failed migration records for a specific table
+   * @param tableName Table name to filter by
+   * @param resolved Filter by resolution status (default: unresolved)
+   * @returns Array of failed records
+   */
+  async getFailedRecords(
+    tableName: string,
+    resolved: boolean = false
+  ): Promise<any[]> {
+    try {
+      const { data, error } = await this.client
+        .from("failed_migration_records")
+        .select("*")
+        .eq("table_name", tableName)
+        .eq("resolved", resolved)
+        .order("attempted_at", { ascending: false });
+
+      if (error) {
+        console.error(`Error fetching failed records: ${error.message}`);
+        return [];
+      }
+
+      return data || [];
+    } catch (error) {
+      console.error("Error retrieving failed records:", error);
+      return [];
+    }
+  }
+
+  /**
+   * Mark a failed record as resolved
+   * @param id ID of the failed record
+   * @param resolvedBy Person or process that resolved the issue
+   * @param notes Optional notes about the resolution
+   * @returns Success status and error if any
+   */
+  async resolveFailedRecord(
+    id: string,
+    resolvedBy: string,
+    notes?: string
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const { error } = await this.client
+        .from("failed_migration_records")
+        .update({
+          resolved: true,
+          resolved_at: new Date().toISOString(),
+          resolved_by: resolvedBy,
+          resolution_notes: notes,
+        })
+        .eq("id", id);
+
+      return {
+        success: !error,
+        error: error?.message,
+      };
+    } catch (error) {
+      return {
+        success: false,
         error: error instanceof Error ? error.message : String(error),
       };
     }

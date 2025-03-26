@@ -45,8 +45,12 @@ export class OrganizationExtractor extends Extractor<
     ids: string[],
     locale: string
   ): Promise<SnowflakeOrganizationTranslation[]> {
-    // Format the IDs for SQL IN clause
     const formattedIds = ids.map((id) => `'${id}'`).join(", ");
+    console.log(
+      "fetching translations records for ",
+      formattedIds.slice(0, 100),
+      "..."
+    );
 
     const query = `
       SELECT 
@@ -55,6 +59,7 @@ export class OrganizationExtractor extends Extractor<
         LOCALE,
         DESCRIPTION,
         IS_CANONICAL,
+        ORGANIZATION_ID as PARENT_RECORD_ID
       FROM ${this.sourceTables.translations}
       WHERE ORGANIZATION_ID IN (${formattedIds})
       AND LOCALE = '${locale}'

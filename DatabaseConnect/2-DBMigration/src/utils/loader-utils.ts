@@ -86,20 +86,48 @@ export async function upsertRecords<T extends Record<string, any>>(
   onConflict: string = "id"
 ): Promise<{ success: number; errors: Error[] }> {
   const errors: Error[] = [];
+  let successCount = 0;
 
-  try {
-    const { data, error } = await supabase
-      .from(tableName)
-      .upsert(records, { onConflict, returning: "minimal" });
+  // Process records individually instead of in batch
+  for (const record of records) {
+    try {
+      const { error } = await supabase
+        .from(tableName)
+        .upsert([record], { onConflict, returning: "minimal" });
 
-    if (error) {
-      errors.push(new Error(processSupabaseError(error, "upsert", tableName)));
-      return { success: 0, errors };
+      if (error) {
+        // Log to failed_migration_records table
+        await supabase.from("failed_migration_records").insert({
+          table_name: tableName,
+          original_id: record.original_id || null,
+          original_translations_id: record.original_translations_id || null,
+          error_message: processSupabaseError(error, "upsert", tableName),
+          attempted_record: record,
+        });
+
+        errors.push(
+          new Error(processSupabaseError(error, "upsert", tableName))
+        );
+      } else {
+        successCount++;
+      }
+    } catch (error) {
+      // Handle unexpected errors
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+
+      // Log to failed_migration_records table
+      await supabase.from("failed_migration_records").insert({
+        table_name: tableName,
+        original_id: record.original_id || null,
+        original_translations_id: record.original_translations_id || null,
+        error_message: errorMessage,
+        attempted_record: record,
+      });
+
+      errors.push(error instanceof Error ? error : new Error(String(error)));
     }
-
-    return { success: records.length, errors };
-  } catch (error) {
-    errors.push(error instanceof Error ? error : new Error(String(error)));
-    return { success: 0, errors };
   }
+
+  return { success: successCount, errors };
 }

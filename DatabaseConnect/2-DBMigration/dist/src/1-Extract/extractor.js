@@ -19,8 +19,13 @@ class Extractor {
         if (mainRecords.length > 0) {
             (0, exports.logJsonBlock)(`First record from ${this.sourceTables.main}`, mainRecords[0]);
         }
+        let ids = [];
         // Get IDs for translation lookup
-        const ids = mainRecords.map((record) => record.id);
+        for (let i = 0; i < mainRecords.length; i++) {
+            const record = mainRecords[i];
+            ids.push(record.ID);
+        }
+        console.log("These ids were mapped from mainRecords ", ids[0], ",", ids[1], "...");
         // Extract translation records for these IDs
         const translationRecords = await this.extractTranslationRecords(ids, locale);
         if (translationRecords.length > 0) {
@@ -29,15 +34,20 @@ class Extractor {
         // Organize data into a map for easy access
         const dataMap = new Map();
         mainRecords.forEach((record) => {
-            dataMap.set(record.id, {
+            dataMap.set(record.ID, {
                 main: record,
                 translations: [],
             });
         });
         translationRecords.forEach((translation) => {
-            const entry = dataMap.get(translation.PARENT_RECORD_ID);
+            // Ensure we're using the right field for joining
+            const parentId = translation.PARENT_RECORD_ID;
+            const entry = dataMap.get(parentId);
             if (entry) {
                 entry.translations.push(translation);
+            }
+            else {
+                console.log(`No matching record found for translation with parent ID: ${parentId}`);
             }
         });
         return dataMap;

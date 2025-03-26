@@ -10,7 +10,7 @@ class OrganizationTransformer extends transformer_1.Transformer {
     transformSingleRecord(source, translation) {
         const newId = (0, uuid_1.v4)();
         return {
-            ID: newId,
+            id: newId,
             name: source.NAME,
             alternate_name: source.ALTERNATE_NAME || undefined,
             description: translation?.DESCRIPTION || undefined,

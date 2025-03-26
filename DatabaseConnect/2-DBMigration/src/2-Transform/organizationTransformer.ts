@@ -22,7 +22,7 @@ export class OrganizationTransformer extends Transformer<
   ): SupabaseOrganization {
     const newId = uuidv4();
     return {
-      ID: newId,
+      id: newId,
       name: source.NAME,
       alternate_name: source.ALTERNATE_NAME || undefined,
       description: translation?.DESCRIPTION || undefined,

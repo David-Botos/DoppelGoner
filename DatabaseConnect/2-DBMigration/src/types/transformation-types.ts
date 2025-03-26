@@ -9,7 +9,8 @@ export interface SourceDataTranslations extends SourceData {
   PARENT_RECORD_ID: string;
 }
 
-export interface MigratedData extends SourceData {
+export interface MigratedData {
+  id: string;
   last_modified: string;
   created: string;
   original_id: string;

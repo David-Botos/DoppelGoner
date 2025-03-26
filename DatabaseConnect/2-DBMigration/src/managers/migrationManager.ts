@@ -106,12 +106,46 @@ export class MigrationManager {
 
       // 3. Load data into Supabase
       console.log(`Loading ${entityType} data into Supabase...`);
+      // Add this to migrationManager.ts before loading data
+      console.log(
+        "Sample transformed record:",
+        JSON.stringify(transformedData[0], null, 2)
+      );
+      
+      // In the migrateEntity method, after the upsertData call:
       const loadResult = await this.supabaseLoader.upsertData(
         entityType,
         transformedData,
         "id",
         batchSize
       );
+
+      successCount = loadResult.success;
+      failureCount = transformedData.length - loadResult.success;
+
+      // If there were failures, log them
+      if (failureCount > 0) {
+        console.warn(
+          `${failureCount} records failed to migrate. Check the failed_migration_records table.`
+        );
+
+        // Optionally, get a count of distinct error types
+        const failedRecords = await this.supabaseLoader.getFailedRecords(
+          entityType
+        );
+        const errorCounts = failedRecords.reduce((acc, record) => {
+          const error = record.error_message;
+          acc[error] = (acc[error] || 0) + 1;
+          return acc;
+        }, {});
+
+        console.log("Error frequency:");
+        Object.entries(errorCounts)
+          .sort((a, b) => (b[1] as number) - (a[1] as number))
+          .forEach(([error, count]) => {
+            console.log(`- ${count} occurrences: ${error}`);
+          });
+      }
 
       successCount = loadResult.success;
       failureCount = transformedData.length - loadResult.success;

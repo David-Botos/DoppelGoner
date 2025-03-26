@@ -40,8 +40,20 @@ export abstract class Extractor<
       );
     }
 
+    let ids: string[] = [];
     // Get IDs for translation lookup
-    const ids = mainRecords.map((record) => record.id);
+    for (let i = 0; i < mainRecords.length; i++) {
+      const record = mainRecords[i];
+      ids.push(record.ID);
+    }
+
+    console.log(
+      "These ids were mapped from mainRecords ",
+      ids[0],
+      ",",
+      ids[1],
+      "..."
+    );
 
     // Extract translation records for these IDs
     const translationRecords = await this.extractTranslationRecords(
@@ -59,16 +71,22 @@ export abstract class Extractor<
     const dataMap = new Map<string, { main: S; translations: T[] }>();
 
     mainRecords.forEach((record) => {
-      dataMap.set(record.id, {
+      dataMap.set(record.ID, {
         main: record,
         translations: [],
       });
     });
 
     translationRecords.forEach((translation) => {
-      const entry = dataMap.get(translation.PARENT_RECORD_ID);
+      // Ensure we're using the right field for joining
+      const parentId = translation.PARENT_RECORD_ID;
+      const entry = dataMap.get(parentId);
       if (entry) {
         entry.translations.push(translation);
+      } else {
+        console.log(
+          `No matching record found for translation with parent ID: ${parentId}`
+        );
       }
     });
 

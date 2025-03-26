@@ -58,6 +58,29 @@ export interface BaseLoader {
   tableExists(tableName: string): Promise<boolean>;
 
   /**
+   * Track metadata for loaded records
+   * @param resourceId ID of the resource being tracked
+   * @param resourceType Type of resource (table name)
+   * @param actionType Type of action performed (insert, update, delete)
+   * @param fieldName Name of the field being modified (optional for inserts)
+   * @param previousValue Previous value of the field ('Imported from Snowflake' for new records)
+   * @param replacementValue New value of the field
+   * @param updatedBy User or process that made the change
+   * @param originalId Original ID from the source system (optional)
+   * @returns Success flag and error if any
+   */
+  trackMetadata(
+    resourceId: string,
+    resourceType: string,
+    actionType: string,
+    fieldName: string,
+    previousValue: string,
+    replacementValue: string,
+    updatedBy: string,
+    originalId?: string
+  ): Promise<{ success: boolean; error?: string }>;
+
+  /**
    * Close the loader and free resources
    */
   close(): void;
