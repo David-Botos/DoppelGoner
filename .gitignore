@@ -1,3 +1,5 @@
 .env
 .DS_Store
 DatabaseConnect/1-Prep/Context/*.md
+**/dist/**
+DatabaseConnect/2-DBMigration/snowflake.log
