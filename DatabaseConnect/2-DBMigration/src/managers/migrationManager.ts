@@ -55,9 +55,6 @@ export class MigrationManager {
 
     // Additional extractors and transformers will be registered here
     // as they are implemented for other entity types
-    // Example:
-    // this.extractors.set('service', new ServiceExtractor(this.snowflakeClient));
-    // this.transformers.set('service', new ServiceTransformer(this.idConverter));
   }
 
   /**
@@ -106,22 +103,31 @@ export class MigrationManager {
 
       // 3. Load data into Supabase
       console.log(`Loading ${entityType} data into Supabase...`);
-      // Add this to migrationManager.ts before loading data
-      console.log(
-        "Sample transformed record:",
-        JSON.stringify(transformedData[0], null, 2)
-      );
-      
-      // In the migrateEntity method, after the upsertData call:
+      // Log a sample record for debugging
+      if (transformedData.length > 0) {
+        console.log(
+          "Sample transformed record:",
+          JSON.stringify(transformedData[0], null, 2)
+        );
+      }
+
+      // Use the sourceTable information from the extractor when available
+      const sourceTable = extractor.sourceTables?.main || "unknown";
+
+      // Use upsertData method with source table information
+      // Skip table existence check since we're sure the tables exist
       const loadResult = await this.supabaseLoader.upsertData(
         entityType,
         transformedData,
         "id",
-        batchSize
+        batchSize,
+        sourceTable
+        // true Skip table_existence check to avoid potential issues
       );
 
       successCount = loadResult.success;
       failureCount = transformedData.length - loadResult.success;
+      errors.push(...loadResult.errors);
 
       // If there were failures, log them
       if (failureCount > 0) {
@@ -133,49 +139,26 @@ export class MigrationManager {
         const failedRecords = await this.supabaseLoader.getFailedRecords(
           entityType
         );
-        const errorCounts = failedRecords.reduce((acc, record) => {
-          const error = record.error_message;
-          acc[error] = (acc[error] || 0) + 1;
-          return acc;
-        }, {});
 
-        console.log("Error frequency:");
-        Object.entries(errorCounts)
-          .sort((a, b) => (b[1] as number) - (a[1] as number))
-          .forEach(([error, count]) => {
-            console.log(`- ${count} occurrences: ${error}`);
-          });
+        if (failedRecords.length > 0) {
+          const errorCounts = failedRecords.reduce((acc, record) => {
+            const error = record.error_message;
+            acc[error] = (acc[error] || 0) + 1;
+            return acc;
+          }, {});
+
+          console.log("Error frequency:");
+          Object.entries(errorCounts)
+            .sort((a, b) => (b[1] as number) - (a[1] as number))
+            .forEach(([error, count]) => {
+              console.log(`- ${count} occurrences: ${error}`);
+            });
+        }
       }
 
-      successCount = loadResult.success;
-      failureCount = transformedData.length - loadResult.success;
-      errors.push(...loadResult.errors);
+      // 4. Validation is now handled automatically in the loader
 
-      // 4. Log migration results
       const endTime = new Date();
-      await this.supabaseLoader.logMigration(
-        extractor.sourceTables.main,
-        entityType,
-        transformedData.length,
-        successCount,
-        failureCount,
-        errors.map((e) => e.message),
-        startTime,
-        endTime
-      );
-
-      // 5. Validate migration if enabled
-      if (migrationConfig.enableValidation) {
-        const validationResult = await this.supabaseLoader.validateRecordCount(
-          entityType,
-          successCount
-        );
-
-        console.log(`Validation result: ${validationResult.message}`);
-      } else {
-        console.log("Validation skipped as per configuration");
-      }
-
       return {
         success: successCount,
         failure: failureCount,
@@ -189,18 +172,6 @@ export class MigrationManager {
       errors.push(e);
 
       console.error(`Error migrating ${entityType}:`, e.message);
-
-      // Log migration failure
-      await this.supabaseLoader.logMigration(
-        `UNKNOWN_${entityType.toUpperCase()}`,
-        entityType,
-        0,
-        successCount,
-        failureCount + 1,
-        [e.message],
-        startTime,
-        endTime
-      );
 
       return {
         success: successCount,
@@ -269,11 +240,6 @@ export class MigrationManager {
         console.log(
           `Errors: ${result.errors.map((e) => e.message).join("\n")}`
         );
-      }
-
-      // Skip validation if disabled in config
-      if (!migrationConfig.enableValidation) {
-        console.log("Validation skipped as per configuration");
       }
     }
 

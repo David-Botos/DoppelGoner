@@ -1,75 +1,124 @@
-// Base loader interface for data loading
-import { MigratedData } from "../types/transformation-types";
-
 /**
- * Base interface for data loaders
+ * Base abstract class for data loaders
+ * Provides core functionality and common patterns while allowing specific implementations
  */
-export interface BaseLoader {
+export abstract class BaseLoader {
   /**
-   * Load data into a destination system
-   * @param tableName The name of the table to load data into
-   * @param data The transformed data to load
-   * @returns Result with success count and any errors
+   * Core method to load data into a destination table
+   * (to be implemented by specific loader implementations)
    */
-  loadData<T extends Record<string, any>>(
+  protected abstract loadDataInternal<T extends Record<string, any>>(
     tableName: string,
     data: T[],
     batchSize?: number
   ): Promise<{ success: number; errors: Error[] }>;
 
   /**
-   * Log the migration progress
-   * @param sourceTable Source table
-   * @param targetTable Target table
-   * @param recordsMigrated Total number of records attempted to migrate
-   * @param successCount Number of records successfully migrated
-   * @param failureCount Number of records that failed to migrate
-   * @param errorMessages Error messages if any
-   * @param startTime Start time of the migration
-   * @param endTime End time of the migration
+   * Check if a table exists in the destination system
    */
-  logMigration(
-    sourceTable: string,
-    targetTable: string,
-    recordsMigrated: number,
-    successCount: number,
-    failureCount: number,
-    errorMessages: string[],
-    startTime: Date,
-    endTime: Date
-  ): Promise<void>;
+  abstract tableExists(tableName: string): Promise<boolean>;
 
   /**
-   * Validate loaded data
-   * @param tableName Table to validate
-   * @param expectedCount Expected number of records
-   * @returns Validation result
+   * Close the loader and free resources
    */
-  validateRecordCount(
+  abstract close(): void;
+
+  /**
+   * Standard method for loading data with consistent pre/post processing
+   * This provides the public API with error handling and logging
+   */
+  async loadData<T extends Record<string, any>>(
+    tableName: string,
+    data: T[],
+    batchSize: number = 100,
+    sourceTable: string = "unknown",
+    skipTableCheck: boolean = false
+  ): Promise<{ success: number; errors: Error[] }> {
+    // Pre-processing logic (validation, logging start)
+    const startTime = new Date();
+
+    try {
+      // Verify table exists before attempting to load (if not skipped)
+      if (!skipTableCheck) {
+        const exists = await this.tableExists(tableName);
+        if (!exists) {
+          throw new Error(
+            `Table ${tableName} does not exist in the destination system`
+          );
+        }
+      }
+
+      // Call the implementation-specific loading method
+      const result = await this.loadDataInternal(tableName, data, batchSize);
+
+      // Post-processing logic (logging completion)
+      const endTime = new Date();
+      await this.logMigration(
+        sourceTable,
+        tableName,
+        data.length,
+        result.success,
+        data.length - result.success,
+        result.errors.map((e) => e.message),
+        startTime,
+        endTime
+      );
+
+      return result;
+    } catch (error) {
+      // Error handling
+      const endTime = new Date();
+      const e = error instanceof Error ? error : new Error(String(error));
+
+      await this.logMigration(
+        sourceTable,
+        tableName,
+        data.length,
+        0,
+        data.length,
+        [e.message],
+        startTime,
+        endTime
+      );
+
+      return { success: 0, errors: [e] };
+    }
+  }
+
+  /**
+   * Load data with upserting behavior (insert or update)
+   * Default implementation calls loadDataInternal, but can be overridden
+   * for database-specific optimizations
+   */
+  async upsertData<T extends Record<string, any>>(
+    tableName: string,
+    data: T[],
+    onConflict: string = "id",
+    batchSize: number = 100,
+    sourceTable: string = "unknown",
+    skipTableCheck: boolean = false
+  ): Promise<{ success: number; errors: Error[] }> {
+    return this.loadData(
+      tableName,
+      data,
+      batchSize,
+      sourceTable,
+      skipTableCheck
+    );
+  }
+
+  /**
+   * Validate loaded data by comparing record counts
+   */
+  abstract validateRecordCount(
     tableName: string,
     expectedCount: number
   ): Promise<{ success: boolean; message: string }>;
 
   /**
-   * Check if a table exists
-   * @param tableName Table name to check
-   * @returns Boolean indicating if the table exists
-   */
-  tableExists(tableName: string): Promise<boolean>;
-
-  /**
    * Track metadata for loaded records
-   * @param resourceId ID of the resource being tracked
-   * @param resourceType Type of resource (table name)
-   * @param actionType Type of action performed (insert, update, delete)
-   * @param fieldName Name of the field being modified (optional for inserts)
-   * @param previousValue Previous value of the field ('Imported from Snowflake' for new records)
-   * @param replacementValue New value of the field
-   * @param updatedBy User or process that made the change
-   * @param originalId Original ID from the source system (optional)
-   * @returns Success flag and error if any
    */
-  trackMetadata(
+  abstract trackMetadata(
     resourceId: string,
     resourceType: string,
     actionType: string,
@@ -81,7 +130,16 @@ export interface BaseLoader {
   ): Promise<{ success: boolean; error?: string }>;
 
   /**
-   * Close the loader and free resources
+   * Log the migration progress
    */
-  close(): void;
+  abstract logMigration(
+    sourceTable: string,
+    targetTable: string,
+    recordsMigrated: number,
+    successCount: number,
+    failureCount: number,
+    errorMessages: string[],
+    startTime: Date,
+    endTime: Date
+  ): Promise<void>;
 }
