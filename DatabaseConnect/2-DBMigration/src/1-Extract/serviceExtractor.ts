@@ -1,56 +1,55 @@
 import { SnowflakeClient } from "../services/snowflake-client";
-import {
-  SnowflakeOrganization,
-  SnowflakeOrganizationTranslation,
-} from "../types";
+import { SnowflakeService, SnowflakeServiceTranslation } from "../types";
 import { Extractor } from "./extractor";
 
-export class OrganizationExtractor extends Extractor<
-  SnowflakeOrganization,
-  SnowflakeOrganizationTranslation
+export class ServiceExtractor extends Extractor<
+  SnowflakeService,
+  SnowflakeServiceTranslation
 > {
   constructor(protected snowflakeClient: SnowflakeClient) {
     super(snowflakeClient, {
-      main: "ORGANIZATION",
-      translations: "ORGANIZATION_TRANSLATIONS",
+      main: "SERVICE",
+      translations: "SERVICE_TRANSLATIONS",
     });
   }
 
   async extractMainRecords(
     offset: number,
     limit?: number
-  ): Promise<SnowflakeOrganization[]> {
+  ): Promise<SnowflakeService[]> {
     // Start building the base query without LIMIT or OFFSET
     let query = `
       SELECT 
         ID,
-        NAME,
-        ALTERNATE_NAME,
+        ORGANIZATION_ID,
+        PROGRAM_ID,
+        URL,
         EMAIL,
-        WEBSITE,
-        YEAR_INCORPORATED,
-        LEGAL_STATUS,
-        PARENT_ORGANIZATION_ID,
+        STATUS,
+        MINIMUM_AGE,
+        MAXIMUM_AGE,
+        ORIGINAL_ID,
         LAST_MODIFIED,
-        CREATED
+        CREATED,
+        PRIORITY
       FROM ${this.sourceTables.main}
       ORDER BY CREATED DESC`;
 
     // Add LIMIT and OFFSET in correct order
     if (limit !== undefined) {
-      query += `
-        LIMIT ${limit}
+      query += ` 
+        LIMIT ${limit};
         OFFSET ${offset}`;
     }
 
     console.log("SQL query being sent: ", query);
-    return this.snowflakeClient.query<SnowflakeOrganization>(query);
+    return this.snowflakeClient.query<SnowflakeService>(query);
   }
 
   async extractTranslationRecords(
     ids: string[],
     locale: string
-  ): Promise<SnowflakeOrganizationTranslation[]> {
+  ): Promise<SnowflakeServiceTranslation[]> {
     const formattedIds = ids.map((id) => `'${id}'`).join(", ");
     console.log(
       "fetching translations records for ",
@@ -61,16 +60,25 @@ export class OrganizationExtractor extends Extractor<
     const query = `
       SELECT 
         ID,
-        ORGANIZATION_ID,
-        LOCALE,
+        SERVICE_ID,
+        NAME,
+        ALTERNATE_NAME,
         DESCRIPTION,
+        SHORT_DESCRIPTION,
+        INTERPRETATION_SERVICES,
+        APPLICATION_PROCESS,
+        FEES_DESCRIPTION,
+        ACCREDITATIONS,
+        ELIGIBILITY_DESCRIPTION,
+        ALERT,
         IS_CANONICAL,
-        ORGANIZATION_ID as PARENT_RECORD_ID
+        LOCALE,
+        SERVICE_ID as PARENT_RECORD_ID
       FROM ${this.sourceTables.translations}
-      WHERE ORGANIZATION_ID IN (${formattedIds})
+      WHERE SERVICE_ID IN (${formattedIds})
       AND LOCALE = '${locale}'
     `;
 
-    return this.snowflakeClient.query<SnowflakeOrganizationTranslation>(query);
+    return this.snowflakeClient.query<SnowflakeServiceTranslation>(query);
   }
 }

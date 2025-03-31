@@ -14,6 +14,7 @@ export abstract class BaseLoader {
   ): Promise<{ success: number; errors: Error[] }>;
 
   /**
+   * TODO: Sunset this abstract implementation in favor for the reusable util
    * Check if a table exists in the destination system
    */
   abstract tableExists(tableName: string): Promise<boolean>;

@@ -7,10 +7,11 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const dotenv_1 = __importDefault(require("dotenv"));
 const commander_1 = require("commander");
 const snowflake_client_1 = require("./services/snowflake-client");
-const supabase_loader_1 = require("./3-Load/supabase-loader");
+// import { SupabaseLoader } from "./3-Load/supabase-loader";
 const uuid_utils_1 = require("./utils/uuid-utils");
 const migrationManager_1 = require("./managers/migrationManager");
 const config_1 = require("./config/config");
+const postgres_loader_1 = require("./3-Load/postgres-loader");
 // Load environment variables
 dotenv_1.default.config();
 // Initialize CLI
@@ -31,15 +32,16 @@ program
     try {
         // Initialize services
         const snowflakeClient = new snowflake_client_1.SnowflakeClient();
-        const supabaseLoader = new supabase_loader_1.SupabaseLoader();
+        // const supabaseLoader = new SupabaseLoader();
+        const postgresLoader = new postgres_loader_1.PostgresLoader();
         const idConverter = new uuid_utils_1.IdConverter();
         // Initialize migration manager
-        const migrationManager = new migrationManager_1.MigrationManager(snowflakeClient, supabaseLoader, idConverter);
+        const migrationManager = new migrationManager_1.MigrationManager(snowflakeClient, postgresLoader, idConverter);
         // Run migration with provided options
         await migrationManager.runCliMigration({
             entity: options.entity,
             batchSize: options.batchSize || config_1.migrationConfig.batchSize,
-            limit: options.limit || 1000,
+            limit: options.limit,
             offset: options.offset || 0,
             locale: options.locale || "en",
         });

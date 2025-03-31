@@ -20,19 +20,19 @@ export abstract class Extractor<
     }
   ) {}
 
-  abstract extractMainRecords(limit: number, offset: number): Promise<S[]>;
+  abstract extractMainRecords(offset: number, limit?: number): Promise<S[]>;
   abstract extractTranslationRecords(
     ids: string[],
     locale: string
   ): Promise<T[]>;
 
   async extract(
-    limit: number,
     offset: number,
-    locale: string = "en"
+    locale: string = "en",
+    limit?: number
   ): Promise<Map<string, { main: S; translations: T[] }>> {
     // Extract main records
-    const mainRecords = await this.extractMainRecords(limit, offset);
+    const mainRecords = await this.extractMainRecords(offset, limit);
     if (mainRecords.length > 0) {
       logJsonBlock(
         `First record from ${this.sourceTables.main}`,

@@ -10,8 +10,9 @@ class OrganizationExtractor extends extractor_1.Extractor {
         });
         this.snowflakeClient = snowflakeClient;
     }
-    async extractMainRecords(limit, offset) {
-        const query = `
+    async extractMainRecords(offset, limit) {
+        // Start building the base query without LIMIT or OFFSET
+        let query = `
       SELECT 
         ID,
         NAME,
@@ -24,10 +25,14 @@ class OrganizationExtractor extends extractor_1.Extractor {
         LAST_MODIFIED,
         CREATED
       FROM ${this.sourceTables.main}
-      ORDER BY CREATED DESC
-      LIMIT ${limit}
-      OFFSET ${offset}
-    `;
+      ORDER BY CREATED DESC`;
+        // Add LIMIT and OFFSET in correct order
+        if (limit !== undefined) {
+            query += `
+        LIMIT ${limit}
+        OFFSET ${offset}`;
+        }
+        console.log("SQL query being sent: ", query);
         return this.snowflakeClient.query(query);
     }
     async extractTranslationRecords(ids, locale) {

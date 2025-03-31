@@ -59,7 +59,7 @@ export interface SnowflakeService extends SourceData {
 export interface SnowflakeServiceTranslation extends SourceDataTranslations {
   SERVICE_ID: string;
   LOCALE: string;
-  NAME: string | null;
+  NAME: string;
   ALTERNATE_NAME: string | null;
   DESCRIPTION: string | null;
   SHORT_DESCRIPTION: string | null;

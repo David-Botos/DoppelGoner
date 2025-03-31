@@ -17,7 +17,7 @@ import { BaseLoader } from "./loader";
 import {
   batchRecords,
   processSupabaseError,
-  upsertRecords,
+  supaUpsertRecords,
 } from "../utils/loader-utils";
 import { SupabaseMetadataManager } from "./supa-metadata-manager";
 import { MetadataManager } from "./metadata-manager";
@@ -131,7 +131,7 @@ export class SupabaseLoader extends BaseLoader {
 
       for (const batch of batches) {
         try {
-          const result = await upsertRecords(
+          const result = await supaUpsertRecords(
             this.client,
             tableName,
             batch,
@@ -414,8 +414,8 @@ export class SupabaseLoader extends BaseLoader {
   }
 
   /**
+   * TODO: Sunset this abstract implementation in favor for the reusable util
    * Check if a table exists in Supabase
-   * Uses a more reliable approach that doesn't require custom RPC functions
    */
   async tableExists(tableName: string): Promise<boolean> {
     try {

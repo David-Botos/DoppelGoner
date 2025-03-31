@@ -1,5 +1,5 @@
 // Utility functions for loaders
-import { PostgrestError } from "@supabase/supabase-js";
+import { PostgrestError, SupabaseClient } from "@supabase/supabase-js";
 
 /**
  * Process errors from Supabase operations
@@ -79,7 +79,7 @@ export async function recordExists(
  * @param onConflict Fields to check for conflicts
  * @returns Result with success count and errors
  */
-export async function upsertRecords<T extends Record<string, any>>(
+export async function supaUpsertRecords<T extends Record<string, any>>(
   supabase: any,
   tableName: string,
   records: T[],
@@ -130,4 +130,45 @@ export async function upsertRecords<T extends Record<string, any>>(
   }
 
   return { success: successCount, errors };
+}
+
+/**
+ * Check if a table exists in Supabase
+ */
+export async function tableExists(
+  tableName: string,
+  supabaseClient: SupabaseClient
+): Promise<boolean> {
+  try {
+    // A more reliable way to check if a table exists is to query the information_schema
+    // or simply attempt to get the count from the table
+    const { count, error } = await supabaseClient
+      .from(tableName)
+      .select("*", { count: "exact", head: true })
+      .limit(1);
+
+    // If we get an error that contains "relation does not exist", the table doesn't exist
+    if (error) {
+      if (
+        error.message &&
+        error.message.includes("relation") &&
+        error.message.includes("does not exist")
+      ) {
+        console.log(`Table ${tableName} does not exist in Supabase`);
+        return false;
+      }
+
+      // Other errors might be permissions or connectivity issues
+      console.error(`Error checking if table exists: ${error.message}`);
+      // For non-existence errors, assume the table exists but there's another issue
+      return true;
+    }
+
+    // No error means the table exists
+    return true;
+  } catch (error) {
+    console.error(`Error checking if table ${tableName} exists:`, error);
+    // For unexpected errors, assume the table exists to prevent blocking operations
+    return true;
+  }
 }

@@ -1,5 +1,5 @@
 import { SnowflakeClient } from "../services/snowflake-client";
-import { SupabaseLoader } from "../3-Load/supabase-loader";
+// import { SupabaseLoader } from "../3-Load/supabase-loader";
 import { Extractor } from "../1-Extract/extractor";
 import { Transformer } from "../2-Transform/transformer";
 import { IdConverter } from "../utils/uuid-utils";
@@ -7,6 +7,10 @@ import { OrganizationExtractor } from "../1-Extract/organizationExtractor";
 import { OrganizationTransformer } from "../2-Transform/organizationTransformer";
 import { MigratedData, SourceData, SourceDataTranslations } from "../types";
 import { migrationConfig } from "../config/config";
+import { ServiceExtractor } from "../1-Extract/serviceExtractor";
+import { ServiceTransformer } from "../2-Transform/serviceTransformer";
+import { PostgresLoader } from "../3-Load/postgres-loader";
+import { PREDEFINED_CONSTRAINTS } from "../utils/constraint-utils";
 
 /**
  * MigrationManager orchestrates the ETL process by coordinating
@@ -14,7 +18,8 @@ import { migrationConfig } from "../config/config";
  */
 export class MigrationManager {
   private snowflakeClient: SnowflakeClient;
-  private supabaseLoader: SupabaseLoader;
+  // private supabaseLoader: SupabaseLoader;
+  private postgresLoader: PostgresLoader;
   private idConverter: IdConverter;
 
   // Storing extractors and transformers for different entity types
@@ -23,11 +28,11 @@ export class MigrationManager {
 
   constructor(
     snowflakeClient: SnowflakeClient,
-    supabaseLoader: SupabaseLoader,
+    postgresLoader: PostgresLoader,
     idConverter: IdConverter
   ) {
     this.snowflakeClient = snowflakeClient;
-    this.supabaseLoader = supabaseLoader;
+    this.postgresLoader = postgresLoader;
     this.idConverter = idConverter;
 
     // Initialize maps
@@ -48,10 +53,13 @@ export class MigrationManager {
       new OrganizationExtractor(this.snowflakeClient)
     );
 
+    this.extractors.set("service", new ServiceExtractor(this.snowflakeClient));
+
     this.transformers.set(
       "organization",
       new OrganizationTransformer(this.idConverter)
     );
+    this.transformers.set("service", new ServiceTransformer(this.idConverter));
 
     // Additional extractors and transformers will be registered here
     // as they are implemented for other entity types
@@ -63,7 +71,7 @@ export class MigrationManager {
   async migrateEntity(
     entityType: string,
     batchSize: number = migrationConfig.batchSize,
-    limit: number = 1000,
+    limit?: number,
     offset: number = 0,
     locale: string = "en"
   ): Promise<{
@@ -91,12 +99,12 @@ export class MigrationManager {
 
       // 1. Extract data from Snowflake
       console.log(`Extracting ${entityType} data from Snowflake...`);
-      const dataMap = await extractor.extract(limit, offset, locale);
+      const dataMap = await extractor.extract(offset, locale, limit);
       console.log(`Extracted ${dataMap.size} ${entityType} records`);
 
       // 2. Transform data
       console.log(`Transforming ${entityType} data...`);
-      const transformedData = transformer.transform(dataMap);
+      const transformedData = await transformer.transform(dataMap);
       console.log(
         `Transformed ${transformedData.length} ${entityType} records`
       );
@@ -114,15 +122,19 @@ export class MigrationManager {
       // Use the sourceTable information from the extractor when available
       const sourceTable = extractor.sourceTables?.main || "unknown";
 
+      // Fetch the proper predefined constraints from the util
+      const constraints = PREDEFINED_CONSTRAINTS.entityType;
+
       // Use upsertData method with source table information
       // Skip table existence check since we're sure the tables exist
-      const loadResult = await this.supabaseLoader.upsertData(
+      const loadResult = await this.postgresLoader.upsertData(
         entityType,
         transformedData,
         "id",
         batchSize,
-        sourceTable
-        // true Skip table_existence check to avoid potential issues
+        sourceTable,
+        false,
+        constraints
       );
 
       successCount = loadResult.success;
@@ -136,7 +148,7 @@ export class MigrationManager {
         );
 
         // Optionally, get a count of distinct error types
-        const failedRecords = await this.supabaseLoader.getFailedRecords(
+        const failedRecords = await this.postgresLoader.getFailedRecords(
           entityType
         );
 
@@ -256,18 +268,12 @@ export class MigrationManager {
     offset?: number;
     locale?: string;
   }): Promise<void> {
-    const {
-      entity,
-      batchSize = migrationConfig.batchSize,
-      limit = 1000,
-      offset = 0,
-      locale = "en",
-    } = args;
+    const { entity, batchSize, limit, offset = 0, locale = "en" } = args;
 
     console.log("Starting migration with parameters:");
     console.log(`Entity: ${entity || "ALL"}`);
     console.log(`Batch Size: ${batchSize}`);
-    console.log(`Limit: ${limit}`);
+    console.log(`Limit: ${limit === undefined ? "ALL" : limit}`);
     console.log(`Offset: ${offset}`);
     console.log(`Locale: ${locale}`);
 

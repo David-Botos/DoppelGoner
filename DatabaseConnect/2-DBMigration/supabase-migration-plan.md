@@ -15,6 +15,7 @@
 ## Table Prioritization
 
 ### High Priority Tables (Immediate Migration)
+
 - organization
 - service
 - location
@@ -23,6 +24,7 @@
 - phone
 
 ### Deferred Tables (Create Schema Only)
+
 - accessibility_for_disabilities
 - contact
 - funding
@@ -37,14 +39,14 @@
 
 ## Updated Table Mapping for Priority Tables
 
-| HSDS Table | Snowflake Source Table(s) | Action | ID Tracking Approach |
-|------------|---------------------------|--------|---------------------|
-| organization | ORGANIZATION + ORGANIZATION_TRANSLATIONS (where LOCALE='en') | Merge | Add original_id, original_translations_id |
-| service | SERVICE + SERVICE_TRANSLATIONS (where LOCALE='en') | Merge | Add original_id, original_translations_id |
-| location | LOCATION + LOCATION_TRANSLATIONS (where LOCALE='en') | Merge | Add original_id, original_translations_id |
-| service_at_location | SERVICE_AT_LOCATION + SERVICE_AT_LOCATION_TRANSLATIONS (where LOCALE='en') | Merge | Add original_id, original_translations_id |
-| address | ADDRESS | Transform | Add original_id, retain address_type field |
-| phone | PHONE + PHONE_TRANSLATIONS (where LOCALE='en') | Merge | Add original_id, original_translations_id |
+| HSDS Table          | Snowflake Source Table(s)                                                  | Action    | ID Tracking Approach                       |
+| ------------------- | -------------------------------------------------------------------------- | --------- | ------------------------------------------ |
+| organization        | ORGANIZATION + ORGANIZATION_TRANSLATIONS (where LOCALE='en')               | Merge     | Add original_id, original_translations_id  |
+| service             | SERVICE + SERVICE_TRANSLATIONS (where LOCALE='en')                         | Merge     | Add original_id, original_translations_id  |
+| location            | LOCATION + LOCATION_TRANSLATIONS (where LOCALE='en')                       | Merge     | Add original_id, original_translations_id  |
+| service_at_location | SERVICE_AT_LOCATION + SERVICE_AT_LOCATION_TRANSLATIONS (where LOCALE='en') | Merge     | Add original_id, original_translations_id  |
+| address             | ADDRESS                                                                    | Transform | Add original_id, retain address_type field |
+| phone               | PHONE + PHONE_TRANSLATIONS (where LOCALE='en')                             | Merge     | Add original_id, original_translations_id  |
 
 ## Updated Field Mapping Details for Priority Tables
 
@@ -52,132 +54,132 @@
 
 **Supabase Table Name**: `organization`
 
-| HSDS Field | Type (Format) | Snowflake Source | Transformation Logic | Traceability Fields |
-|------------|---------------|-----------------|---------------------|-------------------|
-| id | UUID | ORGANIZATION.ID | Convert to UUID format | |
-| name | VARCHAR(255) | ORGANIZATION.NAME | Direct mapping | |
-| alternate_name | VARCHAR(255) | ORGANIZATION.ALTERNATE_NAME | Direct mapping | |
-| description | TEXT | ORGANIZATION_TRANSLATIONS.DESCRIPTION (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English description | |
-| email | VARCHAR(255) | ORGANIZATION.EMAIL | Direct mapping | |
-| url | VARCHAR(255) | ORGANIZATION.WEBSITE | Direct mapping | |
-| year_incorporated | CHAR(4) | ORGANIZATION.YEAR_INCORPORATED | Direct mapping | |
-| legal_status | VARCHAR(255) | ORGANIZATION.LEGAL_STATUS | Direct mapping | |
-| parent_organization_id | UUID | ORGANIZATION.PARENT_ORGANIZATION_ID | Convert to UUID format | |
-| last_modified | TIMESTAMPTZ | ORGANIZATION.LAST_MODIFIED | Convert to proper timestamp with timezone | |
-| created | TIMESTAMPTZ | ORGANIZATION.CREATED | Convert to proper timestamp with timezone | |
-| original_id | VARCHAR(100) | ORGANIZATION.ID | Store original Snowflake ID | New tracking field |
-| original_translations_id | VARCHAR(100) | ORGANIZATION_TRANSLATIONS.ID | Store original translation ID | New tracking field |
+| HSDS Field               | Type (Format) | Snowflake Source                                          | Transformation Logic                      | Traceability Fields |
+| ------------------------ | ------------- | --------------------------------------------------------- | ----------------------------------------- | ------------------- |
+| id                       | UUID          | ORGANIZATION.ID                                           | Convert to UUID format                    |                     |
+| name                     | VARCHAR(255)  | ORGANIZATION.NAME                                         | Direct mapping                            |                     |
+| alternate_name           | VARCHAR(255)  | ORGANIZATION.ALTERNATE_NAME                               | Direct mapping                            |                     |
+| description              | TEXT          | ORGANIZATION_TRANSLATIONS.DESCRIPTION (where LOCALE='en') | Extract canonical English description     |                     |
+| email                    | VARCHAR(255)  | ORGANIZATION.EMAIL                                        | Direct mapping                            |                     |
+| url                      | VARCHAR(255)  | ORGANIZATION.WEBSITE                                      | Direct mapping                            |                     |
+| year_incorporated        | CHAR(4)       | ORGANIZATION.YEAR_INCORPORATED                            | Direct mapping                            |                     |
+| legal_status             | VARCHAR(255)  | ORGANIZATION.LEGAL_STATUS                                 | Direct mapping                            |                     |
+| parent_organization_id   | UUID          | ORGANIZATION.PARENT_ORGANIZATION_ID                       | Convert to UUID format                    |                     |
+| last_modified            | TIMESTAMPTZ   | ORGANIZATION.LAST_MODIFIED                                | Convert to proper timestamp with timezone |                     |
+| created                  | TIMESTAMPTZ   | ORGANIZATION.CREATED                                      | Convert to proper timestamp with timezone |                     |
+| original_id              | VARCHAR(100)  | ORGANIZATION.ID                                           | Store original Snowflake ID               | New tracking field  |
+| original_translations_id | VARCHAR(100)  | ORGANIZATION_TRANSLATIONS.ID                              | Store original translation ID             | New tracking field  |
 
 ### 2. Service Table
 
 **Supabase Table Name**: `service`
 
-| HSDS Field | Type (Format) | Snowflake Source | Transformation Logic | Traceability Fields |
-|------------|---------------|-----------------|---------------------|-------------------|
-| id | UUID | SERVICE.ID | Convert to UUID format | |
-| organization_id | UUID | SERVICE.ORGANIZATION_ID | Convert to UUID format | |
-| program_id | UUID | SERVICE.PROGRAM_ID | Convert to UUID format | |
-| name | VARCHAR(255) | SERVICE_TRANSLATIONS.NAME (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English name | |
-| alternate_name | VARCHAR(255) | SERVICE_TRANSLATIONS.ALTERNATE_NAME (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English alternate name | |
-| description | TEXT | SERVICE_TRANSLATIONS.DESCRIPTION (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English description | |
-| short_description | TEXT | SERVICE_TRANSLATIONS.SHORT_DESCRIPTION (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English short description | |
-| url | VARCHAR(255) | SERVICE.URL | Direct mapping | |
-| email | VARCHAR(255) | SERVICE.EMAIL | Direct mapping | |
-| status | VARCHAR(50) | SERVICE.STATUS | Direct mapping | |
-| interpretation_services | TEXT | SERVICE_TRANSLATIONS.INTERPRETATION_SERVICES (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English interpretation services | |
-| application_process | TEXT | SERVICE_TRANSLATIONS.APPLICATION_PROCESS (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English application process | |
-| wait_time | VARCHAR(255) | NULL | New field per HSDS | |
-| fees_description | TEXT | SERVICE_TRANSLATIONS.FEES_DESCRIPTION (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English fees description | |
-| accreditations | TEXT | SERVICE_TRANSLATIONS.ACCREDITATIONS (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English accreditations | |
-| licenses | VARCHAR(255) | NULL | New field per HSDS | |
-| minimum_age | INT | SERVICE.MINIMUM_AGE | Direct mapping | |
-| maximum_age | INT | SERVICE.MAXIMUM_AGE | Direct mapping | |
-| eligibility_description | TEXT | SERVICE_TRANSLATIONS.ELIGIBILITY_DESCRIPTION (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English eligibility description | |
-| alert | TEXT | SERVICE_TRANSLATIONS.ALERT (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English alert | |
-| last_modified | TIMESTAMPTZ | SERVICE.LAST_MODIFIED | Convert to proper timestamp with timezone | |
-| created | TIMESTAMPTZ | SERVICE.CREATED | Convert to proper timestamp with timezone | |
-| original_id | VARCHAR(100) | SERVICE.ID | Store original Snowflake ID | New tracking field |
-| original_translations_id | VARCHAR(100) | SERVICE_TRANSLATIONS.ID | Store original translation ID | New tracking field |
+| HSDS Field               | Type (Format) | Snowflake Source                                                 | Transformation Logic                              | Traceability Fields |
+| ------------------------ | ------------- | ---------------------------------------------------------------- | ------------------------------------------------- | ------------------- |
+| id                       | UUID          | SERVICE.ID                                                       | Convert to UUID format                            |                     |
+| organization_id          | UUID          | SERVICE.ORGANIZATION_ID                                          | Convert to UUID format                            |                     |
+| program_id               | UUID          | SERVICE.PROGRAM_ID                                               | Convert to UUID format                            |                     |
+| name                     | VARCHAR(255)  | SERVICE_TRANSLATIONS.NAME (where LOCALE='en')                    | Extract canonical English name                    |                     |
+| alternate_name           | VARCHAR(255)  | SERVICE_TRANSLATIONS.ALTERNATE_NAME (where LOCALE='en')          | Extract canonical English alternate name          |                     |
+| description              | TEXT          | SERVICE_TRANSLATIONS.DESCRIPTION (where LOCALE='en')             | Extract canonical English description             |                     |
+| short_description        | TEXT          | SERVICE_TRANSLATIONS.SHORT_DESCRIPTION (where LOCALE='en')       | Extract canonical English short description       |                     |
+| url                      | VARCHAR(255)  | SERVICE.URL                                                      | Direct mapping                                    |                     |
+| email                    | VARCHAR(255)  | SERVICE.EMAIL                                                    | Direct mapping                                    |                     |
+| status                   | VARCHAR(50)   | SERVICE.STATUS                                                   | Direct mapping                                    |                     |
+| interpretation_services  | TEXT          | SERVICE_TRANSLATIONS.INTERPRETATION_SERVICES (where LOCALE='en') | Extract canonical English interpretation services |                     |
+| application_process      | TEXT          | SERVICE_TRANSLATIONS.APPLICATION_PROCESS (where LOCALE='en')     | Extract canonical English application process     |                     |
+| wait_time                | VARCHAR(255)  | NULL                                                             | New field per HSDS                                |                     |
+| fees_description         | TEXT          | SERVICE_TRANSLATIONS.FEES_DESCRIPTION (where LOCALE='en')        | Extract canonical English fees description        |                     |
+| accreditations           | TEXT          | SERVICE_TRANSLATIONS.ACCREDITATIONS (where LOCALE='en')          | Extract canonical English accreditations          |                     |
+| licenses                 | VARCHAR(255)  | NULL                                                             | New field per HSDS                                |                     |
+| minimum_age              | INT           | SERVICE.MINIMUM_AGE                                              | Direct mapping                                    |                     |
+| maximum_age              | INT           | SERVICE.MAXIMUM_AGE                                              | Direct mapping                                    |                     |
+| eligibility_description  | TEXT          | SERVICE_TRANSLATIONS.ELIGIBILITY_DESCRIPTION (where LOCALE='en') | Extract canonical English eligibility description |                     |
+| alert                    | TEXT          | SERVICE_TRANSLATIONS.ALERT (where LOCALE='en')                   | Extract canonical English alert                   |                     |
+| last_modified            | TIMESTAMPTZ   | SERVICE.LAST_MODIFIED                                            | Convert to proper timestamp with timezone         |                     |
+| created                  | TIMESTAMPTZ   | SERVICE.CREATED                                                  | Convert to proper timestamp with timezone         |                     |
+| original_id              | VARCHAR(100)  | SERVICE.ID                                                       | Store original Snowflake ID                       | New tracking field  |
+| original_translations_id | VARCHAR(100)  | SERVICE_TRANSLATIONS.ID                                          | Store original translation ID                     | New tracking field  |
 
 ### 3. Location Table
 
 **Supabase Table Name**: `location`
 
-| HSDS Field | Type (Format) | Snowflake Source | Transformation Logic | Traceability Fields |
-|------------|---------------|-----------------|---------------------|-------------------|
-| id | UUID | LOCATION.ID | Convert to UUID format | |
-| organization_id | UUID | LOCATION.ORGANIZATION_ID | Convert to UUID format | |
-| name | VARCHAR(255) | LOCATION.NAME | Direct mapping | |
-| alternate_name | VARCHAR(255) | LOCATION.ALTERNATE_NAME | Direct mapping | |
-| description | TEXT | LOCATION_TRANSLATIONS.DESCRIPTION (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English description | |
-| short_description | TEXT | LOCATION_TRANSLATIONS.SHORT_DESCRIPTION (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English short description | |
-| transportation | TEXT | LOCATION_TRANSLATIONS.TRANSPORTATION (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English transportation | |
-| latitude | DECIMAL(10,6) | LOCATION.LATITUDE | Direct mapping | |
-| longitude | DECIMAL(10,6) | LOCATION.LONGITUDE | Direct mapping | |
-| location_type | VARCHAR(50) | LOCATION.LOCATION_TYPE | Direct mapping | |
-| last_modified | TIMESTAMPTZ | LOCATION.LAST_MODIFIED | Convert to proper timestamp with timezone | |
-| created | TIMESTAMPTZ | LOCATION.CREATED | Convert to proper timestamp with timezone | |
-| original_id | VARCHAR(100) | LOCATION.ID | Store original Snowflake ID | New tracking field |
-| original_translations_id | VARCHAR(100) | LOCATION_TRANSLATIONS.ID | Store original translation ID | New tracking field |
+| HSDS Field               | Type (Format) | Snowflake Source                                            | Transformation Logic                        | Traceability Fields |
+| ------------------------ | ------------- | ----------------------------------------------------------- | ------------------------------------------- | ------------------- |
+| id                       | UUID          | LOCATION.ID                                                 | Convert to UUID format                      |                     |
+| organization_id          | UUID          | LOCATION.ORGANIZATION_ID                                    | Convert to UUID format                      |                     |
+| name                     | VARCHAR(255)  | LOCATION.NAME                                               | Direct mapping                              |                     |
+| alternate_name           | VARCHAR(255)  | LOCATION.ALTERNATE_NAME                                     | Direct mapping                              |                     |
+| description              | TEXT          | LOCATION_TRANSLATIONS.DESCRIPTION (where LOCALE='en')       | Extract canonical English description       |                     |
+| short_description        | TEXT          | LOCATION_TRANSLATIONS.SHORT_DESCRIPTION (where LOCALE='en') | Extract canonical English short description |                     |
+| transportation           | TEXT          | LOCATION_TRANSLATIONS.TRANSPORTATION (where LOCALE='en')    | Extract canonical English transportation    |                     |
+| latitude                 | DECIMAL(10,6) | LOCATION.LATITUDE                                           | Direct mapping                              |                     |
+| longitude                | DECIMAL(10,6) | LOCATION.LONGITUDE                                          | Direct mapping                              |                     |
+| location_type            | VARCHAR(50)   | LOCATION.LOCATION_TYPE                                      | Direct mapping                              |                     |
+| last_modified            | TIMESTAMPTZ   | LOCATION.LAST_MODIFIED                                      | Convert to proper timestamp with timezone   |                     |
+| created                  | TIMESTAMPTZ   | LOCATION.CREATED                                            | Convert to proper timestamp with timezone   |                     |
+| original_id              | VARCHAR(100)  | LOCATION.ID                                                 | Store original Snowflake ID                 | New tracking field  |
+| original_translations_id | VARCHAR(100)  | LOCATION_TRANSLATIONS.ID                                    | Store original translation ID               | New tracking field  |
 
 ### 4. Service At Location Table
 
 **Supabase Table Name**: `service_at_location`
 
-| HSDS Field | Type (Format) | Snowflake Source | Transformation Logic | Traceability Fields |
-|------------|---------------|-----------------|---------------------|-------------------|
-| id | UUID | SERVICE_AT_LOCATION.ID | Convert to UUID format | |
-| service_id | UUID | SERVICE_AT_LOCATION.SERVICE_ID | Convert to UUID format | |
-| location_id | UUID | SERVICE_AT_LOCATION.LOCATION_ID | Convert to UUID format | |
-| description | TEXT | SERVICE_AT_LOCATION_TRANSLATIONS.DESCRIPTION (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English description | |
-| last_modified | TIMESTAMPTZ | SERVICE_AT_LOCATION.LAST_MODIFIED | Convert to proper timestamp with timezone | |
-| created | TIMESTAMPTZ | SERVICE_AT_LOCATION.CREATED | Convert to proper timestamp with timezone | |
-| original_id | VARCHAR(100) | SERVICE_AT_LOCATION.ID | Store original Snowflake ID | New tracking field |
-| original_translations_id | VARCHAR(100) | SERVICE_AT_LOCATION_TRANSLATIONS.ID | Store original translation ID | New tracking field |
+| HSDS Field               | Type (Format) | Snowflake Source                                                 | Transformation Logic                      | Traceability Fields |
+| ------------------------ | ------------- | ---------------------------------------------------------------- | ----------------------------------------- | ------------------- |
+| id                       | UUID          | SERVICE_AT_LOCATION.ID                                           | Convert to UUID format                    |                     |
+| service_id               | UUID          | SERVICE_AT_LOCATION.SERVICE_ID                                   | Convert to UUID format                    |                     |
+| location_id              | UUID          | SERVICE_AT_LOCATION.LOCATION_ID                                  | Convert to UUID format                    |                     |
+| description              | TEXT          | SERVICE_AT_LOCATION_TRANSLATIONS.DESCRIPTION (where LOCALE='en') | Extract canonical English description     |                     |
+| last_modified            | TIMESTAMPTZ   | SERVICE_AT_LOCATION.LAST_MODIFIED                                | Convert to proper timestamp with timezone |                     |
+| created                  | TIMESTAMPTZ   | SERVICE_AT_LOCATION.CREATED                                      | Convert to proper timestamp with timezone |                     |
+| original_id              | VARCHAR(100)  | SERVICE_AT_LOCATION.ID                                           | Store original Snowflake ID               | New tracking field  |
+| original_translations_id | VARCHAR(100)  | SERVICE_AT_LOCATION_TRANSLATIONS.ID                              | Store original translation ID             | New tracking field  |
 
 ### 5. Consolidated Address Table
 
 **Supabase Table Name**: `address`
 
-| HSDS Field | Type (Format) | Snowflake Source | Transformation Logic | Traceability Fields |
-|------------|---------------|-----------------|---------------------|-------------------|
-| id | UUID | ADDRESS.ID | Convert to UUID format | |
-| location_id | UUID | ADDRESS.LOCATION_ID | Convert to UUID format | |
-| attention | VARCHAR(255) | ADDRESS.ATTENTION | Direct mapping | |
-| address_1 | VARCHAR(255) | ADDRESS.ADDRESS_1 | Direct mapping | |
-| address_2 | VARCHAR(255) | ADDRESS.ADDRESS_2 | Direct mapping | |
-| city | VARCHAR(255) | ADDRESS.CITY | Direct mapping | |
-| region | VARCHAR(255) | ADDRESS.REGION | Direct mapping | |
-| state_province | VARCHAR(100) | ADDRESS.STATE_PROVINCE | Direct mapping | |
-| postal_code | VARCHAR(20) | ADDRESS.POSTAL_CODE | Direct mapping | |
-| country | CHAR(2) | ADDRESS.COUNTRY | Ensure 2-letter ISO code | |
-| address_type | VARCHAR(20) | ADDRESS.ADDRESS_TYPE | Direct mapping | Retained original field |
-| last_modified | TIMESTAMPTZ | ADDRESS.LAST_MODIFIED | Convert to proper timestamp with timezone | |
-| created | TIMESTAMPTZ | ADDRESS.CREATED | Convert to proper timestamp with timezone | |
-| original_id | VARCHAR(100) | ADDRESS.ID | Store original Snowflake ID | New tracking field |
+| HSDS Field     | Type (Format) | Snowflake Source       | Transformation Logic                      | Traceability Fields     |
+| -------------- | ------------- | ---------------------- | ----------------------------------------- | ----------------------- |
+| id             | UUID          | ADDRESS.ID             | Convert to UUID format                    |                         |
+| location_id    | UUID          | ADDRESS.LOCATION_ID    | Convert to UUID format                    |                         |
+| attention      | VARCHAR(255)  | ADDRESS.ATTENTION      | Direct mapping                            |                         |
+| address_1      | VARCHAR(255)  | ADDRESS.ADDRESS_1      | Direct mapping                            |                         |
+| address_2      | VARCHAR(255)  | ADDRESS.ADDRESS_2      | Direct mapping                            |                         |
+| city           | VARCHAR(255)  | ADDRESS.CITY           | Direct mapping                            |                         |
+| region         | VARCHAR(255)  | ADDRESS.REGION         | Direct mapping                            |                         |
+| state_province | VARCHAR(100)  | ADDRESS.STATE_PROVINCE | Direct mapping                            |                         |
+| postal_code    | VARCHAR(20)   | ADDRESS.POSTAL_CODE    | Direct mapping                            |                         |
+| country        | CHAR(2)       | ADDRESS.COUNTRY        | Ensure 2-letter ISO code                  |                         |
+| address_type   | VARCHAR(20)   | ADDRESS.ADDRESS_TYPE   | Direct mapping                            | Retained original field |
+| last_modified  | TIMESTAMPTZ   | ADDRESS.LAST_MODIFIED  | Convert to proper timestamp with timezone |                         |
+| created        | TIMESTAMPTZ   | ADDRESS.CREATED        | Convert to proper timestamp with timezone |                         |
+| original_id    | VARCHAR(100)  | ADDRESS.ID             | Store original Snowflake ID               | New tracking field      |
 
 ### 6. Phone Table
 
 **Supabase Table Name**: `phone`
 
-| HSDS Field | Type (Format) | Snowflake Source | Transformation Logic | Traceability Fields |
-|------------|---------------|-----------------|---------------------|-------------------|
-| id | UUID | PHONE.ID | Convert to UUID format | |
-| location_id | UUID | PHONE.LOCATION_ID | Convert to UUID format | |
-| service_id | UUID | PHONE.SERVICE_ID | Convert to UUID format | |
-| organization_id | UUID | PHONE.ORGANIZATION_ID | Convert to UUID format | |
-| contact_id | UUID | PHONE.CONTACT_ID | Convert to UUID format | |
-| service_at_location_id | UUID | PHONE.SERVICE_AT_LOCATION_ID | Convert to UUID format | |
-| number | VARCHAR(50) | PHONE.NUMBER | Direct mapping | |
-| extension | VARCHAR(20) | PHONE.EXTENSION | Direct mapping | |
-| type | VARCHAR(20) | PHONE.TYPE | Direct mapping | |
-| language | VARCHAR(10) | 'en' | Default to English | |
-| description | TEXT | PHONE_TRANSLATIONS.DESCRIPTION (where LOCALE='en' and IS_CANONICAL=True) | Extract canonical English description | |
-| priority | INT | PHONE.PRIORITY | Direct mapping | |
-| last_modified | TIMESTAMPTZ | PHONE.LAST_MODIFIED | Convert to proper timestamp with timezone | |
-| created | TIMESTAMPTZ | PHONE.CREATED | Convert to proper timestamp with timezone | |
-| original_id | VARCHAR(100) | PHONE.ID | Store original Snowflake ID | New tracking field |
-| original_translations_id | VARCHAR(100) | PHONE_TRANSLATIONS.ID | Store original translation ID | New tracking field |
+| HSDS Field               | Type (Format) | Snowflake Source                                   | Transformation Logic                      | Traceability Fields |
+| ------------------------ | ------------- | -------------------------------------------------- | ----------------------------------------- | ------------------- |
+| id                       | UUID          | PHONE.ID                                           | Convert to UUID format                    |                     |
+| location_id              | UUID          | PHONE.LOCATION_ID                                  | Convert to UUID format                    |                     |
+| service_id               | UUID          | PHONE.SERVICE_ID                                   | Convert to UUID format                    |                     |
+| organization_id          | UUID          | PHONE.ORGANIZATION_ID                              | Convert to UUID format                    |                     |
+| contact_id               | UUID          | PHONE.CONTACT_ID                                   | Convert to UUID format                    |                     |
+| service_at_location_id   | UUID          | PHONE.SERVICE_AT_LOCATION_ID                       | Convert to UUID format                    |                     |
+| number                   | VARCHAR(50)   | PHONE.NUMBER                                       | Direct mapping                            |                     |
+| extension                | VARCHAR(20)   | PHONE.EXTENSION                                    | Direct mapping                            |                     |
+| type                     | VARCHAR(20)   | PHONE.TYPE                                         | Direct mapping                            |                     |
+| language                 | VARCHAR(10)   | 'en'                                               | Default to English                        |                     |
+| description              | TEXT          | PHONE_TRANSLATIONS.DESCRIPTION (where LOCALE='en') | Extract canonical English description     |                     |
+| priority                 | INT           | PHONE.PRIORITY                                     | Direct mapping                            |                     |
+| last_modified            | TIMESTAMPTZ   | PHONE.LAST_MODIFIED                                | Convert to proper timestamp with timezone |                     |
+| created                  | TIMESTAMPTZ   | PHONE.CREATED                                      | Convert to proper timestamp with timezone |                     |
+| original_id              | VARCHAR(100)  | PHONE.ID                                           | Store original Snowflake ID               | New tracking field  |
+| original_translations_id | VARCHAR(100)  | PHONE_TRANSLATIONS.ID                              | Store original translation ID             | New tracking field  |
 
 ## Supabase Schema with PostGIS Support
 
@@ -323,6 +325,7 @@ CREATE TABLE migration_log (
 ## Supabase-Specific Setup
 
 ### 1. Setting up Supabase
+
 ```bash
 # Install Supabase CLI if not already installed
 npm install -g supabase
@@ -343,26 +346,28 @@ supabase link --project-ref your-project-ref
 ### 2. Leveraging Supabase Features
 
 #### Row-Level Security (RLS)
+
 ```sql
 -- Example RLS policy for organization table
 ALTER TABLE organization ENABLE ROW LEVEL SECURITY;
 
 -- Create policy for authenticated users
-CREATE POLICY "Authenticated users can view organizations" 
-ON organization FOR SELECT 
-TO authenticated 
+CREATE POLICY "Authenticated users can view organizations"
+ON organization FOR SELECT
+TO authenticated
 USING (true);
 
 -- Create policy for specific roles (admin)
-CREATE POLICY "Only admins can update organizations" 
-ON organization FOR UPDATE 
-TO authenticated 
+CREATE POLICY "Only admins can update organizations"
+ON organization FOR UPDATE
+TO authenticated
 USING (auth.uid() IN (
   SELECT user_id FROM admin_users
 ));
 ```
 
 #### TypeScript Type Generation
+
 ```bash
 # Generate TypeScript types for your Supabase tables
 supabase gen types typescript --local > src/types/supabase.ts
@@ -371,11 +376,13 @@ supabase gen types typescript --local > src/types/supabase.ts
 ## Migration Implementation Strategy with TypeScript
 
 ### 1. Migration Order
+
 To maintain referential integrity, tables must be migrated in this order:
+
 1. organization
 2. location
 3. service
-4. service_at_location  
+4. service_at_location
 5. address (consolidated)
 6. phone
 
@@ -383,8 +390,8 @@ To maintain referential integrity, tables must be migrated in this order:
 
 ```typescript
 // src/migration/index.ts
-import { createClient } from '@supabase/supabase-js';
-import { SnowflakeService } from './snowflake-service';
+import { createClient } from "@supabase/supabase-js";
+import { SnowflakeService } from "./snowflake-service";
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -401,20 +408,22 @@ const snowflake = new SnowflakeService({
 
 // Migration function for a table
 async function migrateTable(
-  sourceTable: string, 
-  targetTable: string, 
-  transformFunction: Function, 
+  sourceTable: string,
+  targetTable: string,
+  transformFunction: Function,
   batchSize: number = 100
 ) {
   const startTime = new Date();
   let successCount = 0;
   let failureCount = 0;
   let errorMessages = [];
-  
+
   try {
     // 1. Extract data from Snowflake
-    const sourceData = await snowflake.query(`SELECT * FROM ${sourceTable} LIMIT ${batchSize}`);
-    
+    const sourceData = await snowflake.query(
+      `SELECT * FROM ${sourceTable} LIMIT ${batchSize}`
+    );
+
     // 2. For translation tables, join with main table
     let combinedData;
     if (needsTranslationData(targetTable)) {
@@ -425,54 +434,57 @@ async function migrateTable(
     } else {
       combinedData = sourceData;
     }
-    
+
     // 3. Transform data according to mapping rules
     const transformedData = transformFunction(combinedData);
-    
+
     // 4. Load data to Supabase
     const { data, error } = await supabase
       .from(targetTable)
       .insert(transformedData);
-      
+
     if (error) {
       throw error;
     }
-    
+
     successCount = transformedData.length;
   } catch (error) {
     failureCount = batchSize;
     errorMessages.push(error.message);
     console.error(`Error migrating ${sourceTable} to ${targetTable}:`, error);
   }
-  
+
   // 5. Log migration results
   const endTime = new Date();
   const executionTime = (endTime.getTime() - startTime.getTime()) / 1000;
-  
-  await supabase.from('migration_log').insert({
+
+  await supabase.from("migration_log").insert({
     source_table: sourceTable,
     target_table: targetTable,
     records_migrated: successCount + failureCount,
     success_count: successCount,
     failure_count: failureCount,
-    error_messages: errorMessages.join('\n'),
+    error_messages: errorMessages.join("\n"),
     started_at: startTime.toISOString(),
     completed_at: endTime.toISOString(),
-    execution_time_seconds: executionTime
+    execution_time_seconds: executionTime,
   });
-  
+
   return {
     success: successCount,
     failure: failureCount,
-    errors: errorMessages
+    errors: errorMessages,
   };
 }
 
 // Helper functions
 function needsTranslationData(targetTable: string): boolean {
   const tablesWithTranslations = [
-    'organization', 'service', 'location', 
-    'service_at_location', 'phone'
+    "organization",
+    "service",
+    "location",
+    "service_at_location",
+    "phone",
   ];
   return tablesWithTranslations.includes(targetTable);
 }
@@ -480,12 +492,12 @@ function needsTranslationData(targetTable: string): boolean {
 function joinData(mainData: any[], translationData: any[]): any[] {
   // Join logic here, using Map for efficient lookups
   const translationMap = new Map();
-  
-  translationData.forEach(translation => {
+
+  translationData.forEach((translation) => {
     translationMap.set(translation.id, translation);
   });
-  
-  return mainData.map(item => {
+
+  return mainData.map((item) => {
     const translation = translationMap.get(item.id);
     return { ...item, translation };
   });
@@ -493,9 +505,9 @@ function joinData(mainData: any[], translationData: any[]): any[] {
 
 // Transform functions for each table
 const transformOrganization = (data: any[]) => {
-  return data.map(item => {
+  return data.map((item) => {
     const translation = item.translation || {};
-    
+
     return {
       id: parseUUID(item.id),
       name: item.name,
@@ -509,7 +521,7 @@ const transformOrganization = (data: any[]) => {
       last_modified: new Date(item.last_modified).toISOString(),
       created: new Date(item.created).toISOString(),
       original_id: item.id,
-      original_translations_id: translation.id
+      original_translations_id: translation.id,
     };
   });
 };
@@ -518,12 +530,14 @@ const transformOrganization = (data: any[]) => {
 function parseUUID(id: string): string {
   // Convert string ID to proper UUID format if needed
   if (!id) return null;
-  
+
   // If already in UUID format, return as is
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+  if (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+  ) {
     return id;
   }
-  
+
   // Otherwise, generate a UUID using a hash of the original ID for consistency
   // This ensures the same ID always maps to the same UUID
   return generateConsistentUUID(id);
@@ -533,28 +547,29 @@ function generateConsistentUUID(input: string): string {
   // Implementation of a hashing function to convert string to UUID
   // This is simplified - in production use a robust UUID generator
   // or hash function that ensures consistency
-  const crypto = require('crypto');
-  const hash = crypto.createHash('md5').update(input).digest('hex');
-  
+  const crypto = require("crypto");
+  const hash = crypto.createHash("md5").update(input).digest("hex");
+
   // Format as UUID v5 (name-based)
   return [
     hash.substr(0, 8),
     hash.substr(8, 4),
-    '5' + hash.substr(13, 3), // Version 5
-    '8' + hash.substr(17, 3), // Variant 8
-    hash.substr(20, 12)
-  ].join('-');
+    "5" + hash.substr(13, 3), // Version 5
+    "8" + hash.substr(17, 3), // Variant 8
+    hash.substr(20, 12),
+  ].join("-");
 }
 
 // Main migration function
 export async function migrateData() {
   // Migrate in order to maintain referential integrity
-  await migrateTable('ORGANIZATION', 'organization', transformOrganization);
+  await migrateTable("ORGANIZATION", "organization", transformOrganization);
   // Implement other transform functions and migration calls
 }
 ```
 
 ### 3. Handling Missing Data and Translation Tables
+
 Looking at the Snowflake sample data, we see multiple translation tables with various languages. The migration process should:
 
 1. Always prefer canonical English translations (IS_CANONICAL=True)
@@ -564,44 +579,49 @@ Looking at the Snowflake sample data, we see multiple translation tables with va
 
 ```typescript
 // Example of translation handling function
-function findBestTranslation(translations: any[], preferredLocale = 'en'): any {
+function findBestTranslation(translations: any[], preferredLocale = "en"): any {
   if (!translations || translations.length === 0) return null;
-  
+
   // First try to find a canonical translation in the preferred locale
-  const canonicalPreferred = translations.find(t => 
-    t.LOCALE?.toLowerCase() === preferredLocale.toLowerCase() && t.IS_CANONICAL === 'True'
+  const canonicalPreferred = translations.find(
+    (t) =>
+      t.LOCALE?.toLowerCase() === preferredLocale.toLowerCase() &&
+      t.IS_CANONICAL === "True"
   );
   if (canonicalPreferred) return canonicalPreferred;
-  
+
   // Then any translation in the preferred locale
-  const anyPreferred = translations.find(t => 
-    t.LOCALE?.toLowerCase() === preferredLocale.toLowerCase()
+  const anyPreferred = translations.find(
+    (t) => t.LOCALE?.toLowerCase() === preferredLocale.toLowerCase()
   );
   if (anyPreferred) return anyPreferred;
-  
+
   // Then any canonical translation
-  const anyCanonical = translations.find(t => t.IS_CANONICAL === 'True');
+  const anyCanonical = translations.find((t) => t.IS_CANONICAL === "True");
   if (anyCanonical) return anyCanonical;
-  
+
   // Finally, just take the first one
   return translations[0];
 }
 
 // Usage in transformation
-const organizationWithTranslation = organizations.map(org => {
-  const translations = organizationTranslations.filter(t => t.ORGANIZATION_ID === org.ID);
+const organizationWithTranslation = organizations.map((org) => {
+  const translations = organizationTranslations.filter(
+    (t) => t.ORGANIZATION_ID === org.ID
+  );
   const bestTranslation = findBestTranslation(translations);
-  
+
   return {
     ...org,
     description: bestTranslation?.DESCRIPTION || null,
     // other translated fields
-    original_translations_id: bestTranslation?.ID || null
+    original_translations_id: bestTranslation?.ID || null,
   };
 });
 ```
 
 ### 4. UUID Conversion
+
 Since Supabase typically uses UUIDs but Snowflake might be using different ID formats:
 
 1. Create a consistent algorithm to convert source IDs to UUIDs
@@ -609,12 +629,13 @@ Since Supabase typically uses UUIDs but Snowflake might be using different ID fo
 3. Store the original ID in the traceability field
 
 ### 5. PostGIS for SERVICE_AREA
+
 Supabase supports PostGIS out of the box:
 
 ```typescript
 // Example in TypeScript for transforming GeoJSON to PostGIS
 const transformServiceArea = (data: any[]) => {
-  return data.map(item => {
+  return data.map((item) => {
     return {
       id: parseUUID(item.id),
       service_id: parseUUID(item.service_id),
@@ -622,11 +643,11 @@ const transformServiceArea = (data: any[]) => {
       description: item.translation?.description,
       // Convert GeoJSON to PostGIS geometry
       extent: item.extent, // Supabase handles the conversion automatically
-      extent_type: 'geojson',
+      extent_type: "geojson",
       last_modified: new Date(item.last_modified).toISOString(),
       created: new Date(item.created).toISOString(),
       original_id: item.id,
-      original_translations_id: item.translation?.id
+      original_translations_id: item.translation?.id,
     };
   });
 };
@@ -637,46 +658,48 @@ const transformServiceArea = (data: any[]) => {
 Based on the Snowflake sample data, we need a robust validation approach:
 
 1. **Pre-migration validation**:
+
    - Check source data integrity and required fields
    - Identify tables with minimal data (some tables like ACCESSIBILITY have very few records)
    - Validate ID formats and consistency across related tables
    - Check for translations in preferred language (English)
 
 2. **During migration validation**:
+
    - Ensure foreign key constraints are satisfied
    - Validate UUID conversion consistency
    - Handle GeoJSON conversion for SERVICE_AREA table
    - Log any data conversion issues for manual review
 
-3. **Post-migration validation**: 
+3. **Post-migration validation**:
    - Verify record counts match expected values
    - Spot-check sample records for data fidelity
    - Test referential integrity across the migrated tables
    - Verify PostGIS functionality for spatial data
    - Test Supabase Row-Level Security (RLS) policies
 
-```typescript
+````typescript
 // Example validation function
 async function validateMigration() {
   const validationLog = [];
-  
+
   // Check record counts
   const tables = [
-    'organization', 'service', 'location', 
+    'organization', 'service', 'location',
     'service_at_location', 'address', 'phone'
   ];
-  
+
   for (const table of tables) {
     // Get source count from Snowflake
     const sourceCount = await snowflake.query(
       `SELECT COUNT(*) as count FROM ${table.toUpperCase()}`
     );
-    
+
     // Get target count from Supabase
     const { data: targetCount, error } = await supabase
       .from(table.toLowerCase())
       .select('count', { count: 'exact', head: true });
-      
+
     if (error) {
       validationLog.push({
         table,
@@ -685,7 +708,7 @@ async function validateMigration() {
       });
       continue;
     }
-    
+
     // Compare counts
     if (sourceCount[0].count !== targetCount) {
       validationLog.push({
@@ -701,7 +724,7 @@ async function validateMigration() {
       });
     }
   }
-  
+
   // Save validation log
   await supabase.from('migration_log').insert({
     source_table: 'ALL',
@@ -714,7 +737,7 @@ async function validateMigration() {
     completed_at: new Date().toISOString(),
     execution_time_seconds: 0
   });
-  
+
   return validationLog;
 }
 
@@ -725,30 +748,30 @@ async function validateMigration() {
   const sourceCount = await snowflake.query(
     'SELECT COUNT(*) as count FROM ORGANIZATION'
   );
-  
+
   const { data: targetCount, error } = await supabase
     .from('organization')
     .select('count', { count: 'exact', head: true });
-    
+
   console.log(`Source: ${sourceCount[0].count}, Target: ${targetCount}`);
-  
+
   // Check sample records
   const sourceSample = await snowflake.query(
     'SELECT * FROM ORGANIZATION LIMIT 5'
   );
-  
+
   for (const record of sourceSample) {
     const { data, error } = await supabase
       .from('organization')
       .select('*')
       .eq('original_id', record.ID)
       .single();
-      
+
     if (error || !data) {
       console.error(`Record not found or error: ${record.ID}`);
       continue;
     }
-    
+
     // Validate fields
     if (record.NAME !== data.name) {
       console.error(`Name mismatch for ${record.ID}: ${record.NAME} vs ${data.name}`);
@@ -756,11 +779,12 @@ async function validateMigration() {
     // Check other fields...
   }
 }
-```
+````
 
 ## Supabase-Specific Optimizations
 
 1. **Using Realtime Features**: Enable real-time notifications for critical tables if needed
+
    ```sql
    BEGIN;
      -- Enable realtime for specific tables
@@ -769,34 +793,44 @@ async function validateMigration() {
    ```
 
 2. **Efficient Supabase Queries**: Use Supabase client efficiently
+
    ```typescript
    // Efficient filtering with Supabase
    const { data, error } = await supabase
-     .from('organization')
-     .select(`
+     .from("organization")
+     .select(
+       `
        id, 
        name,
        service:service(id, name)
-     `)
-     .eq('status', 'active')
-     .order('name');
+     `
+     )
+     .eq("status", "active")
+     .order("name");
    ```
 
 3. **Batch Processing**: Use batch operations for better performance
+
    ```typescript
    // Process in manageable chunks
    const BATCH_SIZE = 100;
    for (let i = 0; i < totalRecords; i += BATCH_SIZE) {
-     await migrateTable('ORGANIZATION', 'organization', transformOrganization, BATCH_SIZE);
+     await migrateTable(
+       "ORGANIZATION",
+       "organization",
+       transformOrganization,
+       BATCH_SIZE
+     );
    }
    ```
 
 4. **Type Safety**: Leverage TypeScript with generated types
+
    ```typescript
    import { definitions } from '../types/supabase';
-   
+
    type Organization = definitions['organization'];
-   
+
    const transformOrganization = (data: any[]): Organization[] => {
      // Type-safe transformation
      return data.map(item => ({...}));
@@ -836,35 +870,60 @@ Based on the Snowflake sample data, we should address these edge cases:
 async function runMigration() {
   // Setup - ensure the order is correct due to foreign key constraints
   const migrationOrder = [
-    { sourceTable: 'ORGANIZATION', targetTable: 'organization', transform: transformOrganization },
-    { sourceTable: 'LOCATION', targetTable: 'location', transform: transformLocation },
-    { sourceTable: 'SERVICE', targetTable: 'service', transform: transformService },
-    { sourceTable: 'SERVICE_AT_LOCATION', targetTable: 'service_at_location', transform: transformServiceAtLocation },
-    { sourceTable: 'ADDRESS', targetTable: 'address', transform: transformAddress },
-    { sourceTable: 'PHONE', targetTable: 'phone', transform: transformPhone }
+    {
+      sourceTable: "ORGANIZATION",
+      targetTable: "organization",
+      transform: transformOrganization,
+    },
+    {
+      sourceTable: "LOCATION",
+      targetTable: "location",
+      transform: transformLocation,
+    },
+    {
+      sourceTable: "SERVICE",
+      targetTable: "service",
+      transform: transformService,
+    },
+    {
+      sourceTable: "SERVICE_AT_LOCATION",
+      targetTable: "service_at_location",
+      transform: transformServiceAtLocation,
+    },
+    {
+      sourceTable: "ADDRESS",
+      targetTable: "address",
+      transform: transformAddress,
+    },
+    { sourceTable: "PHONE", targetTable: "phone", transform: transformPhone },
   ];
-  
+
   // Run migrations in sequence
   for (const migration of migrationOrder) {
-    console.log(`Starting migration: ${migration.sourceTable} → ${migration.targetTable}`);
-    
+    console.log(
+      `Starting migration: ${migration.sourceTable} → ${migration.targetTable}`
+    );
+
     const result = await migrateTable(
-      migration.sourceTable, 
-      migration.targetTable, 
+      migration.sourceTable,
+      migration.targetTable,
       migration.transform,
       100 // Limit to 100 records for test migration
     );
-    
-    console.log(`Migration completed: ${result.success} succeeded, ${result.failure} failed`);
-    
+
+    console.log(
+      `Migration completed: ${result.success} succeeded, ${result.failure} failed`
+    );
+
     // Break if significant failures to prevent cascade issues
     if (result.failure > result.success * 0.1) {
       console.error(`Too many failures, stopping migration sequence`);
       break;
     }
   }
-  
+
   // Run validation
   const validationResults = await validateMigration();
-  console.log('Validation complete:', validationResults);
+  console.log("Validation complete:", validationResults);
 }
+```

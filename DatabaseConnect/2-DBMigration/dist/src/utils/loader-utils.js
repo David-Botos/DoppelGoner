@@ -3,7 +3,8 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.processSupabaseError = processSupabaseError;
 exports.batchRecords = batchRecords;
 exports.recordExists = recordExists;
-exports.upsertRecords = upsertRecords;
+exports.supaUpsertRecords = supaUpsertRecords;
+exports.tableExists = tableExists;
 /**
  * Process errors from Supabase operations
  * @param error Error object from Supabase
@@ -66,7 +67,7 @@ async function recordExists(supabase, tableName, fieldName, value) {
  * @param onConflict Fields to check for conflicts
  * @returns Result with success count and errors
  */
-async function upsertRecords(supabase, tableName, records, onConflict = "id") {
+async function supaUpsertRecords(supabase, tableName, records, onConflict = "id") {
     const errors = [];
     let successCount = 0;
     // Process records individually instead of in batch
@@ -105,4 +106,37 @@ async function upsertRecords(supabase, tableName, records, onConflict = "id") {
         }
     }
     return { success: successCount, errors };
+}
+/**
+ * Check if a table exists in Supabase
+ */
+async function tableExists(tableName, supabaseClient) {
+    try {
+        // A more reliable way to check if a table exists is to query the information_schema
+        // or simply attempt to get the count from the table
+        const { count, error } = await supabaseClient
+            .from(tableName)
+            .select("*", { count: "exact", head: true })
+            .limit(1);
+        // If we get an error that contains "relation does not exist", the table doesn't exist
+        if (error) {
+            if (error.message &&
+                error.message.includes("relation") &&
+                error.message.includes("does not exist")) {
+                console.log(`Table ${tableName} does not exist in Supabase`);
+                return false;
+            }
+            // Other errors might be permissions or connectivity issues
+            console.error(`Error checking if table exists: ${error.message}`);
+            // For non-existence errors, assume the table exists but there's another issue
+            return true;
+        }
+        // No error means the table exists
+        return true;
+    }
+    catch (error) {
+        console.error(`Error checking if table ${tableName} exists:`, error);
+        // For unexpected errors, assume the table exists to prevent blocking operations
+        return true;
+    }
 }

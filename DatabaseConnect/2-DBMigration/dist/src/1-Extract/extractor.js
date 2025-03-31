@@ -13,9 +13,9 @@ class Extractor {
         this.snowflakeClient = snowflakeClient;
         this.sourceTables = sourceTables;
     }
-    async extract(limit, offset, locale = "en") {
+    async extract(offset, locale = "en", limit) {
         // Extract main records
-        const mainRecords = await this.extractMainRecords(limit, offset);
+        const mainRecords = await this.extractMainRecords(offset, limit);
         if (mainRecords.length > 0) {
             (0, exports.logJsonBlock)(`First record from ${this.sourceTables.main}`, mainRecords[0]);
         }

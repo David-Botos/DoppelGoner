@@ -4,14 +4,17 @@ exports.MigrationManager = void 0;
 const organizationExtractor_1 = require("../1-Extract/organizationExtractor");
 const organizationTransformer_1 = require("../2-Transform/organizationTransformer");
 const config_1 = require("../config/config");
+const serviceExtractor_1 = require("../1-Extract/serviceExtractor");
+const serviceTransformer_1 = require("../2-Transform/serviceTransformer");
+const constraint_utils_1 = require("../utils/constraint-utils");
 /**
  * MigrationManager orchestrates the ETL process by coordinating
  * extractors, transformers, and loaders
  */
 class MigrationManager {
-    constructor(snowflakeClient, supabaseLoader, idConverter) {
+    constructor(snowflakeClient, postgresLoader, idConverter) {
         this.snowflakeClient = snowflakeClient;
-        this.supabaseLoader = supabaseLoader;
+        this.postgresLoader = postgresLoader;
         this.idConverter = idConverter;
         // Initialize maps
         this.extractors = new Map();
@@ -25,17 +28,16 @@ class MigrationManager {
     registerExtractorsAndTransformers() {
         // Register organization extractor and transformer
         this.extractors.set("organization", new organizationExtractor_1.OrganizationExtractor(this.snowflakeClient));
+        this.extractors.set("service", new serviceExtractor_1.ServiceExtractor(this.snowflakeClient));
         this.transformers.set("organization", new organizationTransformer_1.OrganizationTransformer(this.idConverter));
+        this.transformers.set("service", new serviceTransformer_1.ServiceTransformer(this.idConverter));
         // Additional extractors and transformers will be registered here
         // as they are implemented for other entity types
-        // Example:
-        // this.extractors.set('service', new ServiceExtractor(this.snowflakeClient));
-        // this.transformers.set('service', new ServiceTransformer(this.idConverter));
     }
     /**
      * Execute migration for a specific entity type
      */
-    async migrateEntity(entityType, batchSize = config_1.migrationConfig.batchSize, limit = 1000, offset = 0, locale = "en") {
+    async migrateEntity(entityType, batchSize = config_1.migrationConfig.batchSize, limit, offset = 0, locale = "en") {
         const startTime = new Date();
         const errors = [];
         let successCount = 0;
@@ -49,51 +51,49 @@ class MigrationManager {
             }
             // 1. Extract data from Snowflake
             console.log(`Extracting ${entityType} data from Snowflake...`);
-            const dataMap = await extractor.extract(limit, offset, locale);
+            const dataMap = await extractor.extract(offset, locale, limit);
             console.log(`Extracted ${dataMap.size} ${entityType} records`);
             // 2. Transform data
             console.log(`Transforming ${entityType} data...`);
-            const transformedData = transformer.transform(dataMap);
+            const transformedData = await transformer.transform(dataMap);
             console.log(`Transformed ${transformedData.length} ${entityType} records`);
             // 3. Load data into Supabase
             console.log(`Loading ${entityType} data into Supabase...`);
-            // Add this to migrationManager.ts before loading data
-            console.log("Sample transformed record:", JSON.stringify(transformedData[0], null, 2));
-            // In the migrateEntity method, after the upsertData call:
-            const loadResult = await this.supabaseLoader.upsertData(entityType, transformedData, "id", batchSize);
+            // Log a sample record for debugging
+            if (transformedData.length > 0) {
+                console.log("Sample transformed record:", JSON.stringify(transformedData[0], null, 2));
+            }
+            // Use the sourceTable information from the extractor when available
+            const sourceTable = extractor.sourceTables?.main || "unknown";
+            // Fetch the proper predefined constraints from the util
+            const constraints = constraint_utils_1.PREDEFINED_CONSTRAINTS.entityType;
+            // Use upsertData method with source table information
+            // Skip table existence check since we're sure the tables exist
+            const loadResult = await this.postgresLoader.upsertData(entityType, transformedData, "id", batchSize, sourceTable, false, constraints);
             successCount = loadResult.success;
             failureCount = transformedData.length - loadResult.success;
+            errors.push(...loadResult.errors);
             // If there were failures, log them
             if (failureCount > 0) {
                 console.warn(`${failureCount} records failed to migrate. Check the failed_migration_records table.`);
                 // Optionally, get a count of distinct error types
-                const failedRecords = await this.supabaseLoader.getFailedRecords(entityType);
-                const errorCounts = failedRecords.reduce((acc, record) => {
-                    const error = record.error_message;
-                    acc[error] = (acc[error] || 0) + 1;
-                    return acc;
-                }, {});
-                console.log("Error frequency:");
-                Object.entries(errorCounts)
-                    .sort((a, b) => b[1] - a[1])
-                    .forEach(([error, count]) => {
-                    console.log(`- ${count} occurrences: ${error}`);
-                });
+                const failedRecords = await this.postgresLoader.getFailedRecords(entityType);
+                if (failedRecords.length > 0) {
+                    const errorCounts = failedRecords.reduce((acc, record) => {
+                        const error = record.error_message;
+                        acc[error] = (acc[error] || 0) + 1;
+                        return acc;
+                    }, {});
+                    console.log("Error frequency:");
+                    Object.entries(errorCounts)
+                        .sort((a, b) => b[1] - a[1])
+                        .forEach(([error, count]) => {
+                        console.log(`- ${count} occurrences: ${error}`);
+                    });
+                }
             }
-            successCount = loadResult.success;
-            failureCount = transformedData.length - loadResult.success;
-            errors.push(...loadResult.errors);
-            // 4. Log migration results
+            // 4. Validation is now handled automatically in the loader
             const endTime = new Date();
-            await this.supabaseLoader.logMigration(extractor.sourceTables.main, entityType, transformedData.length, successCount, failureCount, errors.map((e) => e.message), startTime, endTime);
-            // 5. Validate migration if enabled
-            if (config_1.migrationConfig.enableValidation) {
-                const validationResult = await this.supabaseLoader.validateRecordCount(entityType, successCount);
-                console.log(`Validation result: ${validationResult.message}`);
-            }
-            else {
-                console.log("Validation skipped as per configuration");
-            }
             return {
                 success: successCount,
                 failure: failureCount,
@@ -107,8 +107,6 @@ class MigrationManager {
             const e = error instanceof Error ? error : new Error(String(error));
             errors.push(e);
             console.error(`Error migrating ${entityType}:`, e.message);
-            // Log migration failure
-            await this.supabaseLoader.logMigration(`UNKNOWN_${entityType.toUpperCase()}`, entityType, 0, successCount, failureCount + 1, [e.message], startTime, endTime);
             return {
                 success: successCount,
                 failure: failureCount + 1,
@@ -145,10 +143,6 @@ class MigrationManager {
             if (result.errors.length > 0) {
                 console.log(`Errors: ${result.errors.map((e) => e.message).join("\n")}`);
             }
-            // Skip validation if disabled in config
-            if (!config_1.migrationConfig.enableValidation) {
-                console.log("Validation skipped as per configuration");
-            }
         }
         return results;
     }
@@ -156,11 +150,11 @@ class MigrationManager {
      * Running a migration with CLI
      */
     async runCliMigration(args) {
-        const { entity, batchSize = config_1.migrationConfig.batchSize, limit = 1000, offset = 0, locale = "en", } = args;
+        const { entity, batchSize, limit, offset = 0, locale = "en" } = args;
         console.log("Starting migration with parameters:");
         console.log(`Entity: ${entity || "ALL"}`);
         console.log(`Batch Size: ${batchSize}`);
-        console.log(`Limit: ${limit}`);
+        console.log(`Limit: ${limit === undefined ? "ALL" : limit}`);
         console.log(`Offset: ${offset}`);
         console.log(`Locale: ${locale}`);
         try {

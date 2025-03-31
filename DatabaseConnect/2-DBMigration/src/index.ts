@@ -2,10 +2,11 @@
 import dotenv from "dotenv";
 import { Command } from "commander";
 import { SnowflakeClient } from "./services/snowflake-client";
-import { SupabaseLoader } from "./3-Load/supabase-loader";
+// import { SupabaseLoader } from "./3-Load/supabase-loader";
 import { IdConverter } from "./utils/uuid-utils";
 import { MigrationManager } from "./managers/migrationManager";
 import { migrationConfig } from "./config/config";
+import { PostgresLoader } from "./3-Load/postgres-loader";
 
 // Load environment variables
 dotenv.config();
@@ -30,13 +31,14 @@ program
     try {
       // Initialize services
       const snowflakeClient = new SnowflakeClient();
-      const supabaseLoader = new SupabaseLoader();
+      // const supabaseLoader = new SupabaseLoader();
+      const postgresLoader = new PostgresLoader();
       const idConverter = new IdConverter();
 
       // Initialize migration manager
       const migrationManager = new MigrationManager(
         snowflakeClient,
-        supabaseLoader,
+        postgresLoader,
         idConverter
       );
 
@@ -44,7 +46,7 @@ program
       await migrationManager.runCliMigration({
         entity: options.entity,
         batchSize: options.batchSize || migrationConfig.batchSize,
-        limit: options.limit || 1000,
+        limit: options.limit,
         offset: options.offset || 0,
         locale: options.locale || "en",
       });

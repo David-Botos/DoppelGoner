@@ -1,31 +1,43 @@
 {
-  "name": "rds-migration",
+  "name": "database-migration-tool",
   "version": "1.0.0",
-  "description": "Snowflake to RDS migration tool for HSDS data",
+  "description": "Tool for migrating data between different database systems",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "migrate": "node dist/src/index.js migrate",
-    "validate": "node dist/src/index.js validate",
-    "setup-db": "psql -h $PG_HOST -U $PG_USER -d $PG_DATABASE -f scripts/setup-postgres.sql"
+    "dev": "ts-node src/index.ts",
+    "test": "jest",
+    "lint": "eslint src/**/*.ts",
+    "execute-sql": "ts-node src/scripts/execute-sql.ts",
+    "postgres-performance": "ts-node src/scripts/postgres-performance.ts"
   },
+  "keywords": [
+    "database",
+    "migration",
+    "etl",
+    "postgres",
+    "snowflake",
+    "supabase"
+  ],
+  "author": "",
+  "license": "ISC",
   "dependencies": {
-    "@supabase/supabase-js": "^2.49.1",
-    "dotenv": "^16.0.3",
-    "pg": "^8.9.0",
-    "snowflake-sdk": "^1.6.21",
-    "uuid": "^11.1.0",
-    "winston": "^3.8.2"
+    "@supabase/supabase-js": "^2.31.0",
+    "dotenv": "^16.3.1",
+    "pg": "^8.11.2",
+    "snowflake-sdk": "^1.9.0",
+    "uuid": "^9.0.0"
   },
   "devDependencies": {
-    "@types/node": "^18.19.81",
-    "@types/pg": "^8.6.6",
+    "@types/node": "^20.4.9",
+    "@types/pg": "^8.10.2",
     "@types/snowflake-sdk": "^1.6.12",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.8.2"
-  },
-  "engines": {
-    "node": ">=16.0.0"
+    "@types/uuid": "^9.0.2",
+    "@typescript-eslint/eslint-plugin": "^6.3.0",
+    "@typescript-eslint/parser": "^6.3.0",
+    "eslint": "^8.46.0",
+    "ts-node": "^10.9.1",
+    "typescript": "^5.1.6"
   }
 }

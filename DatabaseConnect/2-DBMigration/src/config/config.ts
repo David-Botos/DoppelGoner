@@ -8,7 +8,7 @@ export const snowflakeConfig = {
   password: process.env.SNOWFLAKE_PASSWORD || "",
   warehouse: process.env.SNOWFLAKE_WAREHOUSE || "",
   database: "NORSE_STAGING",
-  schema: "WA211",
+  schema: "WHATCOMCOU",
   authenticator: "SNOWFLAKE",
 };
 
@@ -20,7 +20,7 @@ export const supabaseConfig = {
 
 // Migration configuration
 export const migrationConfig = {
-  batchSize: 100, // Number of records to process at once
+  batchSize: 1000, // Number of records to process at once
   logLevel: "info",
   enableValidation: true,
   // Tables to migrate in the specified order
@@ -32,4 +32,16 @@ export const migrationConfig = {
     "address", // Consolidated address table (replacing physical_address & postal_address)
     "phone",
   ],
+};
+
+export const hetznerPostgresConfig = {
+  host: process.env.POSTGRES_HOST || "10.0.0.1",
+  port: parseInt(process.env.POSTGRES_PORT || "5432", 10),
+  database: process.env.POSTGRES_DB || "dataplatform",
+  user: process.env.POSTGRES_USER || "postgres",
+  password: process.env.POSTGRES_PASSWORD || "",
+  ssl: false,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
 };
