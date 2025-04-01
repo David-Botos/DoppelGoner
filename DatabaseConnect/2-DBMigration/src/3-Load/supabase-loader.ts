@@ -5,14 +5,14 @@ import {
 } from "@supabase/supabase-js";
 import { supabaseConfig } from "../config/config";
 import {
-  SupabaseOrganization,
-  SupabaseService,
-  SupabaseLocation,
-  SupabaseServiceAtLocation,
-  SupabaseAddress,
-  SupabasePhone,
-  SupabaseMigrationLog,
-} from "../types/supabase-types";
+  PostgresOrganization,
+  PostgresService,
+  PostgresLocation,
+  PostgresServiceAtLocation,
+  PostgresAddress,
+  PostgresPhone,
+  PostgresMigrationLog,
+} from "../types/postgres-types";
 import { BaseLoader } from "./loader";
 import {
   batchRecords,
@@ -24,12 +24,12 @@ import { MetadataManager } from "./metadata-manager";
 
 // Type mapping for tables to their respective interfaces
 type TableTypes = {
-  organization: SupabaseOrganization;
-  service: SupabaseService;
-  location: SupabaseLocation;
-  service_at_location: SupabaseServiceAtLocation;
-  address: SupabaseAddress;
-  phone: SupabasePhone;
+  organization: PostgresOrganization;
+  service: PostgresService;
+  location: PostgresLocation;
+  service_at_location: PostgresServiceAtLocation;
+  address: PostgresAddress;
+  phone: PostgresPhone;
 };
 
 /**
@@ -468,7 +468,7 @@ export class SupabaseLoader extends BaseLoader {
     const executionTimeSeconds =
       (endTime.getTime() - startTime.getTime()) / 1000;
 
-    const migrationLog: Omit<SupabaseMigrationLog, "id"> = {
+    const migrationLog: Omit<PostgresMigrationLog, "id"> = {
       source_table: sourceTable,
       target_table: targetTable,
       records_migrated: recordsMigrated,

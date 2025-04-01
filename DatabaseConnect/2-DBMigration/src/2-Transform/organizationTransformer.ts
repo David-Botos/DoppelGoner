@@ -2,7 +2,7 @@ import { Transformer } from "./transformer";
 import {
   SnowflakeOrganization,
   SnowflakeOrganizationTranslation,
-  SupabaseOrganization,
+  PostgresOrganization,
 } from "../types";
 import { IdConverter } from "../utils/uuid-utils";
 import { v4 as uuidv4 } from "uuid";
@@ -10,7 +10,7 @@ import { v4 as uuidv4 } from "uuid";
 export class OrganizationTransformer extends Transformer<
   SnowflakeOrganization,
   SnowflakeOrganizationTranslation,
-  SupabaseOrganization
+  PostgresOrganization
 > {
   constructor(idConverter: IdConverter) {
     super(idConverter);
@@ -19,7 +19,7 @@ export class OrganizationTransformer extends Transformer<
   protected transformSingleRecord(
     source: SnowflakeOrganization,
     translation: SnowflakeOrganizationTranslation | null
-  ): SupabaseOrganization {
+  ): PostgresOrganization {
     const newId = uuidv4();
     return {
       id: newId,

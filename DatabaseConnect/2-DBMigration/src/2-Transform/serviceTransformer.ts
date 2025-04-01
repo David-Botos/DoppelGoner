@@ -2,20 +2,21 @@ import { Transformer } from "./transformer";
 import {
   SnowflakeService,
   SnowflakeServiceTranslation,
-  SupabaseOrganization,
-  SupabaseService,
+  PostgresOrganization,
+  PostgresService,
 } from "../types";
 import { IdConverter } from "../utils/uuid-utils";
 import { v4 as uuidv4 } from "uuid";
-import { createClient, SupabaseClient } from "@supabase/supabase-js";
-import { supabaseConfig } from "../config/config";
+// import { createClient, SupabaseClient } from "@supabase/supabase-js";
+// import { supabaseConfig } from "../config/config";
 import { tableExists } from "../utils/loader-utils";
-import getOrgBasedOnOriginalID from "../utils/transformer-utils";
+import { getOrgBasedOnOriginalIDFromPostgres } from "../utils/transformer-utils";
+import { PostgresClient } from "../services/postgres-client";
 
 export class ServiceTransformer extends Transformer<
   SnowflakeService,
   SnowflakeServiceTranslation,
-  SupabaseService
+  PostgresService
 > {
   constructor(idConverter: IdConverter) {
     super(idConverter);
@@ -24,17 +25,16 @@ export class ServiceTransformer extends Transformer<
   protected async transformSingleRecord(
     source: SnowflakeService,
     translation: SnowflakeServiceTranslation
-  ): Promise<SupabaseService> {
+  ): Promise<PostgresService> {
     const newId = uuidv4();
 
-    /** TODO: FK link service translation to program in supa
-     * use figure out if the program exists in supabase.  If not, do not try to populate program_id because it may violate FK constraints
-     **/
+    const postgresClient = new PostgresClient();
 
-    const supaClient = createClient(supabaseConfig.url, supabaseConfig.key);
-
-    const supaOrgEntry: SupabaseOrganization | undefined =
-      await getOrgBasedOnOriginalID(supaClient, source.ORGANIZATION_ID);
+    const supaOrgEntry: PostgresOrganization | undefined =
+      await getOrgBasedOnOriginalIDFromPostgres(
+        postgresClient,
+        source.ORGANIZATION_ID
+      );
 
     let newOrgFKId = "";
 
@@ -45,10 +45,10 @@ export class ServiceTransformer extends Transformer<
     return {
       id: newId,
       organization_id: newOrgFKId,
-      // program_id: source.PROGRAM_ID
-      //   ? this.idConverter.convertToUuid(source.PROGRAM_ID) ||
-      //     source.PROGRAM_ID.toString()
-      //   : undefined,
+      program_id: source.PROGRAM_ID
+        ? this.idConverter.convertToUuid(source.PROGRAM_ID) ||
+          source.PROGRAM_ID.toString()
+        : undefined,
       name: translation.NAME,
       alternate_name: translation?.ALTERNATE_NAME || undefined,
       description: translation?.DESCRIPTION || undefined,

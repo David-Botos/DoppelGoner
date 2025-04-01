@@ -1,8 +1,8 @@
-// Type definitions for Supabase database tables
+// Type definitions for Postgres database tables
 import { MigratedData } from "./transformation-types";
 
 // Organization table type
-export interface SupabaseOrganization extends MigratedData {
+export interface PostgresOrganization extends MigratedData {
   name: string;
   alternate_name?: string;
   description?: string;
@@ -14,7 +14,7 @@ export interface SupabaseOrganization extends MigratedData {
 }
 
 // Service table type
-export interface SupabaseService extends MigratedData {
+export interface PostgresService extends MigratedData {
   organization_id: string;
   program_id?: string;
   name: string;
@@ -37,7 +37,7 @@ export interface SupabaseService extends MigratedData {
 }
 
 // Location table type
-export interface SupabaseLocation extends MigratedData {
+export interface PostgresLocation extends MigratedData {
   organization_id: string;
   name?: string;
   alternate_name?: string;
@@ -50,14 +50,14 @@ export interface SupabaseLocation extends MigratedData {
 }
 
 // ServiceAtLocation table type
-export interface SupabaseServiceAtLocation extends MigratedData {
+export interface PostgresServiceAtLocation extends MigratedData {
   service_id: string;
   location_id: string;
   description?: string;
 }
 
 // Address table type (consolidated)
-export interface SupabaseAddress extends MigratedData {
+export interface PostgresAddress extends MigratedData {
   location_id: string;
   attention?: string;
   address_1: string;
@@ -71,7 +71,7 @@ export interface SupabaseAddress extends MigratedData {
 }
 
 // Phone table type
-export interface SupabasePhone extends MigratedData {
+export interface PostgresPhone extends MigratedData {
   location_id?: string;
   service_id?: string;
   organization_id?: string;
@@ -86,7 +86,7 @@ export interface SupabasePhone extends MigratedData {
 }
 
 // Migration log table type
-export interface SupabaseMigrationLog {
+export interface PostgresMigrationLog {
   id: number;
   source_table: string;
   target_table: string;

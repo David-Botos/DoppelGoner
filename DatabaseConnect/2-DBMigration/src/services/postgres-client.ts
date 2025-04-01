@@ -54,6 +54,8 @@ export class PostgresClient {
     try {
       const sql = fs.readFileSync(path.resolve(filePath), "utf8");
 
+      console.log(`Contents of ${filePath}: `, sql);
+
       // Split the SQL file into individual statements
       const statements = this.splitSqlStatements(sql);
 
@@ -95,7 +97,7 @@ export class PostgresClient {
 
   /**
    * Split SQL string into individual statements
-   * Handles comments and semicolons in string literals
+   * Handles comments, quoted strings, and dollar-quoted blocks
    */
   private splitSqlStatements(sql: string): string[] {
     // Remove comments
@@ -103,28 +105,70 @@ export class PostgresClient {
 
     const statements: string[] = [];
     let currentStatement = "";
-    let inString = false;
+    let inSingleQuote = false;
+    let inDollarQuote = false;
+    let currentDollarTag = "";
 
-    for (let i = 0; i < sql.length; i++) {
+    let i = 0;
+    while (i < sql.length) {
       const char = sql[i];
       const nextChar = sql[i + 1] || "";
 
-      // Handle string delimiters
+      // Handle single quote strings
       if (char === "'" && (i === 0 || sql[i - 1] !== "\\")) {
-        inString = !inString;
+        if (!inDollarQuote) {
+          // Only toggle if not inside a dollar-quoted string
+          inSingleQuote = !inSingleQuote;
+        }
       }
 
-      // If we're not in a string and we hit a semicolon, we're at the end of a statement
-      if (char === ";" && !inString) {
+      // Handle dollar-quoted strings
+      if (char === "$" && !inSingleQuote) {
+        // Check if this is the start of a dollar quote
+        if (!inDollarQuote) {
+          // Try to extract the dollar tag
+          const dollarTagMatch = sql.slice(i).match(/^\$([^$]*)\$/);
+
+          if (dollarTagMatch) {
+            const fullTag = dollarTagMatch[0]; // $TAG$
+            currentDollarTag = fullTag;
+            inDollarQuote = true;
+
+            // Add the opening tag to the current statement
+            currentStatement += fullTag;
+
+            // Skip past the dollar tag
+            i += fullTag.length;
+            continue;
+          }
+        }
+        // Check if this is the end of a dollar quote
+        else if (inDollarQuote && sql.slice(i).startsWith(currentDollarTag)) {
+          inDollarQuote = false;
+
+          // Add the closing tag to the current statement
+          currentStatement += currentDollarTag;
+
+          // Skip past the dollar tag
+          i += currentDollarTag.length;
+          continue;
+        }
+      }
+
+      // If we're not in a string or dollar-quoted block and we hit a semicolon,
+      // we're at the end of a statement
+      if (char === ";" && !inSingleQuote && !inDollarQuote) {
         statements.push(currentStatement + ";");
         currentStatement = "";
+        i++;
         continue;
       }
 
       currentStatement += char;
+      i++;
     }
 
-    // Add the last statement if it doesn't end with a semicolon
+    // Add the last statement if it doesn't end with a semicolon and isn't empty
     if (currentStatement.trim()) {
       statements.push(currentStatement);
     }

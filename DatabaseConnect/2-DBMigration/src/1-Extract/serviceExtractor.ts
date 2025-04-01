@@ -38,7 +38,7 @@ export class ServiceExtractor extends Extractor<
     // Add LIMIT and OFFSET in correct order
     if (limit !== undefined) {
       query += ` 
-        LIMIT ${limit};
+        LIMIT ${limit} 
         OFFSET ${offset}`;
     }
 
