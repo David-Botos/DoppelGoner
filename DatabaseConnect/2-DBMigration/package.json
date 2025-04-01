@@ -7,7 +7,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
-    "test": "jest",
+    "migrate": "node dist/src/index.js migrate",
     "lint": "eslint src/**/*.ts",
     "sql": "ts-node src/scripts/execute-sql.ts",
     "performance": "ts-node src/scripts/postgres-performance.ts"
