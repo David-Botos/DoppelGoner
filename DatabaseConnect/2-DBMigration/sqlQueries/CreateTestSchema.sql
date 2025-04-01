@@ -4,7 +4,7 @@ DROP SCHEMA IF EXISTS test CASCADE;
 -- Create test schema
 CREATE SCHEMA test;
 
--- Create tables in test schema by copying from public schema
+-- Create tables in test schema
 CREATE TABLE test.accessibility_for_disabilities (
     id character(36) NOT NULL,
     location_id character(36) NOT NULL,
@@ -13,7 +13,7 @@ CREATE TABLE test.accessibility_for_disabilities (
     last_modified timestamp without time zone,
     created timestamp without time zone,
     original_id text,
-    CONSTRAINT accessibility_for_disabilities_pkey PRIMARY KEY (id)
+    CONSTRAINT test_accessibility_for_disabilities_pkey PRIMARY KEY (id)
 );
 
 CREATE TABLE test.address (
@@ -31,7 +31,7 @@ CREATE TABLE test.address (
     last_modified timestamp without time zone,
     created timestamp without time zone,
     original_id text,
-    CONSTRAINT address_pkey PRIMARY KEY (id)
+    CONSTRAINT test_address_pkey PRIMARY KEY (id)
 );
 
 CREATE TABLE test.contact (
@@ -47,7 +47,7 @@ CREATE TABLE test.contact (
     created timestamp without time zone,
     original_id text,
     original_translations_id text,
-    CONSTRAINT contact_pkey PRIMARY KEY (id)
+    CONSTRAINT test_contact_pkey PRIMARY KEY (id)
 );
 
 CREATE TABLE test.failed_migration_records (
@@ -64,7 +64,7 @@ CREATE TABLE test.failed_migration_records (
     resolution_notes text,
     retry_count integer NOT NULL DEFAULT 0,
     last_retry_at timestamp without time zone,
-    CONSTRAINT failed_migration_records_pkey PRIMARY KEY (id)
+    CONSTRAINT test_failed_migration_records_pkey PRIMARY KEY (id)
 );
 
 CREATE TABLE test.funding (
@@ -75,7 +75,7 @@ CREATE TABLE test.funding (
     last_modified timestamp without time zone,
     created timestamp without time zone,
     original_id text,
-    CONSTRAINT funding_pkey PRIMARY KEY (id)
+    CONSTRAINT test_funding_pkey PRIMARY KEY (id)
 );
 
 CREATE TABLE test.language (
@@ -86,55 +86,7 @@ CREATE TABLE test.language (
     last_modified timestamp without time zone,
     created timestamp without time zone,
     original_id text,
-    CONSTRAINT language_pkey PRIMARY KEY (id)
-);
-
-CREATE TABLE test.location (
-    id character(36) NOT NULL,
-    organization_id character(36) NOT NULL,
-    name text,
-    alternate_name text,
-    description text,
-    short_description text,
-    transportation text,
-    latitude numeric(10,6),
-    longitude numeric(10,6),
-    location_type text,
-    last_modified timestamp without time zone,
-    created timestamp without time zone,
-    original_id text,
-    original_translations_id text,
-    CONSTRAINT location_pkey PRIMARY KEY (id)
-);
-
-CREATE TABLE test.metadata (
-    id uuid NOT NULL,
-    resource_id text NOT NULL,
-    resource_type text NOT NULL,
-    last_action_date timestamp with time zone NOT NULL,
-    last_action_type text NOT NULL,
-    field_name text NOT NULL,
-    previous_value text,
-    replacement_value text,
-    updated_by text NOT NULL,
-    created timestamp with time zone NOT NULL,
-    last_modified timestamp with time zone NOT NULL,
-    original_id text,
-    CONSTRAINT metadata_pkey PRIMARY KEY (id)
-);
-
-CREATE TABLE test.migration_log (
-    id integer NOT NULL DEFAULT nextval('migration_log_id_seq'::regclass),
-    source_table text NOT NULL,
-    target_table text NOT NULL,
-    records_migrated integer NOT NULL,
-    success_count integer NOT NULL,
-    failure_count integer NOT NULL,
-    error_messages text,
-    started_at timestamp without time zone NOT NULL,
-    completed_at timestamp without time zone NOT NULL,
-    execution_time_seconds numeric(10,2) NOT NULL,
-    CONSTRAINT migration_log_pkey PRIMARY KEY (id)
+    CONSTRAINT test_language_pkey PRIMARY KEY (id)
 );
 
 CREATE TABLE test.organization (
@@ -153,7 +105,57 @@ CREATE TABLE test.organization (
     created timestamp without time zone,
     original_id text,
     original_translations_id text,
-    CONSTRAINT organization_pkey PRIMARY KEY (id)
+    CONSTRAINT test_organization_pkey PRIMARY KEY (id)
+);
+
+CREATE TABLE test.location (
+    id character(36) NOT NULL,
+    organization_id character(36) NOT NULL,
+    name text,
+    alternate_name text,
+    description text,
+    short_description text,
+    transportation text,
+    latitude numeric(10,6),
+    longitude numeric(10,6),
+    location_type text,
+    last_modified timestamp without time zone,
+    created timestamp without time zone,
+    original_id text,
+    original_translations_id text,
+    CONSTRAINT test_location_pkey PRIMARY KEY (id)
+);
+
+CREATE TABLE test.metadata (
+    id uuid NOT NULL,
+    resource_id text NOT NULL,
+    resource_type text NOT NULL,
+    last_action_date timestamp with time zone NOT NULL,
+    last_action_type text NOT NULL,
+    field_name text NOT NULL,
+    previous_value text,
+    replacement_value text,
+    updated_by text NOT NULL,
+    created timestamp with time zone NOT NULL,
+    last_modified timestamp with time zone NOT NULL,
+    original_id text,
+    CONSTRAINT test_metadata_pkey PRIMARY KEY (id)
+);
+
+CREATE SEQUENCE IF NOT EXISTS test.migration_log_id_seq;
+
+CREATE TABLE test.migration_log (
+    id integer NOT NULL DEFAULT nextval('test.migration_log_id_seq'::regclass),
+    source_table text NOT NULL,
+    target_table text NOT NULL,
+    records_migrated integer NOT NULL,
+    success_count integer NOT NULL,
+    failure_count integer NOT NULL,
+    error_messages text,
+    started_at timestamp without time zone NOT NULL,
+    completed_at timestamp without time zone NOT NULL,
+    execution_time_seconds numeric(10,2) NOT NULL,
+    CONSTRAINT test_migration_log_pkey PRIMARY KEY (id)
 );
 
 CREATE TABLE test.other_attribute (
@@ -164,7 +166,7 @@ CREATE TABLE test.other_attribute (
     last_modified timestamp without time zone,
     created timestamp without time zone,
     original_id text,
-    CONSTRAINT other_attribute_pkey PRIMARY KEY (id)
+    CONSTRAINT test_other_attribute_pkey PRIMARY KEY (id)
 );
 
 CREATE TABLE test.phone (
@@ -184,7 +186,7 @@ CREATE TABLE test.phone (
     created timestamp without time zone,
     original_id text,
     original_translations_id text,
-    CONSTRAINT phone_pkey PRIMARY KEY (id)
+    CONSTRAINT test_phone_pkey PRIMARY KEY (id)
 );
 
 CREATE TABLE test.program (
@@ -196,7 +198,7 @@ CREATE TABLE test.program (
     created timestamp without time zone,
     original_id text,
     original_translations_id text,
-    CONSTRAINT program_pkey PRIMARY KEY (id)
+    CONSTRAINT test_program_pkey PRIMARY KEY (id)
 );
 
 CREATE TABLE test.required_document (
@@ -206,7 +208,7 @@ CREATE TABLE test.required_document (
     last_modified timestamp without time zone,
     created timestamp without time zone,
     original_id text,
-    CONSTRAINT required_document_pkey PRIMARY KEY (id)
+    CONSTRAINT test_required_document_pkey PRIMARY KEY (id)
 );
 
 CREATE TABLE test.schedule (
@@ -224,7 +226,7 @@ CREATE TABLE test.schedule (
     last_modified timestamp without time zone,
     created timestamp without time zone,
     original_id text,
-    CONSTRAINT schedule_pkey PRIMARY KEY (id)
+    CONSTRAINT test_schedule_pkey PRIMARY KEY (id)
 );
 
 CREATE TABLE test.service (
@@ -252,7 +254,7 @@ CREATE TABLE test.service (
     created timestamp without time zone,
     original_id text,
     original_translations_id text,
-    CONSTRAINT service_pkey PRIMARY KEY (id)
+    CONSTRAINT test_service_pkey PRIMARY KEY (id)
 );
 
 CREATE TABLE test.service_area (
@@ -266,7 +268,7 @@ CREATE TABLE test.service_area (
     created timestamp without time zone,
     original_id character varying(100),
     original_translations_id character varying(100),
-    CONSTRAINT service_area_pkey PRIMARY KEY (id)
+    CONSTRAINT test_service_area_pkey PRIMARY KEY (id)
 );
 
 CREATE TABLE test.service_at_location (
@@ -278,17 +280,7 @@ CREATE TABLE test.service_at_location (
     created timestamp without time zone,
     original_id text,
     original_translations_id text,
-    CONSTRAINT service_at_location_pkey PRIMARY KEY (id)
-);
-
-CREATE TABLE test.service_taxonomy (
-    id character(36) NOT NULL,
-    service_id character(36) NOT NULL,
-    taxonomy_term_id character(36) NOT NULL,
-    last_modified timestamp without time zone,
-    created timestamp without time zone,
-    original_id text,
-    CONSTRAINT service_taxonomy_pkey PRIMARY KEY (id)
+    CONSTRAINT test_service_at_location_pkey PRIMARY KEY (id)
 );
 
 CREATE TABLE test.taxonomy_term (
@@ -301,96 +293,155 @@ CREATE TABLE test.taxonomy_term (
     last_modified timestamp without time zone,
     created timestamp without time zone,
     original_id text,
-    CONSTRAINT taxonomy_term_pkey PRIMARY KEY (id)
+    CONSTRAINT test_taxonomy_term_pkey PRIMARY KEY (id)
 );
 
--- Add Foreign Key constraints
+CREATE TABLE test.service_taxonomy (
+    id character(36) NOT NULL,
+    service_id character(36) NOT NULL,
+    taxonomy_term_id character(36) NOT NULL,
+    last_modified timestamp without time zone,
+    created timestamp without time zone,
+    original_id text,
+    CONSTRAINT test_service_taxonomy_pkey PRIMARY KEY (id)
+);
+
+-- Add Foreign Key constraints within test schema only
 ALTER TABLE test.accessibility_for_disabilities
-    ADD CONSTRAINT accessibility_for_disabilities_location_id_fkey
+    ADD CONSTRAINT test_accessibility_for_disabilities_location_id_fkey
     FOREIGN KEY (location_id) REFERENCES test.location(id);
 
 ALTER TABLE test.address
-    ADD CONSTRAINT address_location_id_fkey
+    ADD CONSTRAINT test_address_location_id_fkey
     FOREIGN KEY (location_id) REFERENCES test.location(id);
 
 ALTER TABLE test.contact
-    ADD CONSTRAINT contact_organization_id_fkey
+    ADD CONSTRAINT test_contact_organization_id_fkey
     FOREIGN KEY (organization_id) REFERENCES test.organization(id),
-    ADD CONSTRAINT contact_service_id_fkey
+    ADD CONSTRAINT test_contact_service_id_fkey
     FOREIGN KEY (service_id) REFERENCES test.service(id),
-    ADD CONSTRAINT contact_service_at_location_id_fkey
+    ADD CONSTRAINT test_contact_service_at_location_id_fkey
     FOREIGN KEY (service_at_location_id) REFERENCES test.service_at_location(id);
 
 ALTER TABLE test.funding
-    ADD CONSTRAINT funding_organization_id_fkey
+    ADD CONSTRAINT test_funding_organization_id_fkey
     FOREIGN KEY (organization_id) REFERENCES test.organization(id),
-    ADD CONSTRAINT funding_service_id_fkey
+    ADD CONSTRAINT test_funding_service_id_fkey
     FOREIGN KEY (service_id) REFERENCES test.service(id);
 
 ALTER TABLE test.language
-    ADD CONSTRAINT language_location_id_fkey
+    ADD CONSTRAINT test_language_location_id_fkey
     FOREIGN KEY (location_id) REFERENCES test.location(id),
-    ADD CONSTRAINT language_service_id_fkey
+    ADD CONSTRAINT test_language_service_id_fkey
     FOREIGN KEY (service_id) REFERENCES test.service(id);
 
 ALTER TABLE test.location
-    ADD CONSTRAINT location_organization_id_fkey
+    ADD CONSTRAINT test_location_organization_id_fkey
     FOREIGN KEY (organization_id) REFERENCES test.organization(id);
 
 ALTER TABLE test.organization
-    ADD CONSTRAINT organization_parent_organization_id_fkey
+    ADD CONSTRAINT test_organization_parent_organization_id_fkey
     FOREIGN KEY (parent_organization_id) REFERENCES test.organization(id);
 
 ALTER TABLE test.other_attribute
-    ADD CONSTRAINT other_attribute_taxonomy_term_id_fkey
+    ADD CONSTRAINT test_other_attribute_taxonomy_term_id_fkey
     FOREIGN KEY (taxonomy_term_id) REFERENCES test.taxonomy_term(id);
 
 ALTER TABLE test.phone
-    ADD CONSTRAINT phone_location_id_fkey
+    ADD CONSTRAINT test_phone_location_id_fkey
     FOREIGN KEY (location_id) REFERENCES test.location(id),
-    ADD CONSTRAINT phone_organization_id_fkey
+    ADD CONSTRAINT test_phone_organization_id_fkey
     FOREIGN KEY (organization_id) REFERENCES test.organization(id),
-    ADD CONSTRAINT phone_service_at_location_id_fkey
+    ADD CONSTRAINT test_phone_service_at_location_id_fkey
     FOREIGN KEY (service_at_location_id) REFERENCES test.service_at_location(id),
-    ADD CONSTRAINT phone_service_id_fkey
+    ADD CONSTRAINT test_phone_service_id_fkey
     FOREIGN KEY (service_id) REFERENCES test.service(id);
 
 ALTER TABLE test.program
-    ADD CONSTRAINT program_organization_id_fkey
+    ADD CONSTRAINT test_program_organization_id_fkey
     FOREIGN KEY (organization_id) REFERENCES test.organization(id);
 
 ALTER TABLE test.required_document
-    ADD CONSTRAINT required_document_service_id_fkey
+    ADD CONSTRAINT test_required_document_service_id_fkey
     FOREIGN KEY (service_id) REFERENCES test.service(id);
 
 ALTER TABLE test.schedule
-    ADD CONSTRAINT schedule_location_id_fkey
+    ADD CONSTRAINT test_schedule_location_id_fkey
     FOREIGN KEY (location_id) REFERENCES test.location(id),
-    ADD CONSTRAINT schedule_service_at_location_id_fkey
+    ADD CONSTRAINT test_schedule_service_at_location_id_fkey
     FOREIGN KEY (service_at_location_id) REFERENCES test.service_at_location(id),
-    ADD CONSTRAINT schedule_service_id_fkey
+    ADD CONSTRAINT test_schedule_service_id_fkey
     FOREIGN KEY (service_id) REFERENCES test.service(id);
 
 ALTER TABLE test.service
-    ADD CONSTRAINT service_organization_id_fkey
+    ADD CONSTRAINT test_service_organization_id_fkey
     FOREIGN KEY (organization_id) REFERENCES test.organization(id);
 
 ALTER TABLE test.service_area
-    ADD CONSTRAINT service_area_service_id_fkey
+    ADD CONSTRAINT test_service_area_service_id_fkey
     FOREIGN KEY (service_id) REFERENCES test.service(id);
 
 ALTER TABLE test.service_at_location
-    ADD CONSTRAINT service_at_location_location_id_fkey
+    ADD CONSTRAINT test_service_at_location_location_id_fkey
     FOREIGN KEY (location_id) REFERENCES test.location(id),
-    ADD CONSTRAINT service_at_location_service_id_fkey
+    ADD CONSTRAINT test_service_at_location_service_id_fkey
     FOREIGN KEY (service_id) REFERENCES test.service(id);
 
 ALTER TABLE test.service_taxonomy
-    ADD CONSTRAINT service_taxonomy_service_id_fkey
+    ADD CONSTRAINT test_service_taxonomy_service_id_fkey
     FOREIGN KEY (service_id) REFERENCES test.service(id),
-    ADD CONSTRAINT service_taxonomy_taxonomy_term_id_fkey
+    ADD CONSTRAINT test_service_taxonomy_taxonomy_term_id_fkey
     FOREIGN KEY (taxonomy_term_id) REFERENCES test.taxonomy_term(id);
 
 ALTER TABLE test.taxonomy_term
-    ADD CONSTRAINT taxonomy_term_parent_id_fkey
+    ADD CONSTRAINT test_taxonomy_term_parent_id_fkey
     FOREIGN KEY (parent_id) REFERENCES test.taxonomy_term(id);
+
+-- Script to safely truncate only public schema tables
+CREATE OR REPLACE FUNCTION truncate_public_schema() RETURNS void AS $$
+DECLARE
+    r RECORD;
+BEGIN
+    -- Disable foreign key constraints
+    SET session_replication_role = 'replica';
+    
+    -- Loop through all tables in the public schema
+    FOR r IN (
+        SELECT tablename FROM pg_tables 
+        WHERE schemaname = 'public'
+        ORDER BY tablename
+    )
+    LOOP
+        -- Skip PostGIS system tables if they exist
+        IF r.tablename NOT IN ('spatial_ref_sys') THEN
+            EXECUTE 'TRUNCATE TABLE public."' || r.tablename || '" RESTRICT';
+        END IF;
+    END LOOP;
+    
+    -- Re-enable foreign key constraints
+    SET session_replication_role = 'origin';
+END;
+$$ LANGUAGE plpgsql;
+
+-- Script to safely truncate only test schema tables
+CREATE OR REPLACE FUNCTION truncate_test_schema() RETURNS void AS $$
+DECLARE
+    r RECORD;
+BEGIN
+    -- Disable foreign key constraints
+    SET session_replication_role = 'replica';
+    
+    -- Loop through all tables in the test schema
+    FOR r IN (
+        SELECT tablename FROM pg_tables 
+        WHERE schemaname = 'test'
+        ORDER BY tablename
+    )
+    LOOP
+        EXECUTE 'TRUNCATE TABLE test."' || r.tablename || '" RESTRICT';
+    END LOOP;
+    
+    -- Re-enable foreign key constraints
+    SET session_replication_role = 'origin';
+END;
+$$ LANGUAGE plpgsql;
