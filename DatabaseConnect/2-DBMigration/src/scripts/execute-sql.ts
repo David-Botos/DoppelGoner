@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import path from "path";
 import { PostgresClient } from "../services/postgres-client";
+import chalk from "chalk";
+
+// Install chalk with: npm install chalk
 
 async function main() {
   try {
@@ -18,25 +21,52 @@ async function main() {
 
     console.log(`Executing SQL file: ${resolvedPath}`);
 
-    // Create an instance of Postgresclient
+    // Create an instance of PostgresClient
     const client = new PostgresClient();
 
     // Execute the SQL file
-    const result = await client.executeSqlFile(resolvedPath);
+    const results = await client.executeSqlFile(resolvedPath);
 
-    console.log("SQL execution successful!");
-    console.log(`Returned ${result.length} rows`);
+    console.log(chalk.green("SQL execution successful!"));
 
-    // If you want to display the results
-    if (result.length > 0) {
-      console.log("Results:");
-      console.table(result);
+    // Display results for each statement
+    if (results && Array.isArray(results)) {
+      console.log(
+        chalk.yellow(`File contained ${results.length} SQL statements.`)
+      );
+
+      results.forEach((result, index) => {
+        // Command results like CREATE, DROP, etc.
+        if (result && typeof result === "object" && "command" in result) {
+          console.log(
+            chalk.cyan(`\nStatement ${index + 1}: ${result.command}`)
+          );
+          console.log(`Affected rows: ${result.rowCount}`);
+          return;
+        }
+
+        // Query results
+        if (Array.isArray(result) && result.length > 0) {
+          console.log(
+            chalk.cyan(
+              `\nStatement ${index + 1} results (${result.length} rows):`
+            )
+          );
+          console.table(result);
+        } else if (Array.isArray(result) && result.length === 0) {
+          console.log(
+            chalk.cyan(`\nStatement ${index + 1}: Query returned 0 rows`)
+          );
+        }
+      });
+    } else {
+      console.log("No results returned");
     }
 
-    // Close the connection pool using the existing close() method
+    // Close the connection pool
     client.close();
   } catch (error) {
-    console.error("Error executing SQL file:", error);
+    console.error(chalk.red("Error executing SQL file:"), error);
     process.exit(1);
   }
 }

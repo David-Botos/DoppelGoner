@@ -1,5 +1,7 @@
 import { Pool, PoolClient, QueryResult } from "pg";
 import { hetznerPostgresConfig } from "../config/config";
+import * as fs from "fs";
+import * as path from "path";
 
 /**
  * Client class for PostgreSQL database operations
@@ -42,23 +44,92 @@ export class PostgresClient {
   }
 
   /**
-   * Execute SQL from a file
+   * Execute SQL from a file, supporting multiple statements
    * @param filePath Path to SQL file
-   * @returns Query result rows
+   * @returns Array of query results
    */
   async executeSqlFile(filePath: string): Promise<any[]> {
+    const client = await this.pool.connect();
+
     try {
-      const fs = require("fs");
-      const path = require("path");
-
       const sql = fs.readFileSync(path.resolve(filePath), "utf8");
-      const result = await this.pool.query(sql);
 
-      return result.rows;
+      // Split the SQL file into individual statements
+      const statements = this.splitSqlStatements(sql);
+
+      // Execute each statement and collect results
+      const results: QueryResult[] = [];
+
+      for (const statement of statements) {
+        // Skip empty statements
+        if (!statement.trim()) continue;
+
+        try {
+          const result = await client.query(statement);
+          results.push(result);
+        } catch (err) {
+          console.error(`Error executing statement: ${statement}`);
+          throw err;
+        }
+      }
+
+      // Return all results
+      return results.map((result) => {
+        // Include command and rowCount for non-SELECT queries
+        if (!result.rows || result.rows.length === 0) {
+          return {
+            command: result.command,
+            rowCount: result.rowCount,
+            rows: [],
+          };
+        }
+        return result.rows;
+      });
     } catch (error) {
       console.error(`Error executing SQL file ${filePath}:`, error);
       throw error;
+    } finally {
+      client.release();
     }
+  }
+
+  /**
+   * Split SQL string into individual statements
+   * Handles comments and semicolons in string literals
+   */
+  private splitSqlStatements(sql: string): string[] {
+    // Remove comments
+    sql = sql.replace(/--.*$/gm, "");
+
+    const statements: string[] = [];
+    let currentStatement = "";
+    let inString = false;
+
+    for (let i = 0; i < sql.length; i++) {
+      const char = sql[i];
+      const nextChar = sql[i + 1] || "";
+
+      // Handle string delimiters
+      if (char === "'" && (i === 0 || sql[i - 1] !== "\\")) {
+        inString = !inString;
+      }
+
+      // If we're not in a string and we hit a semicolon, we're at the end of a statement
+      if (char === ";" && !inString) {
+        statements.push(currentStatement + ";");
+        currentStatement = "";
+        continue;
+      }
+
+      currentStatement += char;
+    }
+
+    // Add the last statement if it doesn't end with a semicolon
+    if (currentStatement.trim()) {
+      statements.push(currentStatement);
+    }
+
+    return statements;
   }
 
   /**
@@ -87,22 +158,26 @@ export class PostgresClient {
   /**
    * Check if a table exists in PostgreSQL
    * @param tableName Table name to check
+   * @param schema Schema name (defaults to 'public')
    * @returns Boolean indicating if table exists
    */
-  async tableExists(tableName: string): Promise<boolean> {
+  async tableExists(tableName: string, schema = "public"): Promise<boolean> {
     try {
       const query = `
         SELECT EXISTS (
           SELECT FROM information_schema.tables 
-          WHERE table_schema = 'public'
-          AND table_name = $1
+          WHERE table_schema = $1
+          AND table_name = $2
         );
       `;
 
-      const result = await this.pool.query(query, [tableName]);
+      const result = await this.pool.query(query, [schema, tableName]);
       return result.rows[0].exists;
     } catch (error) {
-      console.error(`Error checking if table ${tableName} exists:`, error);
+      console.error(
+        `Error checking if table ${schema}.${tableName} exists:`,
+        error
+      );
       // For unexpected errors, assume the table exists to prevent blocking operations
       return true;
     }
