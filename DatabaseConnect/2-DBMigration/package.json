@@ -9,8 +9,8 @@
     "dev": "ts-node src/index.ts",
     "test": "jest",
     "lint": "eslint src/**/*.ts",
-    "execute-sql": "ts-node src/scripts/execute-sql.ts",
-    "postgres-performance": "ts-node src/scripts/postgres-performance.ts"
+    "sql": "ts-node src/scripts/execute-sql.ts",
+    "performance": "ts-node src/scripts/postgres-performance.ts"
   },
   "keywords": [
     "database",
@@ -24,9 +24,12 @@
   "license": "ISC",
   "dependencies": {
     "@supabase/supabase-js": "^2.31.0",
+    "chalk": "^5.4.1",
+    "cli-table3": "^0.6.5",
     "dotenv": "^16.3.1",
     "pg": "^8.11.2",
     "snowflake-sdk": "^1.9.0",
+    "table": "^6.9.0",
     "uuid": "^9.0.0"
   },
   "devDependencies": {
