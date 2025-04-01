@@ -66,7 +66,7 @@ export class MigrationManager {
   }
 
   /**
-   * Execute migration for a specific entity type
+   * Execute migration for a specific entity type with batch optimization
    */
   async migrateEntity(
     entityType: string,
@@ -103,15 +103,22 @@ export class MigrationManager {
       const dataMap = await extractor.extract(offset, locale, limit);
       console.log(`Extracted ${dataMap.size} ${entityType} records`);
 
-      // 2. Transform data
-      console.log(`Transforming ${entityType} data...`);
-      const transformedData = await transformer.transform(dataMap);
+      // 2. Transform data using batch processing
+      console.log(`Transforming ${entityType} data in batches...`);
+      console.time("transform");
+      const transformationBatchSize = migrationConfig.batchSize || 100;
+      const transformedData = await transformer.transform(
+        dataMap,
+        transformationBatchSize
+      );
+      console.timeEnd("transform");
       console.log(
         `Transformed ${transformedData.length} ${entityType} records`
       );
 
-      // 3. Load data into Supabase
-      console.log(`Loading ${entityType} data into Supabase...`);
+      // 3. Load data into Postgres
+      console.log(`Loading ${entityType} data...`);
+
       // Log a sample record for debugging
       if (transformedData.length > 0) {
         console.log(
@@ -129,8 +136,8 @@ export class MigrationManager {
       // Set the schema based on test mode
       const schema = testMode ? "test" : "public";
 
-      // Use upsertData method with source table information
-      // Skip table existence check since we're sure the tables exist
+      // Use upsertData method with optimized batch size
+      console.time("load");
       const loadResult = await this.postgresLoader.upsertData(
         entityType,
         transformedData,
@@ -141,6 +148,7 @@ export class MigrationManager {
         constraints,
         schema
       );
+      console.timeEnd("load");
 
       successCount = loadResult.success;
       failureCount = transformedData.length - loadResult.success;
@@ -152,7 +160,7 @@ export class MigrationManager {
           `${failureCount} records failed to migrate. Check the failed_migration_records table.`
         );
 
-        // Optionally, get a count of distinct error types
+        // Get a count of distinct error types
         const failedRecords = await this.postgresLoader.getFailedRecords(
           entityType
         );
@@ -173,9 +181,10 @@ export class MigrationManager {
         }
       }
 
-      // 4. Validation is now handled automatically in the loader
-
       const endTime = new Date();
+      const elapsedMs = endTime.getTime() - startTime.getTime();
+      console.log(`Total migration time: ${elapsedMs / 1000} seconds`);
+
       return {
         success: successCount,
         failure: failureCount,

@@ -20,7 +20,7 @@ export const supabaseConfig = {
 
 // Migration configuration
 export const migrationConfig = {
-  batchSize: 1000, // Number of records to process at once
+  batchSize: 2000, // Number of records to process at once
   logLevel: "info",
   enableValidation: true,
   // Tables to migrate in the specified order
