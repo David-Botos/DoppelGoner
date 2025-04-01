@@ -73,7 +73,8 @@ export class MigrationManager {
     batchSize: number = migrationConfig.batchSize,
     limit?: number,
     offset: number = 0,
-    locale: string = "en"
+    locale: string = "en",
+    testMode: boolean = false
   ): Promise<{
     success: number;
     failure: number;
@@ -125,6 +126,9 @@ export class MigrationManager {
       // Fetch the proper predefined constraints from the util
       const constraints = PREDEFINED_CONSTRAINTS.entityType;
 
+      // Set the schema based on test mode
+      const schema = testMode ? "test" : "public";
+
       // Use upsertData method with source table information
       // Skip table existence check since we're sure the tables exist
       const loadResult = await this.postgresLoader.upsertData(
@@ -134,7 +138,8 @@ export class MigrationManager {
         batchSize,
         sourceTable,
         false,
-        constraints
+        constraints,
+        schema
       );
 
       successCount = loadResult.success;
@@ -201,7 +206,8 @@ export class MigrationManager {
   async migrateAll(
     limit: number = 1000,
     offset: number = 0,
-    locale: string = "en"
+    locale: string = "en",
+    testMode: boolean = false
   ): Promise<
     Map<
       string,
@@ -230,6 +236,7 @@ export class MigrationManager {
     console.log(`Locale: ${locale}`);
     console.log(`Validation Enabled: ${migrationConfig.enableValidation}`);
     console.log(`Migration Order: ${tablesToMigrate.join(", ")}`);
+    console.log(`Test Mode: ${testMode}`);
 
     // Migrate entities in the order specified in migrationConfig
     for (const entityType of tablesToMigrate) {
@@ -240,7 +247,8 @@ export class MigrationManager {
         batchSize,
         limit,
         offset,
-        locale
+        locale,
+        testMode
       );
 
       results.set(entityType, result);
@@ -267,8 +275,16 @@ export class MigrationManager {
     limit?: number;
     offset?: number;
     locale?: string;
+    testMode?: boolean;
   }): Promise<void> {
-    const { entity, batchSize, limit, offset = 0, locale = "en" } = args;
+    const {
+      entity,
+      batchSize,
+      limit,
+      offset = 0,
+      locale = "en",
+      testMode = false,
+    } = args;
 
     console.log("Starting migration with parameters:");
     console.log(`Entity: ${entity || "ALL"}`);
@@ -276,6 +292,7 @@ export class MigrationManager {
     console.log(`Limit: ${limit === undefined ? "ALL" : limit}`);
     console.log(`Offset: ${offset}`);
     console.log(`Locale: ${locale}`);
+    console.log(`Test Mode: ${testMode}`);
 
     try {
       if (entity) {
@@ -285,7 +302,8 @@ export class MigrationManager {
           batchSize,
           limit,
           offset,
-          locale
+          locale,
+          testMode
         );
 
         console.log(`Migration completed for ${entity}`);
@@ -296,7 +314,7 @@ export class MigrationManager {
         console.log(`Duration: ${duration.toFixed(2)} seconds`);
       } else {
         // Migrate all entities
-        const results = await this.migrateAll(limit, offset, locale);
+        const results = await this.migrateAll(limit, offset, locale, testMode);
 
         console.log("Migration completed for all entities");
 

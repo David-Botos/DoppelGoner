@@ -104,7 +104,7 @@ export abstract class BaseLoader {
       data,
       batchSize,
       sourceTable,
-      skipTableCheck
+      skipTableCheck,
     );
   }
 

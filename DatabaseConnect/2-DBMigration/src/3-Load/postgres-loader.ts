@@ -44,7 +44,8 @@ export class PostgresLoader extends BaseLoader {
   protected async loadDataInternal<T extends Record<string, any>>(
     tableName: string,
     data: T[],
-    batchSize: number = 1000
+    batchSize: number = 1000,
+    schema: string = "public"
   ): Promise<{ success: number; errors: Error[] }> {
     let successCount = 0;
     const errors: Error[] = [];
@@ -107,7 +108,7 @@ export class PostgresLoader extends BaseLoader {
 
           // Build the INSERT query
           const query = `
-            INSERT INTO ${tableName} (${columns.join(", ")})
+            INSERT INTO ${schema}.${tableName} (${columns.join(", ")})
             VALUES ${placeholders.join(", ")}
             RETURNING id
           `;
@@ -240,7 +241,7 @@ export class PostgresLoader extends BaseLoader {
 
   /**
    * PostgreSQL-specific implementation of upsert functionality
-   * Completely rewritten to handle batches efficiently and separate valid/invalid records
+   * TODO: migrate how the batching works in this implementation to the abstract class(?)
    */
   override async upsertData<T extends Record<string, any>>(
     tableName: string,
@@ -249,7 +250,8 @@ export class PostgresLoader extends BaseLoader {
     batchSize: number = 1000,
     sourceTable: string = "unknown",
     skipTableCheck: boolean = false,
-    tableConstraints?: TableConstraints
+    tableConstraints?: TableConstraints,
+    schema: string = "public"
   ): Promise<{ success: number; errors: Error[] }> {
     // Pre-processing logic
     const startTime = new Date();
@@ -259,9 +261,11 @@ export class PostgresLoader extends BaseLoader {
     try {
       // Verify table exists (if not skipped)
       if (!skipTableCheck) {
-        const exists = await this.tableExists(tableName);
+        const exists = await this.tableExists(tableName, schema);
         if (!exists) {
-          throw new Error(`Table ${tableName} does not exist in PostgreSQL`);
+          throw new Error(
+            `Table ${tableName} does not exist in schema ${schema}`
+          );
         }
       }
 
@@ -306,7 +310,8 @@ export class PostgresLoader extends BaseLoader {
             const batchResult = await this.processBatchUpsert(
               tableName,
               batch,
-              onConflict
+              onConflict,
+              schema
             );
             successCount += batchResult.successCount;
 
@@ -326,7 +331,8 @@ export class PostgresLoader extends BaseLoader {
                 const result = await this.processSingleRecordUpsert(
                   tableName,
                   record,
-                  onConflict
+                  onConflict,
+                  schema
                 );
                 if (result.success) {
                   successCount++;
@@ -400,7 +406,8 @@ export class PostgresLoader extends BaseLoader {
   private async processBatchUpsert<T extends Record<string, any>>(
     tableName: string,
     batch: T[],
-    onConflict: string
+    onConflict: string,
+    schema: string = "public"
   ): Promise<{ successCount: number; errors: Error[] }> {
     let successCount = 0;
     const errors: Error[] = [];
@@ -409,6 +416,8 @@ export class PostgresLoader extends BaseLoader {
     // Execute as a transaction
     await this.client.executeTransaction(async (dbClient) => {
       if (batch.length === 0) return;
+
+      console.log(`using schema: ${schema} for ${tableName}`);
 
       // Get column names from the first record
       const columns = Object.keys(batch[0]);
@@ -437,7 +446,7 @@ export class PostgresLoader extends BaseLoader {
 
       // Build the complete UPSERT query with RETURNING
       const query = `
-        INSERT INTO ${tableName} (${columns.join(", ")})
+        INSERT INTO ${schema}.${tableName} (${columns.join(", ")})
         VALUES ${placeholders.join(", ")}
         ON CONFLICT (${onConflict}) DO UPDATE SET
         ${updateColumns.join(", ")}
@@ -487,7 +496,8 @@ export class PostgresLoader extends BaseLoader {
   private async processSingleRecordUpsert<T extends Record<string, any>>(
     tableName: string,
     record: T,
-    onConflict: string
+    onConflict: string,
+    schema: string = "public"
   ): Promise<{ success: boolean; error?: string }> {
     try {
       // Get column names from the record
@@ -514,7 +524,7 @@ export class PostgresLoader extends BaseLoader {
 
       // Build the complete UPSERT query
       const query = `
-        INSERT INTO ${tableName} (${columns.join(", ")})
+        INSERT INTO ${schema}.${tableName} (${columns.join(", ")})
         VALUES (${placeholders.join(", ")})
         ON CONFLICT (${onConflict}) DO UPDATE SET
         ${updateColumns.join(", ")}
@@ -816,8 +826,11 @@ export class PostgresLoader extends BaseLoader {
   /**
    * Check if a table exists in PostgreSQL (delegated to client)
    */
-  async tableExists(tableName: string): Promise<boolean> {
-    return this.client.tableExists(tableName);
+  async tableExists(
+    tableName: string,
+    schema: string = "public"
+  ): Promise<boolean> {
+    return this.client.tableExists(tableName, schema);
   }
 
   /**
@@ -990,7 +1003,8 @@ export class PostgresLoader extends BaseLoader {
   async testOptimalBatchSize<T extends Record<string, any>>(
     tableName: string,
     sampleData: T[],
-    batchSizesToTest: number[] = [100, 500, 1000, 2000, 5000]
+    batchSizesToTest: number[] = [100, 500, 1000, 2000, 5000],
+    schema: string = "public"
   ): Promise<{ batchSize: number; timeSeconds: number }[]> {
     const results = [];
 
@@ -1016,7 +1030,12 @@ export class PostgresLoader extends BaseLoader {
         await this.client.getPool().query(`TRUNCATE TABLE ${testTableName}`);
 
         const startTime = new Date();
-        await this.loadDataInternal(testTableName, sampleData, batchSize);
+        await this.loadDataInternal(
+          testTableName,
+          sampleData,
+          batchSize,
+          schema
+        );
         const endTime = new Date();
 
         const timeSeconds = (endTime.getTime() - startTime.getTime()) / 1000;

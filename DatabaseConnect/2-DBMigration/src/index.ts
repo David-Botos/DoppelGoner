@@ -27,6 +27,7 @@ program
   .option("-l, --limit <limit>", "Limit number of records", parseInt)
   .option("-o, --offset <offset>", "Offset for pagination", parseInt)
   .option("--locale <locale>", "Locale for translations", "en")
+  .option("-t, --test", "Run in test mode using test schema", false)
   .action(async (options) => {
     try {
       // Initialize services
@@ -49,6 +50,7 @@ program
         limit: options.limit,
         offset: options.offset || 0,
         locale: options.locale || "en",
+        testMode: options.test || false,
       });
 
       console.log("Migration completed successfully");
