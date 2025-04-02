@@ -66,7 +66,14 @@ export class ServiceTransformer extends Transformer<
     // Call the base class implementation with our options
     const transformedRecords = await super.transform(dataMap, options);
 
-    // Filter out records with empty organization IDs (same as original implementation)
+    // Instead of silently filtering, check each record and track invalid ones
+    transformedRecords.forEach((record) => {
+      if (!record.organization_id || record.organization_id.trim() === "") {
+        this.addInvalidRecord(record, "Missing required organization_id");
+      }
+    });
+
+    // Only return valid records after tracking invalid ones
     const validRecords = transformedRecords.filter(
       (record) => record.organization_id && record.organization_id.trim() !== ""
     );
@@ -74,7 +81,7 @@ export class ServiceTransformer extends Transformer<
     const invalidCount = transformedRecords.length - validRecords.length;
     if (invalidCount > 0) {
       console.warn(
-        `Filtered out ${invalidCount} records with missing organization IDs`
+        `Found ${invalidCount} records with missing organization IDs (tracked in invalidRecords)`
       );
     }
 

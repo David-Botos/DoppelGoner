@@ -3,6 +3,14 @@ import { IdConverter } from "../utils/uuid-utils";
 import { PostgresClient } from "../services/postgres-client";
 
 /**
+ * Validation result for records with errors
+ */
+export interface ValidationResult<T> {
+  record: T;
+  errors: string[];
+}
+
+/**
  * Relationship definition for foreign key resolution
  */
 export interface RelationshipDefinition {
@@ -39,9 +47,35 @@ export abstract class Transformer<
   R extends MigratedData
 > {
   protected postgresClient: PostgresClient;
+  protected invalidRecords: ValidationResult<R>[] = [];
 
   constructor(protected idConverter: IdConverter) {
     this.postgresClient = new PostgresClient();
+  }
+
+  /**
+   * Get invalid records that failed validation during transformation
+   * @returns Array of invalid records with errors
+   */
+  public getInvalidRecords(): ValidationResult<R>[] {
+    return this.invalidRecords;
+  }
+
+  /**
+   * Add a record to the invalid records list with an error message
+   * @param record The record that failed validation
+   * @param error Error message explaining the validation failure
+   */
+  protected addInvalidRecord(record: R, error: string): void {
+    const existingRecord = this.invalidRecords.find(
+      (r) => r.record.original_id === record.original_id
+    );
+
+    if (existingRecord) {
+      existingRecord.errors.push(error);
+    } else {
+      this.invalidRecords.push({ record, errors: [error] });
+    }
   }
 
   /**
@@ -110,6 +144,9 @@ export abstract class Transformer<
     options: TransformOptions = {}
   ): Promise<R[]> {
     const { batchSize = 100, pgSchema = "public", debug = false } = options;
+
+    // Reset invalid records at the start of transformation
+    this.invalidRecords = [];
 
     const transformedRecords: R[] = [];
     const entries = Array.from(dataMap.entries());
@@ -200,6 +237,13 @@ export abstract class Transformer<
     console.log(
       `Successfully transformed ${transformedRecords.length} records`
     );
+
+    if (this.invalidRecords.length > 0) {
+      console.log(
+        `Found ${this.invalidRecords.length} invalid records during transformation`
+      );
+    }
+
     return transformedRecords;
   }
 
