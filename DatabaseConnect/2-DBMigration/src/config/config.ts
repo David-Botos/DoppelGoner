@@ -25,9 +25,9 @@ export const migrationConfig = {
   enableValidation: true,
   // Tables to migrate in the specified order
   tables: [
-    "organization",
-    // "location",
-    "service",
+    // "organization",
+    "location",
+    // "service",
     // "service_at_location",
     // "address", // Consolidated address table (replacing physical_address & postal_address)
     // "phone",
