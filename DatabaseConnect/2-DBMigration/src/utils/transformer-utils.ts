@@ -36,11 +36,22 @@ export async function getOrgBasedOnOriginalIDFromPostgres(
       LIMIT 1
     `;
 
+    // Using generic type parameter and keeping formatOutput as false (default)
+    // since we need the raw data for processing
     const results = await postgresClient.executeQuery<PostgresOrganization>(
       query,
       [organization_id]
     );
 
+    // Handle potential string response from formatted output
+    if (typeof results === "string") {
+      console.warn(
+        "Received formatted string instead of data array. Check PostgresClient settings."
+      );
+      return undefined;
+    }
+
+    // Check array length
     if (results && results.length > 0) {
       return results[0];
     }
