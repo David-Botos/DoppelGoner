@@ -1,7 +1,6 @@
 import { SnowflakeClient } from "../services/snowflake-client";
-// import { SupabaseLoader } from "../3-Load/supabase-loader";
 import { Extractor } from "../1-Extract/extractor";
-import { Transformer } from "../2-Transform/transformer";
+import { Transformer, TransformOptions } from "../2-Transform/transformer";
 import { IdConverter } from "../utils/uuid-utils";
 import { OrganizationExtractor } from "../1-Extract/organizationExtractor";
 import { OrganizationTransformer } from "../2-Transform/organizationTransformer";
@@ -18,7 +17,6 @@ import { PREDEFINED_CONSTRAINTS } from "../utils/constraint-utils";
  */
 export class MigrationManager {
   private snowflakeClient: SnowflakeClient;
-  // private supabaseLoader: SupabaseLoader;
   private postgresLoader: PostgresLoader;
   private idConverter: IdConverter;
 
@@ -74,7 +72,8 @@ export class MigrationManager {
     limit?: number,
     offset: number = 0,
     locale: string = "en",
-    testMode: boolean = false
+    testMode: boolean = false,
+    schema?: string
   ): Promise<{
     success: number;
     failure: number;
@@ -88,6 +87,11 @@ export class MigrationManager {
     let failureCount = 0;
 
     try {
+      // If schema is provided, set it in the SnowflakeClient
+      if (schema) {
+        await this.snowflakeClient.setSchema(schema);
+      }
+
       // Get the appropriate extractor and transformer
       const extractor = this.extractors.get(entityType);
       const transformer = this.transformers.get(entityType);
@@ -98,8 +102,13 @@ export class MigrationManager {
         );
       }
 
+      // Set the schema based on test mode
+      const pgSchema = testMode ? "test" : "public";
+      console.log(
+        `Extracting ${entityType} data from Snowflake schema ${this.snowflakeClient.getCurrentSchema()} to Postgres schema ${pgSchema}...`
+      );
+
       // 1. Extract data from Snowflake
-      console.log(`Extracting ${entityType} data from Snowflake...`);
       const dataMap = await extractor.extract(offset, locale, limit);
       console.log(`Extracted ${dataMap.size} ${entityType} records`);
 
@@ -107,17 +116,25 @@ export class MigrationManager {
       console.log(`Transforming ${entityType} data in batches...`);
       console.time("transform");
       const transformationBatchSize = migrationConfig.batchSize || 100;
+
+      const transformOptions: TransformOptions = {
+        batchSize: transformationBatchSize,
+        pgSchema: pgSchema,
+      };
+
+      // Pass the schema to the transform method
       const transformedData = await transformer.transform(
         dataMap,
-        transformationBatchSize
+        transformOptions
       );
+
       console.timeEnd("transform");
       console.log(
         `Transformed ${transformedData.length} ${entityType} records`
       );
 
       // 3. Load data into Postgres
-      console.log(`Loading ${entityType} data...`);
+      console.log(`Loading ${entityType} data into ${pgSchema} schema...`);
 
       // Log a sample record for debugging
       if (transformedData.length > 0) {
@@ -133,9 +150,6 @@ export class MigrationManager {
       // Fetch the proper predefined constraints from the util
       const constraints = PREDEFINED_CONSTRAINTS.entityType;
 
-      // Set the schema based on test mode
-      const schema = testMode ? "test" : "public";
-
       // Use upsertData method with optimized batch size
       console.time("load");
       const loadResult = await this.postgresLoader.upsertData(
@@ -146,7 +160,7 @@ export class MigrationManager {
         sourceTable,
         false,
         constraints,
-        schema
+        pgSchema
       );
       console.timeEnd("load");
 
@@ -212,11 +226,12 @@ export class MigrationManager {
   /**
    * Execute migration for all entities in the specified order
    */
-  async migrateAll(
-    limit: number = 1000,
+  async migrateAllEntities(
+    limit?: number,
     offset: number = 0,
     locale: string = "en",
-    testMode: boolean = false
+    testMode: boolean = false,
+    schema?: string
   ): Promise<
     Map<
       string,
@@ -240,12 +255,18 @@ export class MigrationManager {
     // Log migration settings
     console.log("Starting migration with the following settings:");
     console.log(`Batch Size: ${batchSize}`);
-    console.log(`Limit: ${limit}`);
+    console.log(`Limit: ${limit === undefined ? "ALL" : limit}`);
     console.log(`Offset: ${offset}`);
     console.log(`Locale: ${locale}`);
     console.log(`Validation Enabled: ${migrationConfig.enableValidation}`);
     console.log(`Migration Order: ${tablesToMigrate.join(", ")}`);
     console.log(`Test Mode: ${testMode}`);
+    console.log(`Schema: ${schema || this.snowflakeClient.getCurrentSchema()}`);
+
+    // Set schema if provided
+    if (schema) {
+      await this.snowflakeClient.setSchema(schema);
+    }
 
     // Migrate entities in the order specified in migrationConfig
     for (const entityType of tablesToMigrate) {
@@ -276,6 +297,67 @@ export class MigrationManager {
   }
 
   /**
+   * Migrate all schemas
+   */
+  async migrateAllSchemas(
+    limit?: number,
+    offset: number = 0,
+    locale: string = "en",
+    testMode: boolean = false
+  ): Promise<
+    Map<
+      string, // schema name
+      Map<
+        string, // entity type
+        {
+          success: number;
+          failure: number;
+          errors: Error[];
+          startTime: Date;
+          endTime: Date;
+        }
+      >
+    >
+  > {
+    const allResults = new Map();
+    const schemas = this.snowflakeClient.getSchemas();
+
+    console.log(
+      `Preparing to migrate ${schemas.length} schemas: ${schemas.join(", ")}`
+    );
+
+    for (const schema of schemas) {
+      console.log(`\n=== Starting migration for schema: ${schema} ===\n`);
+
+      const results = await this.migrateAllEntities(
+        limit,
+        offset,
+        locale,
+        testMode,
+        schema
+      );
+
+      allResults.set(schema, results);
+
+      // Summary for this schema
+      let schemaSuccess = 0;
+      let schemaFailure = 0;
+
+      results.forEach((result) => {
+        schemaSuccess += result.success;
+        schemaFailure += result.failure;
+      });
+
+      console.log(`\n=== Completed migration for schema: ${schema} ===`);
+      console.log(
+        `Total Success: ${schemaSuccess}, Total Failure: ${schemaFailure}\n`
+      );
+    }
+
+    return allResults;
+  }
+
+  /**
    * Running a migration with CLI
    */
   async runCliMigration(args: {
@@ -285,6 +367,8 @@ export class MigrationManager {
     offset?: number;
     locale?: string;
     testMode?: boolean;
+    schema?: string;
+    allSchemas?: boolean;
   }): Promise<void> {
     const {
       entity,
@@ -293,6 +377,8 @@ export class MigrationManager {
       offset = 0,
       locale = "en",
       testMode = false,
+      schema,
+      allSchemas = false,
     } = args;
 
     console.log("Starting migration with parameters:");
@@ -302,9 +388,51 @@ export class MigrationManager {
     console.log(`Offset: ${offset}`);
     console.log(`Locale: ${locale}`);
     console.log(`Test Mode: ${testMode}`);
+    console.log(`Schema: ${schema || "Default"}`);
+    console.log(`All Schemas: ${allSchemas}`);
 
     try {
-      if (entity) {
+      // If specific schema is requested, set it
+      if (schema && !allSchemas) {
+        await this.snowflakeClient.setSchema(schema);
+      }
+
+      if (allSchemas) {
+        // Migrate all schemas
+        console.log("Starting migration for all schemas");
+        const results = await this.migrateAllSchemas(
+          limit,
+          offset,
+          locale,
+          testMode
+        );
+
+        console.log("\n=== Overall Migration Summary ===");
+
+        let totalSuccess = 0;
+        let totalFailure = 0;
+
+        results.forEach((entityResults, schema) => {
+          let schemaSuccess = 0;
+          let schemaFailure = 0;
+
+          entityResults.forEach((result) => {
+            schemaSuccess += result.success;
+            schemaFailure += result.failure;
+          });
+
+          console.log(
+            `Schema ${schema}: Success=${schemaSuccess}, Failure=${schemaFailure}`
+          );
+
+          totalSuccess += schemaSuccess;
+          totalFailure += schemaFailure;
+        });
+
+        console.log(
+          `Grand Total: Success=${totalSuccess}, Failure=${totalFailure}`
+        );
+      } else if (entity) {
         // Migrate specific entity
         const result = await this.migrateEntity(
           entity,
@@ -322,10 +450,17 @@ export class MigrationManager {
           (result.endTime.getTime() - result.startTime.getTime()) / 1000;
         console.log(`Duration: ${duration.toFixed(2)} seconds`);
       } else {
-        // Migrate all entities
-        const results = await this.migrateAll(limit, offset, locale, testMode);
+        // Migrate all entities in current schema
+        const results = await this.migrateAllEntities(
+          limit,
+          offset,
+          locale,
+          testMode
+        );
 
-        console.log("Migration completed for all entities");
+        console.log(
+          `Migration completed for all entities in schema ${this.snowflakeClient.getCurrentSchema()}`
+        );
 
         let totalSuccess = 0;
         let totalFailure = 0;

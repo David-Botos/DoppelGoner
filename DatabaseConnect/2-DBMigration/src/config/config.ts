@@ -8,7 +8,7 @@ export const snowflakeConfig = {
   password: process.env.SNOWFLAKE_PASSWORD || "",
   warehouse: process.env.SNOWFLAKE_WAREHOUSE || "",
   database: "NORSE_STAGING",
-  schema: "WHATCOMCOU",
+  schema: ["WA211", "WITHINREAC", "WHATCOMCOU"],
   authenticator: "SNOWFLAKE",
 };
 
@@ -26,11 +26,11 @@ export const migrationConfig = {
   // Tables to migrate in the specified order
   tables: [
     "organization",
-    "location",
+    // "location",
     "service",
-    "service_at_location",
-    "address", // Consolidated address table (replacing physical_address & postal_address)
-    "phone",
+    // "service_at_location",
+    // "address", // Consolidated address table (replacing physical_address & postal_address)
+    // "phone",
   ],
 };
 

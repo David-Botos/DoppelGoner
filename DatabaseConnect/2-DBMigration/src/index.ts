@@ -2,7 +2,6 @@
 import dotenv from "dotenv";
 import { Command } from "commander";
 import { SnowflakeClient } from "./services/snowflake-client";
-// import { SupabaseLoader } from "./3-Load/supabase-loader";
 import { IdConverter } from "./utils/uuid-utils";
 import { MigrationManager } from "./managers/migrationManager";
 import { migrationConfig } from "./config/config";
@@ -28,11 +27,12 @@ program
   .option("-o, --offset <offset>", "Offset for pagination", parseInt)
   .option("--locale <locale>", "Locale for translations", "en")
   .option("-t, --test", "Run in test mode using test schema", false)
+  .option("-s, --schema <schema>", "Specific schema to migrate")
+  .option("-a, --all-schemas", "Migrate all configured schemas", false)
   .action(async (options) => {
     try {
       // Initialize services
       const snowflakeClient = new SnowflakeClient();
-      // const supabaseLoader = new SupabaseLoader();
       const postgresLoader = new PostgresLoader();
       const idConverter = new IdConverter();
 
@@ -51,12 +51,43 @@ program
         offset: options.offset || 0,
         locale: options.locale || "en",
         testMode: options.test || false,
+        schema: options.schema,
+        allSchemas: options.allSchemas || false,
       });
 
       console.log("Migration completed successfully");
       process.exit(0);
     } catch (error) {
       console.error("Migration failed:", error);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("list-schemas")
+  .description("List all available schemas")
+  .action(async () => {
+    try {
+      // Initialize snowflake client
+      const snowflakeClient = new SnowflakeClient();
+
+      // Connect to ensure we have access
+      await snowflakeClient.connect();
+
+      // Get all schemas
+      const schemas = snowflakeClient.getSchemas();
+
+      console.log("Available schemas:");
+      schemas.forEach((schema) => {
+        console.log(`- ${schema}`);
+      });
+
+      // Disconnect
+      await snowflakeClient.disconnect();
+
+      process.exit(0);
+    } catch (error) {
+      console.error("Failed to list schemas:", error);
       process.exit(1);
     }
   });

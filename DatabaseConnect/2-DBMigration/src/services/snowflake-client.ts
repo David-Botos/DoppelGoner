@@ -5,9 +5,19 @@ import { snowflakeConfig } from "../config/config";
 export class SnowflakeClient {
   private connection: snowflake.Connection;
   private connected: boolean = false;
+  private currentSchema: string;
+  private schemas: string[];
 
   constructor(config?: Partial<typeof snowflakeConfig>) {
     const finalConfig = { ...snowflakeConfig, ...config };
+
+    // Handle both string and array schemas
+    this.schemas = Array.isArray(finalConfig.schema)
+      ? finalConfig.schema
+      : [finalConfig.schema];
+
+    // Set the initial schema to the first one
+    this.currentSchema = this.schemas[0];
 
     this.connection = snowflake.createConnection({
       account: finalConfig.account,
@@ -15,7 +25,7 @@ export class SnowflakeClient {
       password: finalConfig.password,
       warehouse: finalConfig.warehouse,
       database: finalConfig.database,
-      schema: finalConfig.schema,
+      schema: this.currentSchema,
       authenticator: finalConfig.authenticator,
     });
   }
@@ -35,7 +45,9 @@ export class SnowflakeClient {
         }
 
         this.connected = true;
-        console.log("Successfully connected to Snowflake!");
+        console.log(
+          `Successfully connected to Snowflake with schema: ${this.currentSchema}!`
+        );
         resolve();
       });
     });
@@ -60,6 +72,42 @@ export class SnowflakeClient {
         resolve();
       });
     });
+  }
+
+  /**
+   * Get all configured schemas
+   */
+  public getSchemas(): string[] {
+    return this.schemas;
+  }
+
+  /**
+   * Get current schema
+   */
+  public getCurrentSchema(): string {
+    return this.currentSchema;
+  }
+
+  /**
+   * Set the active schema
+   * @param schema The schema to switch to
+   */
+  public async setSchema(schema: string): Promise<void> {
+    if (!this.schemas.includes(schema)) {
+      throw new Error(`Schema '${schema}' is not configured`);
+    }
+
+    if (schema === this.currentSchema) {
+      return; // Already using this schema
+    }
+
+    this.currentSchema = schema;
+
+    if (this.connected) {
+      // Update the schema in the existing connection
+      await this.query(`USE SCHEMA ${schema}`);
+      console.log(`Switched to schema: ${schema}`);
+    }
   }
 
   /**
