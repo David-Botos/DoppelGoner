@@ -3,8 +3,6 @@ import path from "path";
 import { PostgresClient } from "../services/postgres-client";
 import chalk from "chalk";
 
-// Install chalk with: npm install chalk
-
 async function main() {
   try {
     // Get the file path from command line arguments
@@ -12,61 +10,43 @@ async function main() {
 
     if (args.length === 0) {
       console.error("Error: Please provide a SQL file path");
-      console.log("Usage: npx ts-node execute-sql-file.ts <path-to-sql-file>");
+      console.log(
+        "Usage: npx ts-node execute-sql-script.ts <path-to-sql-file>"
+      );
       process.exit(1);
     }
 
     const filePath = args[0];
     const resolvedPath = path.resolve(filePath);
 
-    console.log(`Executing SQL file: ${resolvedPath}`);
+    console.log(`Executing SQL script: ${resolvedPath}`);
 
     // Create an instance of PostgresClient
     const client = new PostgresClient();
 
-    // Execute the SQL file
-    const results = await client.executeSqlFile(resolvedPath);
+    // Execute the SQL file using the improved method for complex scripts
+    // Set formatOutput = true to enable table formatting
+    const result = await client.executeComplexSqlScript(resolvedPath, true);
 
-    console.log(chalk.green("SQL execution successful!"));
+    if (result.success) {
+      console.log(chalk.green("SQL execution successful!"));
 
-    // Display results for each statement
-    if (results && Array.isArray(results)) {
-      console.log(
-        chalk.yellow(`File contained ${results.length} SQL statements.`)
-      );
-
-      results.forEach((result, index) => {
-        // Command results like CREATE, DROP, etc.
-        if (result && typeof result === "object" && "command" in result) {
-          console.log(
-            chalk.cyan(`\nStatement ${index + 1}: ${result.command}`)
-          );
-          console.log(`Affected rows: ${result.rowCount}`);
-          return;
-        }
-
-        // Query results
-        if (Array.isArray(result) && result.length > 0) {
-          console.log(
-            chalk.cyan(
-              `\nStatement ${index + 1} results (${result.length} rows):`
-            )
-          );
-          console.table(result);
-        } else if (Array.isArray(result) && result.length === 0) {
-          console.log(
-            chalk.cyan(`\nStatement ${index + 1}: Query returned 0 rows`)
-          );
-        }
-      });
+      // If there are formatted results, display them
+      if (result.formattedResults) {
+        console.log(chalk.cyan("\nQuery Results:"));
+        console.log(result.formattedResults);
+      } else {
+        console.log(chalk.cyan("\nExecution Summary:"), result.message);
+      }
     } else {
-      console.log("No results returned");
+      console.error(chalk.red("SQL execution failed:"), result.message);
+      process.exit(1);
     }
 
     // Close the connection pool
     client.close();
   } catch (error) {
-    console.error(chalk.red("Error executing SQL file:"), error);
+    console.error(chalk.red("Error executing SQL script:"), error);
     process.exit(1);
   }
 }

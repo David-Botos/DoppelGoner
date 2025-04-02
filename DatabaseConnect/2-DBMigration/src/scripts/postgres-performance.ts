@@ -12,7 +12,25 @@ interface SampleData {
   boolean_value: boolean;
 }
 
-// Function to generate sample test data for batch testing
+/**
+ * Helper to process query results that might be formatted strings or data arrays
+ * @param result Query result (could be formatted string or data array)
+ * @returns The result data as an array if possible, empty array otherwise
+ */
+function ensureDataArray(result: any[] | string): any[] {
+  if (typeof result === "string") {
+    // If it's a formatted string, output it directly to console
+    console.log(result);
+    return [];
+  }
+  return Array.isArray(result) ? result : [];
+}
+
+/**
+ * Generate sample test data for batch testing
+ * @param count Number of records to generate
+ * @returns Array of sample data objects
+ */
 function generateSampleData(count: number = 1000): SampleData[] {
   const data: SampleData[] = [];
   for (let i = 0; i < count; i++) {
@@ -28,7 +46,11 @@ function generateSampleData(count: number = 1000): SampleData[] {
   return data;
 }
 
-// Function to format time duration
+/**
+ * Format time duration in milliseconds to a readable string
+ * @param milliseconds Duration in milliseconds
+ * @returns Formatted duration string
+ */
 function formatDuration(milliseconds: number): string {
   if (milliseconds < 1000) {
     return `${milliseconds.toFixed(2)}ms`;
@@ -37,12 +59,14 @@ function formatDuration(milliseconds: number): string {
   }
 }
 
-// Main diagnostic function
+/**
+ * Main diagnostic function for PostgreSQL performance assessment
+ */
 async function runDiagnostics() {
   console.log("PostgreSQL Performance Diagnostics");
   console.log("=================================");
 
-  // Create Postgresclient instance
+  // Create PostgresClient instance
   const client = new PostgresClient();
 
   try {
@@ -52,14 +76,20 @@ async function runDiagnostics() {
     const versionQuery = await client.executeQuery("SELECT version()");
     const connectTime = Date.now() - startConnect;
 
+    const versionData = ensureDataArray(versionQuery);
+
     console.log(`✅ Connected successfully in ${formatDuration(connectTime)}`);
-    console.log(`PostgreSQL Version: ${versionQuery[0].version}`);
+    if (versionData.length > 0) {
+      console.log(`PostgreSQL Version: ${versionData[0].version}`);
+    }
 
     // 2. Database statistics
     console.log("\n2. Gathering database statistics...");
 
-    // Table sizes
-    const tableSizesQuery = await client.executeQuery(`
+    // Table sizes - use formatting for better readability
+    console.log("\nTop 10 tables by size:");
+    await client.executeQuery(
+      `
       SELECT
         table_schema,
         table_name,
@@ -71,13 +101,15 @@ async function runDiagnostics() {
       WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
       ORDER BY pg_total_relation_size('"' || table_schema || '"."' || table_name || '"') DESC
       LIMIT 10;
-    `);
+    `,
+      [],
+      true
+    );
 
-    console.log("Top 10 tables by size:");
-    console.table(tableSizesQuery);
-
-    // Connection statistics
-    const connectionStatsQuery = await client.executeQuery(`
+    // Connection statistics - use formatting for better readability
+    console.log("\nConnection statistics:");
+    const connectionStatsQuery = await client.executeQuery(
+      `
       SELECT 
         max_conn.setting as max_connections,
         used.count as used_connections,
@@ -85,23 +117,42 @@ async function runDiagnostics() {
       FROM 
         (SELECT setting FROM pg_settings WHERE name = 'max_connections') max_conn,
         (SELECT count(*) FROM pg_stat_activity) used;
-    `);
+    `,
+      [],
+      true
+    );
 
-    console.log("Connection statistics:");
-    console.table(connectionStatsQuery);
+    // Store connection stats for summary
+    const connectionStatsData = ensureDataArray(connectionStatsQuery);
+    let connStats = { max_connections: 0, used_connections: 0 };
+    if (connectionStatsData.length > 0) {
+      connStats = {
+        max_connections: parseInt(connectionStatsData[0].max_connections),
+        used_connections: parseInt(connectionStatsData[0].used_connections),
+      };
+    }
 
-    // Cache hit ratio
-    const cacheStatsQuery = await client.executeQuery(`
+    // Cache hit ratio - use formatting for better readability
+    console.log("\nCache statistics:");
+    const cacheStatsQuery = await client.executeQuery(
+      `
       SELECT 
         sum(heap_blks_read) as heap_read,
         sum(heap_blks_hit) as heap_hit,
         sum(heap_blks_hit) / (sum(heap_blks_hit) + sum(heap_blks_read)) as cache_hit_ratio
       FROM 
         pg_statio_user_tables;
-    `);
+    `,
+      [],
+      true
+    );
 
-    console.log("Cache statistics:");
-    console.table(cacheStatsQuery);
+    // Store cache stats for summary
+    const cacheStatsData = ensureDataArray(cacheStatsQuery);
+    let cacheHitRatio = 0;
+    if (cacheStatsData.length > 0) {
+      cacheHitRatio = parseFloat(cacheStatsData[0].cache_hit_ratio);
+    }
 
     // 3. Query performance test
     console.log("\n3. Testing query performance...");
@@ -148,8 +199,10 @@ async function runDiagnostics() {
       LIMIT 5;
     `);
 
-    if (tablesQuery.length > 0) {
-      const testTable = tablesQuery[0].table_name;
+    const tablesData = ensureDataArray(tablesQuery);
+
+    if (tablesData.length > 0) {
+      const testTable = tablesData[0].table_name;
       console.log(`\nUsing table "${testTable}" for further testing...`);
 
       // Count query
@@ -165,11 +218,10 @@ async function runDiagnostics() {
       );
     }
 
-    // 4. Batch size performance test using built-in method
+    // 4. Batch size performance test
     console.log("\n4. Testing optimal batch size for data loading...");
 
-    // Check if we can create a temporary table by trying to create one
-    // This is safer than the previous approach that used has_table_privilege incorrectly
+    // Check if we can create a temporary table
     let canCreateTable = false;
     try {
       // Try to create and then immediately drop a temporary table
@@ -226,7 +278,7 @@ async function runDiagnostics() {
           }
 
           for (const batch of batches) {
-            // This uses a simple INSERT rather than the more complex upsertData method
+            // This uses a simple INSERT
             const columns = Object.keys(batch[0]) as (keyof SampleData)[];
             const values: any[] = [];
             const placeholders: string[] = [];
@@ -258,14 +310,20 @@ async function runDiagnostics() {
           console.log(`  Completed in ${timeSeconds.toFixed(2)} seconds`);
         }
 
-        // Sort and display results
-        testResults.sort((a, b) => a.timeSeconds - b.timeSeconds);
+        // Sort and display results - use formatting for better readability
         console.log("\nBatch size test results (sorted by performance):");
+
+        // Sort the results by time (fastest first)
+        testResults.sort((a, b) => a.timeSeconds - b.timeSeconds);
+
+        // Display in a formatted table
         console.table(testResults);
 
-        console.log(
-          `✅ Optimal batch size appears to be: ${testResults[0].batchSize}`
-        );
+        if (testResults.length > 0) {
+          console.log(
+            `✅ Optimal batch size appears to be: ${testResults[0].batchSize}`
+          );
+        }
       } catch (error) {
         console.error("Error during batch testing:", error);
       } finally {
@@ -274,9 +332,34 @@ async function runDiagnostics() {
       }
     }
 
-    // 5. Basic index performance check
+    // 5. Basic index performance check - use formatting for better readability
     console.log("\n5. Checking index usage...");
 
+    // Get index stats with formatting
+    const indexStatsQuery = await client.executeQuery(
+      `
+      SELECT
+        relname as table_name,
+        idx_scan as index_scans,
+        seq_scan as sequential_scans,
+        CASE WHEN seq_scan = 0 THEN 0
+          ELSE 100.0 * seq_scan / (seq_scan + idx_scan)
+        END as seq_scan_percent
+      FROM
+        pg_stat_user_tables
+      WHERE
+        (idx_scan + seq_scan) > 0
+      ORDER BY
+        seq_scan_percent DESC
+      LIMIT 10;
+    `,
+      [],
+      true
+    );
+
+    console.log("Tables with potential index issues:");
+
+    // Get raw data for processing in the next step
     const indexStats = await client.executeQuery(`
       SELECT
         relname as table_name,
@@ -294,18 +377,20 @@ async function runDiagnostics() {
       LIMIT 10;
     `);
 
-    console.log("Tables with potential index issues:");
-    console.table(indexStats);
+    // Process for warnings
+    const indexStatsData = ensureDataArray(indexStats);
 
-    if (indexStats.length > 0) {
+    if (indexStatsData.length > 0) {
       // Make sure seq_scan_percent is treated as a number
-      const highSeqScanTables = indexStats.filter(
+      const highSeqScanTables = indexStatsData.filter(
         (t) => parseFloat(t.seq_scan_percent) > 50
       );
+
       if (highSeqScanTables.length > 0) {
         console.log(
           "\nWarning: The following tables show high sequential scan percentages and may benefit from additional indexes:"
         );
+
         highSeqScanTables.forEach((t) => {
           console.log(
             `- ${t.table_name} (${parseFloat(t.seq_scan_percent).toFixed(
@@ -327,35 +412,42 @@ async function runDiagnostics() {
     );
 
     // Cache health
-    const cacheHealth =
-      cacheStatsQuery[0].cache_hit_ratio > 0.99
-        ? "✅ Excellent"
-        : cacheStatsQuery[0].cache_hit_ratio > 0.95
-        ? "✅ Good"
-        : cacheStatsQuery[0].cache_hit_ratio > 0.9
-        ? "⚠️ Fair"
-        : "❌ Poor";
-    console.log(
-      `Cache Hit Ratio: ${cacheHealth} (${(
-        cacheStatsQuery[0].cache_hit_ratio * 100
-      ).toFixed(2)}%)`
-    );
+    if (cacheHitRatio > 0) {
+      const cacheHealth =
+        cacheHitRatio > 0.99
+          ? "✅ Excellent"
+          : cacheHitRatio > 0.95
+          ? "✅ Good"
+          : cacheHitRatio > 0.9
+          ? "⚠️ Fair"
+          : "❌ Poor";
+
+      console.log(
+        `Cache Hit Ratio: ${cacheHealth} (${(cacheHitRatio * 100).toFixed(2)}%)`
+      );
+    } else {
+      console.log(`Cache Hit Ratio: Unable to determine`);
+    }
 
     // Connection utilization
-    const connStats = connectionStatsQuery[0];
-    const connUtilization =
-      connStats.used_connections / connStats.max_connections;
-    const connHealth =
-      connUtilization < 0.5
-        ? "✅ Good"
-        : connUtilization < 0.8
-        ? "⚠️ Fair"
-        : "❌ High";
-    console.log(
-      `Connection Utilization: ${connHealth} (${connStats.used_connections}/${
-        connStats.max_connections
-      }, ${(connUtilization * 100).toFixed(2)}%)`
-    );
+    if (connStats.max_connections > 0) {
+      const connUtilization =
+        connStats.used_connections / connStats.max_connections;
+      const connHealth =
+        connUtilization < 0.5
+          ? "✅ Good"
+          : connUtilization < 0.8
+          ? "⚠️ Fair"
+          : "❌ High";
+
+      console.log(
+        `Connection Utilization: ${connHealth} (${connStats.used_connections}/${
+          connStats.max_connections
+        }, ${(connUtilization * 100).toFixed(2)}%)`
+      );
+    } else {
+      console.log(`Connection Utilization: Unable to determine`);
+    }
   } catch (error) {
     console.error("Error during diagnostics:", error);
   } finally {

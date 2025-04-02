@@ -2,6 +2,11 @@ import { Pool, PoolClient, QueryResult } from "pg";
 import { hetznerPostgresConfig } from "../config/config";
 import * as fs from "fs";
 import * as path from "path";
+import { exec } from "child_process";
+import { promisify } from "util";
+import { TableFormatter } from "../utils/sql-utils";
+
+const execPromise = promisify(exec);
 
 /**
  * Client class for PostgreSQL database operations
@@ -33,9 +38,19 @@ export class PostgresClient {
    * @param params Query parameters
    * @returns Query result rows
    */
-  async executeQuery<T = any>(query: string, params: any[] = []): Promise<T[]> {
+  async executeQuery<T = any>(
+    query: string,
+    params: any[] = [],
+    formatOutput: boolean = false
+  ): Promise<T[] | string> {
     try {
       const result = await this.pool.query(query, params);
+
+      // Return formatted table if requested
+      if (formatOutput) {
+        return TableFormatter.formatResults(result);
+      }
+
       return result.rows;
     } catch (error) {
       console.error("Error executing query:", error);
@@ -44,136 +59,241 @@ export class PostgresClient {
   }
 
   /**
-   * Execute SQL from a file, supporting multiple statements
+   * Execute a complex SQL script that may contain PL/pgSQL functions, triggers, etc.
    * @param filePath Path to SQL file
-   * @returns Array of query results
+   * @param formatOutput Whether to format the output as a table
+   * @returns Result indicating success with formatted output if requested
    */
-  async executeSqlFile(filePath: string): Promise<any[]> {
+  async executeComplexSqlScript(
+    filePath: string,
+    formatOutput: boolean = true
+  ): Promise<{ success: boolean; message: string; formattedResults?: string }> {
     const client = await this.pool.connect();
 
     try {
       const sql = fs.readFileSync(path.resolve(filePath), "utf8");
 
-      console.log(`Contents of ${filePath}: `, sql);
+      // Check if this is a SELECT query that returns results
+      const isSelectQuery = /^\s*SELECT\b/i.test(sql.trim());
 
-      // Split the SQL file into individual statements
+      // Split script to handle multiple statements
+      // Note: This is a simple approach; it won't handle complex SQL correctly
       const statements = this.splitSqlStatements(sql);
 
-      // Execute each statement and collect results
-      const results: QueryResult[] = [];
+      // Detect if there are actual SELECT statements in the script
+      const hasSelectStatements = statements.some(
+        (stmt) =>
+          /^\s*SELECT\b/i.test(stmt.trim()) && !stmt.trim().startsWith("--")
+      );
 
-      for (const statement of statements) {
-        // Skip empty statements
-        if (!statement.trim()) continue;
+      try {
+        let allResults: QueryResult[] = [];
 
-        try {
-          const result = await client.query(statement);
-          results.push(result);
-        } catch (err) {
-          console.error(`Error executing statement: ${statement}`);
-          throw err;
+        // For single SELECT queries, try getting formatted results
+        if (isSelectQuery || hasSelectStatements) {
+          try {
+            // Execute each statement and collect results for SELECTs
+            for (const statement of statements) {
+              if (statement.trim() && !statement.trim().startsWith("--")) {
+                const result = await client.query(statement);
+                if (result.command === "SELECT") {
+                  allResults.push(result);
+                }
+              }
+            }
+
+            let formattedResults = "";
+            if (allResults.length > 0 && formatOutput) {
+              formattedResults = TableFormatter.formatResults(allResults);
+            }
+
+            return {
+              success: true,
+              message: "SQL script executed successfully",
+              formattedResults: formattedResults,
+            };
+          } catch (e) {
+            // If individual statement execution fails, fall back to executing as a single script
+            console.warn(
+              "Individual statement execution failed, trying as a single script"
+            );
+            allResults = [];
+          }
         }
-      }
 
-      // Return all results
-      return results.map((result) => {
-        // Include command and rowCount for non-SELECT queries
-        if (!result.rows || result.rows.length === 0) {
+        // If not a SELECT or individual execution failed, try the transaction approach
+        await client.query("BEGIN");
+        await client.query(sql);
+        await client.query("COMMIT");
+
+        return {
+          success: true,
+          message: "SQL script executed successfully",
+        };
+      } catch (error) {
+        // Rollback any transaction
+        try {
+          await client.query("ROLLBACK");
+        } catch (e) {
+          // Ignore rollback errors
+        }
+
+        // Try fallback to psql if enabled
+        if (process.env.USE_PSQL_FALLBACK === "true") {
+          try {
+            const psqlResult = await this.executeSqlWithPsql(filePath);
+            return psqlResult;
+          } catch (psqlError) {
+            return {
+              success: false,
+              message: `Failed to execute SQL: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            };
+          }
+        } else {
           return {
-            command: result.command,
-            rowCount: result.rowCount,
-            rows: [],
+            success: false,
+            message: `Failed to execute SQL: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
           };
         }
-        return result.rows;
-      });
+      }
     } catch (error) {
-      console.error(`Error executing SQL file ${filePath}:`, error);
-      throw error;
+      return {
+        success: false,
+        message: `Error reading/executing SQL file: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      };
     } finally {
       client.release();
     }
   }
 
   /**
-   * Split SQL string into individual statements
-   * Handles comments, quoted strings, and dollar-quoted blocks
+   * Split SQL statements by semicolons
+   * This is a simple approach and won't handle all SQL correctly
    */
   private splitSqlStatements(sql: string): string[] {
-    // Remove comments
-    sql = sql.replace(/--.*$/gm, "");
+    // Remove comments first
+    const noComments = sql.replace(/--.*$/gm, "");
 
+    // Split by semicolons, but handle quoted strings and dollar-quoted blocks
     const statements: string[] = [];
     let currentStatement = "";
-    let inSingleQuote = false;
+    let inQuotes = false;
     let inDollarQuote = false;
-    let currentDollarTag = "";
+    let dollarTag = "";
 
-    let i = 0;
-    while (i < sql.length) {
-      const char = sql[i];
-      const nextChar = sql[i + 1] || "";
+    for (let i = 0; i < noComments.length; i++) {
+      const char = noComments[i];
+      const nextChar = noComments[i + 1] || "";
 
-      // Handle single quote strings
-      if (char === "'" && (i === 0 || sql[i - 1] !== "\\")) {
-        if (!inDollarQuote) {
-          // Only toggle if not inside a dollar-quoted string
-          inSingleQuote = !inSingleQuote;
+      // Handle quotes
+      if (char === "'" && !inDollarQuote) {
+        // Handle escaped quotes
+        if (noComments[i - 1] !== "\\") {
+          inQuotes = !inQuotes;
         }
       }
 
-      // Handle dollar-quoted strings
-      if (char === "$" && !inSingleQuote) {
-        // Check if this is the start of a dollar quote
+      // Handle dollar quoting
+      if (char === "$" && !inQuotes) {
         if (!inDollarQuote) {
-          // Try to extract the dollar tag
-          const dollarTagMatch = sql.slice(i).match(/^\$([^$]*)\$/);
-
-          if (dollarTagMatch) {
-            const fullTag = dollarTagMatch[0]; // $TAG$
-            currentDollarTag = fullTag;
+          // Try to detect start of dollar quote
+          let tag = "$";
+          let j = i + 1;
+          while (j < noComments.length && noComments[j] !== "$") {
+            tag += noComments[j];
+            j++;
+          }
+          if (j < noComments.length && noComments[j] === "$") {
+            tag += "$";
             inDollarQuote = true;
-
-            // Add the opening tag to the current statement
-            currentStatement += fullTag;
-
-            // Skip past the dollar tag
-            i += fullTag.length;
+            dollarTag = tag;
+            currentStatement += tag;
+            i = j;
             continue;
           }
-        }
-        // Check if this is the end of a dollar quote
-        else if (inDollarQuote && sql.slice(i).startsWith(currentDollarTag)) {
+        } else if (
+          noComments.substring(i, i + dollarTag.length) === dollarTag
+        ) {
+          // End of dollar quote
           inDollarQuote = false;
-
-          // Add the closing tag to the current statement
-          currentStatement += currentDollarTag;
-
-          // Skip past the dollar tag
-          i += currentDollarTag.length;
+          currentStatement += dollarTag;
+          i += dollarTag.length - 1;
           continue;
         }
       }
 
-      // If we're not in a string or dollar-quoted block and we hit a semicolon,
-      // we're at the end of a statement
-      if (char === ";" && !inSingleQuote && !inDollarQuote) {
-        statements.push(currentStatement + ";");
+      // Handle statement separator
+      if (char === ";" && !inQuotes && !inDollarQuote) {
+        currentStatement += char;
+        statements.push(currentStatement.trim());
         currentStatement = "";
-        i++;
-        continue;
+      } else {
+        currentStatement += char;
       }
-
-      currentStatement += char;
-      i++;
     }
 
-    // Add the last statement if it doesn't end with a semicolon and isn't empty
+    // Add the last statement if it exists
     if (currentStatement.trim()) {
-      statements.push(currentStatement);
+      statements.push(currentStatement.trim());
     }
 
     return statements;
+  }
+
+  /**
+   * Execute a SQL file using the psql command-line utility
+   * @param filePath Path to SQL file
+   * @returns Result object
+   */
+  private async executeSqlWithPsql(
+    filePath: string
+  ): Promise<{ success: boolean; message: string }> {
+    try {
+      // Extract connection info from connection pool config
+      const { host, port, database, user, password } = this.pool.options;
+
+      // Handle password securely
+      let command: string;
+      let options: any = {};
+
+      if (typeof password === "string") {
+        // Option 1: Pass password as environment variable (type-safe way)
+        const env = { ...process.env } as Record<string, string>;
+        env.PGPASSWORD = password;
+        options.env = env;
+        command = `psql -h ${host} -p ${port} -d ${database} -U ${user} -f ${filePath}`;
+      } else {
+        // Option 2: Use connection string without password in environment
+        command = `psql "postgresql://${user}:${encodeURIComponent(
+          String(password)
+        )}@${host}:${port}/${database}" -f ${filePath}`;
+      }
+
+      // Execute psql command
+      const { stdout, stderr } = await execPromise(command, options);
+
+      if (stderr && !stderr.includes("NOTICE") && !stderr.includes("INFO")) {
+        return { success: false, message: stderr.toString() };
+      }
+
+      return {
+        success: true,
+        message: stdout.toString() || "SQL executed successfully via psql",
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: `psql execution failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      };
+    }
   }
 
   /**
@@ -228,119 +348,24 @@ export class PostgresClient {
   }
 
   /**
-   * Process a PostgreSQL error into a more readable format
-   * @param error PostgreSQL error
-   * @param operation Operation name
-   * @param tableName Table name
-   * @returns Formatted error message
+   * Check if a schema exists in PostgreSQL
+   * @param schemaName Schema name to check
+   * @returns Boolean indicating if schema exists
    */
-  processPostgresError(
-    error: any,
-    operation: string,
-    tableName: string
-  ): string {
-    let message = `${operation} operation failed on table ${tableName}: `;
-
-    if (error.code) {
-      switch (error.code) {
-        case "23505":
-          message += `Unique constraint violation (${
-            error.constraint || "unknown constraint"
-          })`;
-          break;
-        case "23503":
-          message += `Foreign key constraint violation (${
-            error.constraint || "unknown constraint"
-          })`;
-          break;
-        case "23502":
-          message += `Not null constraint violation (${
-            error.column || "unknown column"
-          })`;
-          break;
-        case "22P02":
-          message += `Invalid text representation (${
-            error.column || "unknown column"
-          })`;
-          break;
-        default:
-          message += `${error.message || String(error)}`;
-      }
-    } else {
-      message += `${error.message || String(error)}`;
-    }
-
-    return message;
-  }
-
-  /**
-   * Find records that meet specific criteria
-   * @param tableName Table to search
-   * @param criteria Object with column-value pairs to match
-   * @returns Array of matching records
-   */
-  async findRecords<T = any>(
-    tableName: string,
-    criteria: Record<string, any>
-  ): Promise<T[]> {
+  async schemaExists(schemaName: string): Promise<boolean> {
     try {
-      // Build WHERE clause
-      const conditions: string[] = [];
-      const values: any[] = [];
-      let paramIndex = 1;
+      const query = `
+        SELECT EXISTS (
+          SELECT FROM information_schema.schemata
+          WHERE schema_name = $1
+        );
+      `;
 
-      Object.entries(criteria).forEach(([column, value]) => {
-        if (value === null) {
-          conditions.push(`${column} IS NULL`);
-        } else {
-          conditions.push(`${column} = $${paramIndex}`);
-          values.push(value);
-          paramIndex++;
-        }
-      });
-
-      const whereClause =
-        conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-
-      const query = `SELECT * FROM ${tableName} ${whereClause}`;
-      const result = await this.pool.query(query, values);
-
-      return result.rows;
+      const result = await this.pool.query(query, [schemaName]);
+      return result.rows[0].exists;
     } catch (error) {
-      console.error(`Error finding records in ${tableName}:`, error);
-      throw error;
-    }
-  }
-
-  /**
-   * Delete all records from a table - useful for testing or rollbacks
-   * @param tableName Table to delete from
-   * @returns Result object with success, count, and error information
-   */
-  async deleteAllRecords(
-    tableName: string
-  ): Promise<{ success: boolean; count: number; error?: string }> {
-    try {
-      // First count the records
-      const countResult = await this.pool.query(
-        `SELECT COUNT(*) FROM ${tableName}`
-      );
-      const beforeCount = parseInt(countResult.rows[0].count, 10);
-
-      // Then delete them
-      await this.pool.query(`DELETE FROM ${tableName}`);
-
-      return {
-        success: true,
-        count: beforeCount,
-        error: undefined,
-      };
-    } catch (error) {
-      return {
-        success: false,
-        count: 0,
-        error: error instanceof Error ? error.message : String(error),
-      };
+      console.error(`Error checking if schema ${schemaName} exists:`, error);
+      return false;
     }
   }
 
