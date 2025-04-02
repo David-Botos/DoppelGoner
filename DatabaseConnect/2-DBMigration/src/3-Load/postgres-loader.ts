@@ -1,7 +1,4 @@
-import { PoolClient } from "pg";
-import { BaseLoader } from "./loader";
-import { PostgresMetadataManager } from "./postgres-metadata-manager";
-import { MetadataManager } from "./metadata-manager";
+import { PoolClient, Pool } from "pg";
 import { PostgresClient } from "../services/postgres-client";
 import { batchRecords } from "../utils/loader-utils";
 import {
@@ -13,182 +10,227 @@ import {
 import { v4 as uuidv4 } from "uuid";
 
 /**
- * PostgreSQL implementation of the BaseLoader abstract class
- * With enhanced batch processing and constraint validation
+ * PostgreSQL implementation that handles loading data and managing metadata
  */
-export class PostgresLoader extends BaseLoader {
+export class PostgresLoader {
   private client: PostgresClient;
-  private metadataManager: MetadataManager;
   private constraintsCache: Map<string, TableConstraints> = new Map();
 
-  constructor(client?: PostgresClient, metadataManager?: MetadataManager) {
-    super();
+  constructor(client?: PostgresClient) {
     this.client = client || new PostgresClient();
-
-    this.metadataManager =
-      metadataManager || new PostgresMetadataManager(this.client.getPool());
   }
 
   /**
-   * Get the PostgreSQL client instance
-   * @returns PostgresClient instance
+   * Get the underlying PostgreSQL pool
    */
-  getClient(): PostgresClient {
-    return this.client;
+  getPool(): Pool {
+    return this.client.getPool();
   }
 
   /**
-   * Implementation of the core data loading functionality for PostgreSQL
-   * With improved batch handling
+   * Standard method for loading data with consistent pre/post processing
    */
-  protected async loadDataInternal<T extends Record<string, any>>(
+  async loadData<T extends Record<string, any>>(
     tableName: string,
     data: T[],
-    batchSize: number = 1000,
+    batchSize: number = 100,
+    sourceTable: string = "unknown",
+    skipTableCheck: boolean = false,
     schema: string = "public"
   ): Promise<{ success: number; errors: Error[] }> {
-    let successCount = 0;
-    const errors: Error[] = [];
+    // Pre-processing logic (validation, logging start)
+    const startTime = new Date();
 
-    // Get table constraints
-    const constraints = await this.getTableConstraintsWithCache(tableName);
-
-    // Validate records against constraints
-    const { validRecords, invalidRecordsWithErrors } =
-      validateRecordsAgainstConstraints(data, constraints);
-
-    // Process invalid records
-    for (const {
-      record,
-      errors: validationErrors,
-    } of invalidRecordsWithErrors) {
-      const errorMsg = `Validation failed: ${validationErrors.join(", ")}`;
-      errors.push(new Error(errorMsg));
-
-      try {
-        await this.logFailedRecord(
-          tableName,
-          record.original_id || null,
-          record.original_translations_id || null,
-          errorMsg,
-          record
-        );
-      } catch (logError) {
-        console.error(`Failed to log invalid record: ${logError}`);
+    try {
+      // Verify table exists before attempting to load (if not skipped)
+      if (!skipTableCheck) {
+        const exists = await this.tableExists(tableName, schema);
+        if (!exists) {
+          throw new Error(
+            `Table ${schema}.${tableName} does not exist in the destination system`
+          );
+        }
       }
-    }
 
-    // Process valid records in batches
-    if (validRecords.length > 0) {
-      // Break data into batches
-      const batches = batchRecords(validRecords, batchSize);
+      // Get table constraints
+      const constraints = await this.getTableConstraintsWithCache(tableName);
 
-      for (const batch of batches) {
+      // Validate records against constraints
+      const { validRecords, invalidRecordsWithErrors } =
+        validateRecordsAgainstConstraints(data, constraints);
+
+      let successCount = 0;
+      const errors: Error[] = [];
+
+      // Process invalid records
+      for (const {
+        record,
+        errors: validationErrors,
+      } of invalidRecordsWithErrors) {
+        const errorMsg = `Validation failed: ${validationErrors.join(", ")}`;
+        errors.push(new Error(errorMsg));
+
         try {
-          if (batch.length === 0) continue;
+          await this.logFailedRecord(
+            tableName,
+            record.original_id || null,
+            record.original_translations_id || null,
+            errorMsg,
+            record,
+            schema
+          );
+        } catch (logError) {
+          console.error(`Failed to log invalid record: ${logError}`);
+        }
+      }
 
-          // Get column names from the first record
-          const columns = Object.keys(batch[0]);
+      // Process valid records in batches
+      if (validRecords.length > 0) {
+        // Break data into batches
+        const batches = batchRecords(validRecords, batchSize);
 
-          // Prepare values and placeholder strings
-          const values: any[] = [];
-          const placeholders: string[] = [];
+        for (const batch of batches) {
+          try {
+            if (batch.length === 0) continue;
 
-          batch.forEach((record, rowIndex) => {
-            const rowPlaceholders: string[] = [];
+            // Get column names from the first record
+            const columns = Object.keys(batch[0]);
 
-            columns.forEach((column, colIndex) => {
-              const paramIndex = rowIndex * columns.length + colIndex + 1;
-              rowPlaceholders.push(`$${paramIndex}`);
-              values.push(record[column]);
+            // Prepare values and placeholder strings
+            const values: any[] = [];
+            const placeholders: string[] = [];
+
+            batch.forEach((record, rowIndex) => {
+              const rowPlaceholders: string[] = [];
+
+              columns.forEach((column, colIndex) => {
+                const paramIndex = rowIndex * columns.length + colIndex + 1;
+                rowPlaceholders.push(`$${paramIndex}`);
+                values.push(record[column]);
+              });
+
+              placeholders.push(`(${rowPlaceholders.join(", ")})`);
             });
 
-            placeholders.push(`(${rowPlaceholders.join(", ")})`);
-          });
+            // Build the INSERT query
+            const query = `
+              INSERT INTO ${schema}.${tableName} (${columns.join(", ")})
+              VALUES ${placeholders.join(", ")}
+              RETURNING id
+            `;
 
-          // Build the INSERT query
-          const query = `
-            INSERT INTO ${schema}.${tableName} (${columns.join(", ")})
-            VALUES ${placeholders.join(", ")}
-            RETURNING id
-          `;
+            // Execute the query
+            const result = await this.client.getPool().query(query, values);
+            if (result && result.rowCount) {
+              successCount += result.rowCount;
+            }
 
-          // Execute the query
-          const result = await this.client.getPool().query(query, values);
-          if (result && result.rowCount) {
-            successCount += result.rowCount;
-          }
+            // Track metadata for each successfully inserted record
+            await this.client.executeTransaction(async (dbClient) => {
+              for (const record of batch) {
+                try {
+                  await this.trackMetadataWithClient(
+                    dbClient,
+                    record.id,
+                    tableName,
+                    "insert",
+                    "all",
+                    "Imported from Snowflake",
+                    JSON.stringify(record),
+                    "ETL Process",
+                    record.original_id || null,
+                    schema
+                  );
+                } catch (metadataError) {
+                  console.error(
+                    `Failed to track metadata for record ${record.id}: ${metadataError}`
+                  );
+                }
+              }
+            });
+          } catch (error) {
+            const errorMsg =
+              error instanceof Error ? error : new Error(String(error));
+            console.error(`Error inserting batch into ${tableName}:`, errorMsg);
+            errors.push(errorMsg);
 
-          // Track metadata for each successfully inserted record
-          await this.client.executeTransaction(async (dbClient) => {
+            // If batch fails, try each record individually as fallback
             for (const record of batch) {
               try {
-                await this.trackMetadataWithClient(
-                  dbClient,
-                  record.id,
+                const singleResult = await this.insertSingleRecord(
                   tableName,
-                  "insert",
-                  "all",
-                  "Imported from Snowflake",
-                  JSON.stringify(record),
-                  "ETL Process",
-                  record.original_id || null
+                  record,
+                  schema
                 );
-              } catch (metadataError) {
-                console.error(
-                  `Failed to track metadata for record ${record.id}: ${metadataError}`
-                );
-                // Don't fail the whole process for metadata tracking failures
-              }
-            }
-          });
-        } catch (error) {
-          const errorMsg =
-            error instanceof Error ? error : new Error(String(error));
-          console.error(`Error inserting batch into ${tableName}:`, errorMsg);
-          errors.push(errorMsg);
+                if (singleResult.success) {
+                  successCount++;
+                } else {
+                  errors.push(new Error(singleResult.error || "Unknown error"));
 
-          // If batch fails, try each record individually as fallback
-          for (const record of batch) {
-            try {
-              const singleResult = await this.insertSingleRecord(
-                tableName,
-                record
-              );
-              if (singleResult.success) {
-                successCount++;
-              } else {
-                errors.push(new Error(singleResult.error || "Unknown error"));
+                  await this.logFailedRecord(
+                    tableName,
+                    record.original_id || null,
+                    record.original_translations_id || null,
+                    singleResult.error || "Unknown error",
+                    record,
+                    schema
+                  );
+                }
+              } catch (singleError) {
+                const singleErrorMsg =
+                  singleError instanceof Error
+                    ? singleError.message
+                    : String(singleError);
+                errors.push(new Error(singleErrorMsg));
 
                 await this.logFailedRecord(
                   tableName,
                   record.original_id || null,
                   record.original_translations_id || null,
-                  singleResult.error || "Unknown error",
-                  record
+                  singleErrorMsg,
+                  record,
+                  schema
                 );
               }
-            } catch (singleError) {
-              const singleErrorMsg =
-                singleError instanceof Error
-                  ? singleError.message
-                  : String(singleError);
-              errors.push(new Error(singleErrorMsg));
-
-              await this.logFailedRecord(
-                tableName,
-                record.original_id || null,
-                record.original_translations_id || null,
-                singleErrorMsg,
-                record
-              );
             }
           }
         }
       }
-    }
 
-    return { success: successCount, errors };
+      // Post-processing logic (logging completion)
+      const endTime = new Date();
+      await this.logMigration(
+        sourceTable,
+        tableName,
+        data.length,
+        successCount,
+        data.length - successCount,
+        errors.map((e) => e.message),
+        startTime,
+        endTime,
+        schema
+      );
+
+      return { success: successCount, errors };
+    } catch (error) {
+      // Error handling
+      const endTime = new Date();
+      const e = error instanceof Error ? error : new Error(String(error));
+
+      await this.logMigration(
+        sourceTable,
+        tableName,
+        data.length,
+        0,
+        data.length,
+        [e.message],
+        startTime,
+        endTime,
+        schema
+      );
+
+      return { success: 0, errors: [e] };
+    }
   }
 
   /**
@@ -196,7 +238,8 @@ export class PostgresLoader extends BaseLoader {
    */
   private async insertSingleRecord<T extends Record<string, any>>(
     tableName: string,
-    record: T
+    record: T,
+    schema: string = "public"
   ): Promise<{ success: boolean; error?: string }> {
     try {
       const columns = Object.keys(record);
@@ -204,7 +247,7 @@ export class PostgresLoader extends BaseLoader {
       const values = columns.map((col) => record[col]);
 
       const query = `
-        INSERT INTO ${tableName} (${columns.join(", ")})
+        INSERT INTO ${schema}.${tableName} (${columns.join(", ")})
         VALUES (${placeholders.join(", ")})
         RETURNING id
       `;
@@ -221,7 +264,8 @@ export class PostgresLoader extends BaseLoader {
           "Imported from Snowflake",
           JSON.stringify(record),
           "ETL Process",
-          record.original_id || null
+          record.original_id || null,
+          schema
         );
 
         return { success: true };
@@ -240,17 +284,15 @@ export class PostgresLoader extends BaseLoader {
   }
 
   /**
-   * PostgreSQL-specific implementation of upsert functionality
-   * TODO: migrate how the batching works in this implementation to the abstract class(?)
+   * Upsert data into PostgreSQL (insert or update)
    */
-  override async upsertData<T extends Record<string, any>>(
+  async upsertData<T extends Record<string, any>>(
     tableName: string,
     data: T[],
     onConflict: string = "id",
     batchSize: number = 1000,
     sourceTable: string = "unknown",
     skipTableCheck: boolean = false,
-    tableConstraints?: TableConstraints,
     schema: string = "public"
   ): Promise<{ success: number; errors: Error[] }> {
     // Pre-processing logic
@@ -263,16 +305,12 @@ export class PostgresLoader extends BaseLoader {
       if (!skipTableCheck) {
         const exists = await this.tableExists(tableName, schema);
         if (!exists) {
-          throw new Error(
-            `Table ${tableName} does not exist in schema ${schema}`
-          );
+          throw new Error(`Table ${schema}.${tableName} does not exist`);
         }
       }
 
       // Get table constraints (either from parameter, cache, or database)
-      const constraints =
-        tableConstraints ||
-        (await this.getTableConstraintsWithCache(tableName));
+      const constraints = await this.getTableConstraintsWithCache(tableName);
 
       // Validate records against constraints
       const { validRecords, invalidRecordsWithErrors } =
@@ -293,7 +331,8 @@ export class PostgresLoader extends BaseLoader {
             record.original_id || null,
             record.original_translations_id || null,
             errorMsg,
-            record
+            record,
+            schema
           );
         }
       });
@@ -343,7 +382,8 @@ export class PostgresLoader extends BaseLoader {
                     record.original_id || null,
                     record.original_translations_id || null,
                     result.error,
-                    record
+                    record,
+                    schema
                   );
                 }
               } catch (singleError) {
@@ -358,7 +398,8 @@ export class PostgresLoader extends BaseLoader {
                   record.original_id || null,
                   record.original_translations_id || null,
                   errorMsg,
-                  record
+                  record,
+                  schema
                 );
               }
             }
@@ -376,7 +417,8 @@ export class PostgresLoader extends BaseLoader {
         data.length - successCount,
         errors.map((e) => e.message),
         startTime,
-        endTime
+        endTime,
+        schema
       );
 
       return { success: successCount, errors };
@@ -393,7 +435,8 @@ export class PostgresLoader extends BaseLoader {
         data.length,
         [e.message],
         startTime,
-        endTime
+        endTime,
+        schema
       );
 
       return { success: 0, errors: [e] };
@@ -416,8 +459,6 @@ export class PostgresLoader extends BaseLoader {
     // Execute as a transaction
     await this.client.executeTransaction(async (dbClient) => {
       if (batch.length === 0) return;
-
-      console.log(`using schema: ${schema} for ${tableName}`);
 
       // Get column names from the first record
       const columns = Object.keys(batch[0]);
@@ -475,7 +516,8 @@ export class PostgresLoader extends BaseLoader {
               "Previous values in PostgreSQL",
               JSON.stringify(record),
               "ETL Process",
-              record.original_id || null
+              record.original_id || null,
+              schema
             );
           } catch (metadataError) {
             console.error(
@@ -544,7 +586,8 @@ export class PostgresLoader extends BaseLoader {
           "Previous values in PostgreSQL",
           JSON.stringify(record),
           "ETL Process",
-          record.original_id || null
+          record.original_id || null,
+          schema
         );
 
         return { success: true };
@@ -591,6 +634,70 @@ export class PostgresLoader extends BaseLoader {
   }
 
   /**
+   * Track metadata for loaded/modified records
+   */
+  async trackMetadata(
+    resourceId: string,
+    resourceType: string,
+    actionType: string,
+    fieldName: string,
+    previousValue: string,
+    replacementValue: string,
+    updatedBy: string,
+    originalId?: string | null,
+    schema: string = "public"
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const metadataId = uuidv4();
+      const now = new Date().toISOString();
+
+      const query = `
+        INSERT INTO ${schema}.metadata (
+          id, 
+          resource_id, 
+          resource_type, 
+          last_action_date, 
+          last_action_type, 
+          field_name, 
+          previous_value, 
+          replacement_value, 
+          updated_by, 
+          created, 
+          last_modified,
+          original_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      `;
+
+      const values = [
+        metadataId,
+        resourceId,
+        resourceType,
+        now,
+        actionType,
+        fieldName,
+        previousValue,
+        replacementValue,
+        updatedBy,
+        now,
+        now,
+        originalId || null,
+      ];
+
+      await this.client.getPool().query(query, values);
+
+      return {
+        success: true,
+      };
+    } catch (error) {
+      console.error("Error tracking metadata:", error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
    * Track metadata using a specific database client (for transaction support)
    */
   private async trackMetadataWithClient(
@@ -602,14 +709,15 @@ export class PostgresLoader extends BaseLoader {
     previousValue: string,
     replacementValue: string,
     updatedBy: string,
-    originalId?: string
+    originalId?: string | null,
+    schema: string = "public"
   ): Promise<{ success: boolean; error?: string }> {
     try {
       const metadataId = uuidv4();
       const now = new Date().toISOString();
 
       const query = `
-        INSERT INTO metadata (
+        INSERT INTO ${schema}.metadata (
           id, 
           resource_id, 
           resource_type, 
@@ -655,6 +763,31 @@ export class PostgresLoader extends BaseLoader {
   }
 
   /**
+   * Get failed migration records for a specific table
+   */
+  async getFailedRecords(
+    tableName: string,
+    resolved: boolean = false
+  ): Promise<any[]> {
+    try {
+      const query = `
+        SELECT * FROM failed_migration_records
+        WHERE table_name = $1
+        AND resolved = $2
+        ORDER BY attempted_at DESC
+      `;
+
+      const result = await this.client
+        .getPool()
+        .query(query, [tableName, resolved]);
+      return result.rows;
+    } catch (error) {
+      console.error("Error retrieving failed records:", error);
+      return [];
+    }
+  }
+
+  /**
    * Log failed record using a specific database client (for transaction support)
    */
   private async logFailedRecordWithClient(
@@ -663,10 +796,11 @@ export class PostgresLoader extends BaseLoader {
     originalId: string | null,
     originalTranslationsId: string | null,
     errorMessage: string,
-    attemptedRecord: any
+    attemptedRecord: any,
+    schema: string = "public"
   ): Promise<void> {
     const query = `
-      INSERT INTO failed_migration_records (
+      INSERT INTO ${schema}.failed_migration_records (
         id,
         table_name,
         original_id,
@@ -702,10 +836,11 @@ export class PostgresLoader extends BaseLoader {
     originalId: string | null,
     originalTranslationsId: string | null,
     errorMessage: string,
-    attemptedRecord: T
+    attemptedRecord: T,
+    schema: string = "public"
   ): Promise<void> {
     const query = `
-      INSERT INTO failed_migration_records (
+      INSERT INTO ${schema}.failed_migration_records (
         id,
         table_name,
         original_id,
@@ -739,92 +874,7 @@ export class PostgresLoader extends BaseLoader {
   }
 
   /**
-   * Update a record in PostgreSQL
-   */
-  async updateRecord<T extends Record<string, any>>(
-    tableName: string,
-    id: string,
-    data: Partial<T>
-  ): Promise<{ success: boolean; error?: string }> {
-    try {
-      // First get the current record to compare values
-      const existingRecord = await this.client.executeQuery(
-        `SELECT * FROM ${tableName} WHERE id = $1`,
-        [id]
-      );
-
-      if (!existingRecord || existingRecord.length === 0) {
-        return {
-          success: false,
-          error: `Record with id ${id} not found in ${tableName}`,
-        };
-      }
-
-      // Prepare the SET clause and values for the UPDATE query
-      const columns = Object.keys(data);
-      const values = Object.values(data);
-
-      const setClauses = columns
-        .map((col, i) => `${col} = $${i + 2}`)
-        .join(", ");
-
-      // Perform the update
-      const query = `
-        UPDATE ${tableName} 
-        SET ${setClauses} 
-        WHERE id = $1
-      `;
-
-      const result = await this.client.getPool().query(query, [id, ...values]);
-
-      if (result && result.rowCount && result.rowCount > 0) {
-        // Track metadata for each changed field
-        for (const [fieldName, newValue] of Object.entries(data)) {
-          const oldValue = existingRecord[0][fieldName];
-
-          // Only track if the value actually changed
-          if (oldValue !== newValue) {
-            await this.trackMetadata(
-              id,
-              tableName,
-              "update",
-              fieldName,
-              oldValue !== null && oldValue !== undefined
-                ? String(oldValue)
-                : "null",
-              newValue !== null && newValue !== undefined
-                ? String(newValue)
-                : "null",
-              "ETL Process",
-              existingRecord[0].original_id || null
-            );
-          }
-        }
-      }
-
-      if (result && result.rowCount) {
-        return {
-          success: result.rowCount > 0,
-          error: result.rowCount === 0 ? "Record not updated" : undefined,
-        };
-      } else {
-        return {
-          success: false,
-          error:
-            "On PostgresLoader.updateRecord(), the query returned result.rowCount == nil.  Query executed was: " +
-            query,
-        };
-      }
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  }
-
-  /**
-   * Check if a table exists in PostgreSQL (delegated to client)
+   * Check if a table exists in PostgreSQL
    */
   async tableExists(
     tableName: string,
@@ -834,25 +884,17 @@ export class PostgresLoader extends BaseLoader {
   }
 
   /**
-   * Delete all records from a table (delegated to client)
-   */
-  async deleteAllRecords(
-    tableName: string
-  ): Promise<{ success: boolean; count: number; error?: string }> {
-    return this.client.deleteAllRecords(tableName);
-  }
-
-  /**
    * Validate loaded data by comparing record counts
    */
   async validateRecordCount(
     tableName: string,
-    expectedCount: number
+    expectedCount: number,
+    schema: string = "public"
   ): Promise<{ success: boolean; message: string }> {
     try {
       const result = await this.client
         .getPool()
-        .query(`SELECT COUNT(*) FROM ${tableName}`);
+        .query(`SELECT COUNT(*) FROM ${schema}.${tableName}`);
       const count = parseInt(result.rows[0].count, 10);
 
       const success = count === expectedCount;
@@ -873,52 +915,6 @@ export class PostgresLoader extends BaseLoader {
   }
 
   /**
-   * Track metadata for loaded records - delegates to the metadata manager
-   */
-  async trackMetadata(
-    resourceId: string,
-    resourceType: string,
-    actionType: string,
-    fieldName: string,
-    previousValue: string,
-    replacementValue: string,
-    updatedBy: string,
-    originalId?: string
-  ): Promise<{ success: boolean; error?: string }> {
-    return this.metadataManager.trackMetadata(
-      resourceId,
-      resourceType,
-      actionType,
-      fieldName,
-      previousValue,
-      replacementValue,
-      updatedBy,
-      originalId
-    );
-  }
-
-  /**
-   * Get failed migration records for a specific table
-   */
-  async getFailedRecords(
-    tableName: string,
-    resolved: boolean = false
-  ): Promise<any[]> {
-    return this.metadataManager.getFailedRecords(tableName, resolved);
-  }
-
-  /**
-   * Mark a failed record as resolved
-   */
-  async resolveFailedRecord(
-    id: string,
-    resolvedBy: string,
-    notes?: string
-  ): Promise<{ success: boolean; error?: string }> {
-    return this.metadataManager.resolveFailedRecord(id, resolvedBy, notes);
-  }
-
-  /**
    * Log the migration progress to the migration_log table
    */
   async logMigration(
@@ -929,13 +925,14 @@ export class PostgresLoader extends BaseLoader {
     failureCount: number,
     errorMessages: string[],
     startTime: Date,
-    endTime: Date
+    endTime: Date,
+    schema: string = "public"
   ): Promise<void> {
     const executionTimeSeconds =
       (endTime.getTime() - startTime.getTime()) / 1000;
 
     const query = `
-      INSERT INTO migration_log (
+      INSERT INTO ${schema}.migration_log (
         source_table, 
         target_table, 
         records_migrated, 
@@ -968,101 +965,7 @@ export class PostgresLoader extends BaseLoader {
   }
 
   /**
-   * Run a migration task with proper batching, validation, and error handling
-   */
-  async runMigration<T extends Record<string, any>>(
-    sourceData: T[],
-    targetTable: string,
-    sourceTable: string,
-    batchSize: number = 1000,
-    onConflict: string = "id"
-  ): Promise<{ success: number; errors: Error[] }> {
-    console.log(`Starting migration from ${sourceTable} to ${targetTable}`);
-    console.log(
-      `Processing ${sourceData.length} records with batch size ${batchSize}`
-    );
-
-    const result = await this.upsertData(
-      targetTable,
-      sourceData,
-      onConflict,
-      batchSize,
-      sourceTable
-    );
-
-    console.log(
-      `Migration completed: ${result.success} successful, ${result.errors.length} failed`
-    );
-
-    return result;
-  }
-
-  /**
-   * Test optimal batch size for a specific table
-   */
-  async testOptimalBatchSize<T extends Record<string, any>>(
-    tableName: string,
-    sampleData: T[],
-    batchSizesToTest: number[] = [100, 500, 1000, 2000, 5000],
-    schema: string = "public"
-  ): Promise<{ batchSize: number; timeSeconds: number }[]> {
-    const results = [];
-
-    // Create a test table
-    const testTableName = `${tableName}_test_${Date.now()}`;
-
-    try {
-      // Get the table structure and create test table
-      const createTableQuery = await this.client.getPool().query(`
-        SELECT pg_get_ddl('${tableName}'::regclass) AS ddl
-      `);
-
-      const createTestTableQuery = createTableQuery.rows[0].ddl.replace(
-        `CREATE TABLE ${tableName}`,
-        `CREATE TABLE ${testTableName}`
-      );
-
-      await this.client.getPool().query(createTestTableQuery);
-
-      // Test each batch size
-      for (const batchSize of batchSizesToTest) {
-        // Clean table before each test
-        await this.client.getPool().query(`TRUNCATE TABLE ${testTableName}`);
-
-        const startTime = new Date();
-        await this.loadDataInternal(
-          testTableName,
-          sampleData,
-          batchSize,
-          schema
-        );
-        const endTime = new Date();
-
-        const timeSeconds = (endTime.getTime() - startTime.getTime()) / 1000;
-        results.push({ batchSize, timeSeconds });
-
-        console.log(`Batch size ${batchSize}: ${timeSeconds} seconds`);
-      }
-
-      // Sort by performance
-      return results.sort((a, b) => a.timeSeconds - b.timeSeconds);
-    } catch (error) {
-      console.error("Error testing batch sizes:", error);
-      return results;
-    } finally {
-      // Clean up test table
-      try {
-        await this.client
-          .getPool()
-          .query(`DROP TABLE IF EXISTS ${testTableName}`);
-      } catch (dropError) {
-        console.error("Error dropping test table:", dropError);
-      }
-    }
-  }
-
-  /**
-   * Close the PostgreSQL connection (delegated to client)
+   * Close the PostgreSQL connection
    */
   close(): void {
     this.client.close();

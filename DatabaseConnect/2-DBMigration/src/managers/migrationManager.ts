@@ -10,14 +10,16 @@ import { ServiceExtractor } from "../1-Extract/serviceExtractor";
 import { ServiceTransformer } from "../2-Transform/serviceTransformer";
 import { PostgresLoader } from "../3-Load/postgres-loader";
 import { PREDEFINED_CONSTRAINTS } from "../utils/constraint-utils";
+import { LocationExtractor } from "../1-Extract/locationExtractor";
+import { LocationTransformer } from "../2-Transform/locationTransformer";
 
 /**
  * MigrationManager orchestrates the ETL process by coordinating
- * extractors, transformers, and loaders
+ * extractors, transformers, and data managers
  */
 export class MigrationManager {
   private snowflakeClient: SnowflakeClient;
-  private postgresLoader: PostgresLoader;
+  private loader: PostgresLoader;
   private idConverter: IdConverter;
 
   // Storing extractors and transformers for different entity types
@@ -30,7 +32,7 @@ export class MigrationManager {
     idConverter: IdConverter
   ) {
     this.snowflakeClient = snowflakeClient;
-    this.postgresLoader = postgresLoader;
+    this.loader = postgresLoader;
     this.idConverter = idConverter;
 
     // Initialize maps
@@ -53,11 +55,20 @@ export class MigrationManager {
 
     this.extractors.set("service", new ServiceExtractor(this.snowflakeClient));
 
+    this.extractors.set(
+      "location",
+      new LocationExtractor(this.snowflakeClient)
+    );
+
     this.transformers.set(
       "organization",
       new OrganizationTransformer(this.idConverter)
     );
     this.transformers.set("service", new ServiceTransformer(this.idConverter));
+    this.transformers.set(
+      "location",
+      new LocationTransformer(this.idConverter)
+    );
 
     // Additional extractors and transformers will be registered here
     // as they are implemented for other entity types
@@ -87,6 +98,12 @@ export class MigrationManager {
     let failureCount = 0;
 
     try {
+      console.log(
+        `Starting migration for ${entityType} with schema: ${
+          schema || "default"
+        }`
+      );
+
       // If schema is provided, set it in the SnowflakeClient
       if (schema) {
         await this.snowflakeClient.setSchema(schema);
@@ -133,8 +150,33 @@ export class MigrationManager {
         `Transformed ${transformedData.length} ${entityType} records`
       );
 
+      // NEW: Process invalid records from transformation
+      const invalidRecords = transformer.getInvalidRecords();
+      if (invalidRecords.length > 0) {
+        console.log(
+          `Processing ${invalidRecords.length} invalid records from transformer`
+        );
+
+        // Log each invalid record to failed_migration_records
+        for (const { record, errors: validationErrors } of invalidRecords) {
+          await this.loader.logFailedRecord(
+            entityType,
+            record.original_id || null,
+            record.original_translations_id || null,
+            validationErrors.join(", "),
+            record,
+            pgSchema
+          );
+
+          // Increment failure count for statistics
+          failureCount++;
+        }
+      }
+
       // 3. Load data into Postgres
-      console.log(`Loading ${entityType} data into ${pgSchema} schema...`);
+      console.log(
+        `Loading ${transformedData.length} valid ${entityType} records into ${pgSchema} schema...`
+      );
 
       // Log a sample record for debugging
       if (transformedData.length > 0) {
@@ -152,32 +194,32 @@ export class MigrationManager {
 
       // Use upsertData method with optimized batch size
       console.time("load");
-      const loadResult = await this.postgresLoader.upsertData(
+      const loadResult = await this.loader.upsertData(
         entityType,
         transformedData,
         "id",
         batchSize,
         sourceTable,
         false,
-        constraints,
         pgSchema
       );
       console.timeEnd("load");
 
       successCount = loadResult.success;
-      failureCount = transformedData.length - loadResult.success;
+      failureCount += transformedData.length - loadResult.success;
       errors.push(...loadResult.errors);
 
+      // Show total failures including both validation and loading failures
+      const totalFailures = failureCount + invalidRecords.length;
+
       // If there were failures, log them
-      if (failureCount > 0) {
+      if (totalFailures > 0) {
         console.warn(
-          `${failureCount} records failed to migrate. Check the failed_migration_records table.`
+          `${totalFailures} records failed to migrate (${invalidRecords.length} validation errors, ${failureCount} load errors). Check the failed_migration_records table.`
         );
 
         // Get a count of distinct error types
-        const failedRecords = await this.postgresLoader.getFailedRecords(
-          entityType
-        );
+        const failedRecords = await this.loader.getFailedRecords(entityType);
 
         if (failedRecords.length > 0) {
           const errorCounts = failedRecords.reduce((acc, record) => {
@@ -201,7 +243,7 @@ export class MigrationManager {
 
       return {
         success: successCount,
-        failure: failureCount,
+        failure: failureCount + invalidRecords.length, // Include validation failures in the count
         errors,
         startTime,
         endTime,

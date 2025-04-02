@@ -33,7 +33,7 @@ program
     try {
       // Initialize services
       const snowflakeClient = new SnowflakeClient();
-      const postgresLoader = new PostgresLoader();
+      const postgresLoader = new PostgresLoader(); // Now a direct concrete class
       const idConverter = new IdConverter();
 
       // Initialize migration manager
