@@ -12,6 +12,12 @@ import { PostgresLoader } from "../3-Load/postgres-loader";
 import { PREDEFINED_CONSTRAINTS } from "../utils/constraint-utils";
 import { LocationExtractor } from "../1-Extract/locationExtractor";
 import { LocationTransformer } from "../2-Transform/locationTransformer";
+import { ServiceAtLocationExtractor } from "../1-Extract/ServiceAtLocationExtractor";
+import { ServiceAtLocationTransformer } from "../2-Transform/ServiceAtLocationTransformer";
+import { PhoneExtractor } from "../1-Extract/phoneExtractor";
+import { PhoneTransformer } from "../2-Transform/phoneTransformer";
+import { AddressExtractor } from "../1-Extract/addressExtractor";
+import { AddressTransformer } from "../2-Transform/addressTransformer";
 
 /**
  * MigrationManager orchestrates the ETL process by coordinating
@@ -59,6 +65,12 @@ export class MigrationManager {
       "location",
       new LocationExtractor(this.snowflakeClient)
     );
+    this.extractors.set(
+      "service_at_location",
+      new ServiceAtLocationExtractor(this.snowflakeClient)
+    );
+    this.extractors.set("phone", new PhoneExtractor(this.snowflakeClient));
+    this.extractors.set("address", new AddressExtractor(this.snowflakeClient));
 
     this.transformers.set(
       "organization",
@@ -69,6 +81,12 @@ export class MigrationManager {
       "location",
       new LocationTransformer(this.idConverter)
     );
+    this.transformers.set(
+      "service_at_location",
+      new ServiceAtLocationTransformer(this.idConverter)
+    );
+    this.transformers.set("phone", new PhoneTransformer(this.idConverter));
+    this.transformers.set("address", new AddressTransformer(this.idConverter));
 
     // Additional extractors and transformers will be registered here
     // as they are implemented for other entity types
