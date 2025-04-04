@@ -56,7 +56,7 @@ export interface PostgresServiceAtLocation extends MigratedData {
   description?: string;
 }
 
-// Address table type (consolidated)
+// Address table type
 export interface PostgresAddress extends MigratedData {
   location_id: string;
   attention?: string;
