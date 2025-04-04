@@ -149,8 +149,12 @@ export class ServiceTransformer extends Transformer<
       eligibility_description:
         translation?.ELIGIBILITY_DESCRIPTION || undefined,
       alert: translation?.ALERT || undefined,
-      last_modified: new Date(source.LAST_MODIFIED).toISOString(),
-      created: new Date(source.CREATED).toISOString(),
+      last_modified: source.LAST_MODIFIED
+        ? new Date(source.LAST_MODIFIED).toISOString()
+        : new Date().toISOString(),
+      created: source.CREATED
+        ? new Date(source.CREATED).toISOString()
+        : new Date().toISOString(),
       original_id:
         this.idConverter.convertToUuid(source.ID) || source.ID.toString(),
       original_translations_id: translation?.ID
