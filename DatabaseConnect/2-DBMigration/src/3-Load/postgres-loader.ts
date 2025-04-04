@@ -36,7 +36,8 @@ export class PostgresLoader {
     batchSize: number = 100,
     sourceTable: string = "unknown",
     skipTableCheck: boolean = false,
-    schema: string = "public"
+    schema: string = "public",
+    maxConcurrent: number = 16 // New parameter to control concurrency
   ): Promise<{ success: number; errors: Error[] }> {
     // Pre-processing logic (validation, logging start)
     const startTime = new Date();
@@ -63,36 +64,42 @@ export class PostgresLoader {
       const errors: Error[] = [];
 
       // Process invalid records
-      for (const {
-        record,
-        errors: validationErrors,
-      } of invalidRecordsWithErrors) {
-        const errorMsg = `Validation failed: ${validationErrors.join(", ")}`;
-        errors.push(new Error(errorMsg));
+      const invalidPromises = invalidRecordsWithErrors.map(
+        async ({ record, errors: validationErrors }) => {
+          const errorMsg = `Validation failed: ${validationErrors.join(", ")}`;
+          errors.push(new Error(errorMsg));
 
-        try {
-          await this.logFailedRecord(
-            tableName,
-            record.original_id || null,
-            record.original_translations_id || null,
-            errorMsg,
-            record,
-            schema
-          );
-        } catch (logError) {
-          console.error(`Failed to log invalid record: ${logError}`);
+          try {
+            await this.logFailedRecord(
+              tableName,
+              record.original_id || null,
+              record.original_translations_id || null,
+              errorMsg,
+              record,
+              schema
+            );
+          } catch (logError) {
+            console.error(`Failed to log invalid record: ${logError}`);
+          }
         }
-      }
+      );
 
-      // Process valid records in batches
+      // Wait for all invalid record logging to complete
+      await Promise.all(invalidPromises);
+
+      // Process valid records in batches with controlled concurrency
       if (validRecords.length > 0) {
         // Break data into batches
         const batches = batchRecords(validRecords, batchSize);
+        console.log(
+          `Processing ${batches.length} batches with max ${maxConcurrent} concurrent operations`
+        );
 
-        for (const batch of batches) {
+        // Process batches with controlled concurrency
+        const processBatch = async (batch: T[]) => {
+          if (batch.length === 0) return 0;
+
           try {
-            if (batch.length === 0) continue;
-
             // Get column names from the first record
             const columns = Object.keys(batch[0]);
 
@@ -121,11 +128,10 @@ export class PostgresLoader {
 
             // Execute the query
             const result = await this.client.getPool().query(query, values);
-            if (result && result.rowCount) {
-              successCount += result.rowCount;
-            }
+            const insertedCount =
+              result && result.rowCount ? result.rowCount : 0;
 
-            // Track metadata for each successfully inserted record
+            // Track metadata for each successfully inserted record in a separate transaction
             await this.client.executeTransaction(async (dbClient) => {
               for (const record of batch) {
                 try {
@@ -148,6 +154,8 @@ export class PostgresLoader {
                 }
               }
             });
+
+            return insertedCount;
           } catch (error) {
             const errorMsg =
               error instanceof Error ? error : new Error(String(error));
@@ -155,45 +163,83 @@ export class PostgresLoader {
             errors.push(errorMsg);
 
             // If batch fails, try each record individually as fallback
-            for (const record of batch) {
-              try {
-                const singleResult = await this.insertSingleRecord(
-                  tableName,
-                  record,
-                  schema
-                );
-                if (singleResult.success) {
-                  successCount++;
-                } else {
-                  errors.push(new Error(singleResult.error || "Unknown error"));
+            let individualSuccessCount = 0;
+
+            // Process records individually, but still in parallel with controlled concurrency
+            const individualResults = await Promise.all(
+              batch.map(async (record) => {
+                try {
+                  const singleResult = await this.insertSingleRecord(
+                    tableName,
+                    record,
+                    schema
+                  );
+
+                  if (singleResult.success) {
+                    return 1 as number;
+                  } else {
+                    errors.push(
+                      new Error(singleResult.error || "Unknown error")
+                    );
+
+                    await this.logFailedRecord(
+                      tableName,
+                      record.original_id || null,
+                      record.original_translations_id || null,
+                      singleResult.error || "Unknown error",
+                      record,
+                      schema
+                    );
+                    return 0 as number;
+                  }
+                } catch (singleError) {
+                  const singleErrorMsg =
+                    singleError instanceof Error
+                      ? singleError.message
+                      : String(singleError);
+                  errors.push(new Error(singleErrorMsg));
 
                   await this.logFailedRecord(
                     tableName,
                     record.original_id || null,
                     record.original_translations_id || null,
-                    singleResult.error || "Unknown error",
+                    singleErrorMsg,
                     record,
                     schema
                   );
+                  return 0 as number;
                 }
-              } catch (singleError) {
-                const singleErrorMsg =
-                  singleError instanceof Error
-                    ? singleError.message
-                    : String(singleError);
-                errors.push(new Error(singleErrorMsg));
+              })
+            );
 
-                await this.logFailedRecord(
-                  tableName,
-                  record.original_id || null,
-                  record.original_translations_id || null,
-                  singleErrorMsg,
-                  record,
-                  schema
-                );
-              }
-            }
+            return individualResults.reduce(
+              (sum: number, count: number) => sum + count,
+              0
+            );
           }
+        };
+
+        // Process batches with controlled concurrency
+        let processedCount = 0;
+        const batchesCount = batches.length;
+
+        // Process batches in chunks to control concurrency
+        for (let i = 0; i < batchesCount; i += maxConcurrent) {
+          const currentBatches = batches.slice(i, i + maxConcurrent);
+          const results = await Promise.all(currentBatches.map(processBatch));
+
+          const batchSuccessCount = results.reduce(
+            (sum, count) => sum + count,
+            0
+          );
+          successCount += batchSuccessCount;
+
+          processedCount += currentBatches.length;
+          console.log(
+            `Processed ${processedCount}/${batchesCount} batches (${Math.round(
+              (processedCount / batchesCount) * 100
+            )}%)`
+          );
         }
       }
 
@@ -293,7 +339,8 @@ export class PostgresLoader {
     batchSize: number = 1000,
     sourceTable: string = "unknown",
     skipTableCheck: boolean = false,
-    schema: string = "public"
+    schema: string = "public",
+    maxConcurrent: number = 16 // New parameter to control concurrency
   ): Promise<{ success: number; errors: Error[] }> {
     // Pre-processing logic
     const startTime = new Date();
@@ -317,93 +364,146 @@ export class PostgresLoader {
         validateRecordsAgainstConstraints(data, constraints);
 
       // Process invalid records - log them to failed_migration_records
-      await this.client.executeTransaction(async (dbClient) => {
-        for (const {
-          record,
-          errors: validationErrors,
-        } of invalidRecordsWithErrors) {
-          const errorMsg = `Validation failed: ${validationErrors.join(", ")}`;
-          errors.push(new Error(errorMsg));
+      if (invalidRecordsWithErrors.length > 0) {
+        await Promise.all(
+          invalidRecordsWithErrors.map(
+            async ({ record, errors: validationErrors }) => {
+              const errorMsg = `Validation failed: ${validationErrors.join(
+                ", "
+              )}`;
+              errors.push(new Error(errorMsg));
 
-          await this.logFailedRecordWithClient(
-            dbClient,
-            tableName,
-            record.original_id || null,
-            record.original_translations_id || null,
-            errorMsg,
-            record,
-            schema
-          );
-        }
-      });
+              await this.logFailedRecord(
+                tableName,
+                record.original_id || null,
+                record.original_translations_id || null,
+                errorMsg,
+                record,
+                schema
+              );
+            }
+          )
+        );
+      }
 
-      // Process valid records in batches
+      // Process valid records in batches with controlled concurrency
       if (validRecords.length > 0) {
         const batches = batchRecords(validRecords, batchSize);
+        console.log(
+          `Processing ${batches.length} batches with max ${maxConcurrent} concurrent operations`
+        );
 
-        for (const batch of batches) {
-          try {
-            if (batch.length === 0) continue;
+        // Process batches in chunks to control concurrency
+        let processedCount = 0;
+        const batchesCount = batches.length;
 
-            // Process batch using transaction
-            const batchResult = await this.processBatchUpsert(
-              tableName,
-              batch,
-              onConflict,
-              schema
-            );
-            successCount += batchResult.successCount;
+        // Process batches in chunks to control concurrency - use a lower concurrency value
+        // to prevent connection pool exhaustion
+        for (let i = 0; i < batchesCount; i += maxConcurrent) {
+          const currentBatches = batches.slice(i, i + maxConcurrent);
+          // Reduce parallelism to avoid connection timeouts
+          const concurrentLimit = Math.min(8, maxConcurrent);
 
-            // Add any batch errors to our error collection
-            if (batchResult.errors.length > 0) {
-              errors.push(...batchResult.errors);
-            }
-          } catch (batchError) {
-            console.error(
-              `Error processing batch for ${tableName}:`,
-              batchError
-            );
+          // Process in smaller groups to prevent connection exhaustion
+          for (let j = 0; j < currentBatches.length; j += concurrentLimit) {
+            const batchGroup = currentBatches.slice(j, j + concurrentLimit);
 
-            // If batch processing fails, try each record individually
-            for (const record of batch) {
+            const batchPromises = batchGroup.map(async (batch) => {
               try {
-                const result = await this.processSingleRecordUpsert(
+                const batchResult = await this.processBatchUpsert(
                   tableName,
-                  record,
+                  batch,
                   onConflict,
                   schema
                 );
-                if (result.success) {
-                  successCount++;
-                } else if (result.error) {
-                  errors.push(new Error(result.error));
-                  await this.logFailedRecord(
-                    tableName,
-                    record.original_id || null,
-                    record.original_translations_id || null,
-                    result.error,
-                    record,
-                    schema
+
+                if (batchResult.errors.length > 0) {
+                  errors.push(...batchResult.errors);
+                }
+
+                return batchResult.successCount;
+              } catch (batchError) {
+                console.error(
+                  `Error processing batch for ${tableName}:`,
+                  batchError
+                );
+
+                // If batch processing fails, try each record individually with reduced concurrency
+                const recordsPerGroup = 10; // Process a smaller number of records at a time
+                let individualSuccess = 0;
+
+                for (let k = 0; k < batch.length; k += recordsPerGroup) {
+                  const recordGroup = batch.slice(k, k + recordsPerGroup);
+
+                  const individualResults = await Promise.all(
+                    recordGroup.map(async (record) => {
+                      try {
+                        const result = await this.processSingleRecordUpsert(
+                          tableName,
+                          record,
+                          onConflict,
+                          schema
+                        );
+
+                        if (result.success) {
+                          return 1 as number;
+                        } else if (result.error) {
+                          errors.push(new Error(result.error));
+                          await this.logFailedRecord(
+                            tableName,
+                            record.original_id || null,
+                            record.original_translations_id || null,
+                            result.error,
+                            record,
+                            schema
+                          );
+                          return 0 as number;
+                        }
+                        return 0 as number;
+                      } catch (singleError) {
+                        const errorMsg =
+                          singleError instanceof Error
+                            ? singleError.message
+                            : String(singleError);
+                        errors.push(new Error(errorMsg));
+
+                        await this.logFailedRecord(
+                          tableName,
+                          record.original_id || null,
+                          record.original_translations_id || null,
+                          errorMsg,
+                          record,
+                          schema
+                        );
+                        return 0 as number;
+                      }
+                    })
+                  );
+
+                  individualSuccess += individualResults.reduce(
+                    (sum: number, count: number) => sum + count,
+                    0
                   );
                 }
-              } catch (singleError) {
-                const errorMsg =
-                  singleError instanceof Error
-                    ? singleError.message
-                    : String(singleError);
-                errors.push(new Error(errorMsg));
 
-                await this.logFailedRecord(
-                  tableName,
-                  record.original_id || null,
-                  record.original_translations_id || null,
-                  errorMsg,
-                  record,
-                  schema
-                );
+                return individualSuccess;
               }
-            }
+            });
+
+            const batchResults = await Promise.all(batchPromises);
+            const batchSuccessCount = batchResults.reduce(
+              (sum: number, count: number) => sum + count,
+              0
+            );
+            successCount += batchSuccessCount;
           }
+
+          processedCount += currentBatches.length;
+          console.log(
+            `Processed ${processedCount}/${batchesCount} batches (${Math.round(
+              (processedCount / batchesCount) * 100
+            )}%)`
+          );
         }
       }
 
@@ -456,10 +556,9 @@ export class PostgresLoader {
     const errors: Error[] = [];
     const returnedIds: string[] = [];
 
-    // Execute as a transaction
-    await this.client.executeTransaction(async (dbClient) => {
-      if (batch.length === 0) return;
+    if (batch.length === 0) return { successCount: 0, errors: [] };
 
+    try {
       // Get column names from the first record
       const columns = Object.keys(batch[0]);
 
@@ -495,41 +594,56 @@ export class PostgresLoader {
       `;
 
       // Execute the query
-      const result = await dbClient.query(query, values);
+      const result = await this.client.getPool().query(query, values);
       const ids = result.rows.map((row) => row.id);
       returnedIds.push(...ids);
       successCount = ids.length;
 
       // Track metadata for each successfully upserted record
-      for (let i = 0; i < batch.length; i++) {
-        const record = batch[i];
-        const recordId = record.id;
+      // Process metadata operations in parallel with controlled concurrency
+      const metadataChunkSize = 50; // Process metadata in smaller chunks
+      const recordIds = batch
+        .map((record) => record.id)
+        .filter((id) => ids.includes(id));
 
-        if (ids.includes(recordId)) {
-          try {
-            await this.trackMetadataWithClient(
-              dbClient,
-              recordId,
-              tableName,
-              "upsert",
-              "all",
-              "Previous values in PostgreSQL",
-              JSON.stringify(record),
-              "ETL Process",
-              record.original_id || null,
-              schema
-            );
-          } catch (metadataError) {
-            console.error(
-              `Failed to track metadata for record ${recordId}: ${metadataError}`
-            );
-            // Don't fail the whole batch for metadata errors
-          }
-        }
+      for (let i = 0; i < recordIds.length; i += metadataChunkSize) {
+        const currentChunk = recordIds.slice(i, i + metadataChunkSize);
+
+        await this.client.executeTransaction(async (dbClient) => {
+          await Promise.all(
+            currentChunk.map(async (recordId) => {
+              const record = batch.find((r) => r.id === recordId);
+              if (!record) return;
+
+              try {
+                await this.trackMetadataWithClient(
+                  dbClient,
+                  recordId,
+                  tableName,
+                  "upsert",
+                  "all",
+                  "Previous values in PostgreSQL",
+                  JSON.stringify(record),
+                  "ETL Process",
+                  record.original_id || null,
+                  schema
+                );
+              } catch (metadataError) {
+                console.error(
+                  `Failed to track metadata for record ${recordId}: ${metadataError}`
+                );
+                // Don't fail the whole batch for metadata errors
+              }
+            })
+          );
+        });
       }
-    });
 
-    return { successCount, errors };
+      return { successCount, errors };
+    } catch (error) {
+      errors.push(error instanceof Error ? error : new Error(String(error)));
+      return { successCount: 0, errors };
+    }
   }
 
   /**

@@ -23,14 +23,16 @@ export const migrationConfig = {
   batchSize: 2000, // Number of records to process at once
   logLevel: "info",
   enableValidation: true,
+  // Number of concurrent batches to process
+  concurrentBatches: 8,
   // Tables to migrate in the specified order
   tables: [
-    // "organization",
+    "organization",
     "location",
-    // "service",
-    // "service_at_location",
-    // "address", // Consolidated address table (replacing physical_address & postal_address)
-    // "phone",
+    "service",
+    "service_at_location",
+    "address",
+    "phone",
   ],
 };
 
@@ -41,7 +43,20 @@ export const hetznerPostgresConfig = {
   user: process.env.POSTGRES_USER || "postgres",
   password: process.env.POSTGRES_PASSWORD || "",
   ssl: false,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+  // Connection pool settings
+  max: 20, // Maximum number of connections
+  min: 5, // Minimum number of idle connections to maintain
+  idleTimeoutMillis: 90000, // 90 seconds - since your server has good memory
+  connectionTimeoutMillis: 15000, // 15 seconds - better for Docker networking
+  // Query settings
+  statement_timeout: 60000, // 60 seconds since you have good memory allocation
+  application_name: "etl-migration", // Helpful for identifying connections
+  // Performance settings matching your PostgreSQL config
+  query_timeout: 120000, // 2 minutes for more complex queries
+  // Connection behavior
+  keepalive: true,
+  keepaliveInitialDelayMillis: 30000, // 30 seconds before first keepalive
+  // Add retry logic for connection failures
+  max_retries: 5,
+  retry_interval: 2000, // 2 seconds between retries
 };
