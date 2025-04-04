@@ -16,15 +16,27 @@ export abstract class Extractor<
     protected snowflakeClient: SnowflakeClient,
     public sourceTables: {
       main: string;
-      translations: string;
+      translations?: string; // Make translations optional
     }
   ) {}
 
   abstract extractMainRecords(offset: number, limit?: number): Promise<S[]>;
+
+  /**
+   * Extract translation records for the given IDs and locale
+   * This method must be implemented if translations are supported
+   */
   abstract extractTranslationRecords(
     ids: string[],
     locale: string
   ): Promise<T[]>;
+
+  /**
+   * Check if this extractor supports translations
+   */
+  protected hasTranslations(): boolean {
+    return !!this.sourceTables.translations;
+  }
 
   async extract(
     offset: number,
@@ -40,36 +52,9 @@ export abstract class Extractor<
       );
     }
 
-    let ids: string[] = [];
-    // Get IDs for translation lookup
-    for (let i = 0; i < mainRecords.length; i++) {
-      const record = mainRecords[i];
-      ids.push(record.ID);
-    }
-
-    console.log(
-      "These ids were mapped from mainRecords ",
-      ids[0],
-      ",",
-      ids[1],
-      "..."
-    );
-
-    // Extract translation records for these IDs
-    const translationRecords = await this.extractTranslationRecords(
-      ids,
-      locale
-    );
-    if (translationRecords.length > 0) {
-      logJsonBlock(
-        `First record from ${this.sourceTables.translations}`,
-        translationRecords[0]
-      );
-    }
-
-    // Organize data into a map for easy access
     const dataMap = new Map<string, { main: S; translations: T[] }>();
 
+    // Initialize the map with main records
     mainRecords.forEach((record) => {
       dataMap.set(record.ID, {
         main: record,
@@ -77,18 +62,47 @@ export abstract class Extractor<
       });
     });
 
-    translationRecords.forEach((translation) => {
-      // Ensure we're using the right field for joining
-      const parentId = translation.PARENT_RECORD_ID;
-      const entry = dataMap.get(parentId);
-      if (entry) {
-        entry.translations.push(translation);
-      } else {
+    // Only extract translations if supported
+    if (this.hasTranslations()) {
+      // Get IDs for translation lookup
+      let ids: string[] = mainRecords.map((record) => record.ID);
+
+      if (ids.length > 0) {
         console.log(
-          `No matching record found for translation with parent ID: ${parentId}`
+          "These ids were mapped from mainRecords ",
+          ids[0],
+          ",",
+          ids[1] || "",
+          "..."
         );
+
+        // Extract translation records for these IDs
+        const translationRecords = await this.extractTranslationRecords(
+          ids,
+          locale
+        );
+
+        if (translationRecords.length > 0) {
+          logJsonBlock(
+            `First record from ${this.sourceTables.translations}`,
+            translationRecords[0]
+          );
+        }
+
+        // Add translations to their corresponding main records
+        translationRecords.forEach((translation) => {
+          const parentId = translation.PARENT_RECORD_ID;
+          const entry = dataMap.get(parentId);
+          if (entry) {
+            entry.translations.push(translation);
+          } else {
+            console.log(
+              `No matching record found for translation with parent ID: ${parentId}`
+            );
+          }
+        });
       }
-    });
+    }
 
     return dataMap;
   }
