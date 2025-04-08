@@ -3,6 +3,7 @@
 DatabaseConnect/1-Prep/Context/*.md
 DatabaseConnect/1-Prep/Plan/snowflake_table_samples.md
 **/dist/**
+**/target/**
 DatabaseConnect/2-DBMigration/snowflake.log
 /DatabaseConnect/2-DBMigration/dist/
 node_modules/
