@@ -149,8 +149,7 @@ SELECT
         'id', id,
         'cluster_id', cluster_id,
         'method_name', method_name,
-        'confidence', confidence,
-        'details', details
+        'confidence', confidence
     ) AS record
 FROM 
     matching_methods
