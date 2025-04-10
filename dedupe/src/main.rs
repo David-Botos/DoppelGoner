@@ -4,9 +4,10 @@ mod db;
 mod models;
 mod matching;
 mod results;
+mod entity_organization;
 
 use crate::db::PgPool;
-use crate::models::{LLMReviewResult, MatchGroup};
+use crate::models::{LLMReviewResult, MatchGroup, HierarchicalMatchGroup};
 use crate::matching::{
     address::match_addresses,
     email::match_emails,
@@ -15,6 +16,7 @@ use crate::matching::{
 };
 // use crate::matching::semantic::{assign_taxonomies, match_by_taxonomy_and_region, match_semantic};
 use crate::results::{merge_match_groups, save_clusters};
+use crate::entity_organization::organize_entities;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -60,6 +62,11 @@ async fn main() -> anyhow::Result<()> {
     let unified_groups: Vec<MatchGroup> = merge_match_groups(groups);
     println!("   Merged into {} unified groups", unified_groups.len());
     
+    // === Organize Entities into Hierarchical Structure ===
+    println!("🏗️ Organizing entities into hierarchical structure...");
+    let hierarchical_groups: Vec<HierarchicalMatchGroup> = organize_entities(&pool, &unified_groups).await?;
+    println!("   Organized {} groups with hierarchical structure", hierarchical_groups.len());
+    
     // === Simplified Implementation: Skip Phase 2, 3, 4 for now ===
     // Comment out the more sophisticated matching strategies to focus on deterministic methods
     /*
@@ -97,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
     
     // === Persist Results for Human Review ===
     println!("💾 Saving deterministic match clusters to database...");
-    save_clusters(&pool, &reviewed_groups).await?;
+    save_clusters(&pool, &reviewed_groups, &hierarchical_groups).await?;
     
     println!("✅ Phase 1 deduplication completed successfully!");
     println!("   Total groups identified: {}", reviewed_groups.len());

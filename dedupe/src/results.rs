@@ -1,6 +1,6 @@
 // src/results.rs
 
-use crate::models::{MatchGroup, MatchingMethod, LLMReviewResult};
+use crate::models::{MatchGroup, MatchingMethod, LLMReviewResult, HierarchicalMatchGroup};
 use crate::db::PgPool;
 use anyhow::{Result, Context};
 use std::collections::{HashMap, HashSet};
@@ -11,38 +11,16 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 // use tokio_postgres::Row;
 
-/// Run LLM review on match groups to validate and provide reasoning
-///
-/// This function takes match groups that are candidates for merging and asks an LLM
-/// to evaluate whether they represent the same real-world entity.
-// pub async fn run_llm_review(pool: &PgPool, unified_groups: &[MatchGroup]) -> Result<Vec<LLMReviewResult>> {
-//     // This is a placeholder implementation
-//     // In a real system, you would:
-//     // 1. Select groups that need review (e.g., below confidence threshold)
-//     // 2. For each group, fetch the full details of involved records
-//     // 3. Format a prompt for the LLM with this context
-//     // 4. Call an LLM API (Mistral, OpenAI, etc.)
-//     // 5. Parse the result and update the match groups
-
-//     // For now, we'll just return the groups unmodified
-//     let results = unified_groups
-//         .iter()
-//         .map(|group| LLMReviewResult {
-//             group: group.clone(),
-//             reasoning: Some("Automated placeholder review".to_string()),
-//             is_valid: true, // All are valid by default
-//         })
-//         .collect();
-
-//     Ok(results)
-// }
-
 /// Save the cluster results to database for human review using concurrent processing
 ///
 /// This persists the match groups to a database table where human reviewers
 /// can access them through a review interface. Uses controlled concurrency and Arc
 /// to efficiently share data across tasks.
-pub async fn save_clusters(pool: &PgPool, reviewed_results: &[LLMReviewResult]) -> Result<()> {
+pub async fn save_clusters(
+    pool: &PgPool, 
+    reviewed_results: &[LLMReviewResult],
+    hierarchical_groups: &[HierarchicalMatchGroup]
+) -> Result<()> {
     println!("   Saving {} match groups to database...", reviewed_results.len());
     
     // Filter out only the indices of valid clusters to avoid excessive cloning
@@ -70,6 +48,7 @@ pub async fn save_clusters(pool: &PgPool, reviewed_results: &[LLMReviewResult]) 
     // Share data across tasks using Arc
     let pool = Arc::new(pool.clone());
     let shared_results = Arc::new(reviewed_results.to_vec());
+    let shared_hierarchical = Arc::new(hierarchical_groups.to_vec());
     
     // Use semaphore to limit concurrent operations
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_BATCHES));
@@ -91,6 +70,7 @@ pub async fn save_clusters(pool: &PgPool, reviewed_results: &[LLMReviewResult]) 
         let semaphore_clone = Arc::clone(&semaphore);
         let pool_clone = Arc::clone(&pool);
         let results_clone = Arc::clone(&shared_results);
+        let hierarchical_clone = Arc::clone(&shared_hierarchical);
         
         // Create a batch processing task
         let task = tokio::spawn(async move {
@@ -101,8 +81,14 @@ pub async fn save_clusters(pool: &PgPool, reviewed_results: &[LLMReviewResult]) 
             println!("   Starting batch {}/{} ({} groups)...", 
                     batch_idx + 1, total_batches, batch_indices.len());
             
-            let result = process_batch_by_indices(&pool_clone, &results_clone, 
-                                               &batch_indices, batch_idx + 1, total_batches).await;
+            let result = process_batch_by_indices(
+                &pool_clone, 
+                &results_clone, 
+                &hierarchical_clone,
+                &batch_indices, 
+                batch_idx + 1, 
+                total_batches
+            ).await;
             
             let elapsed = batch_start.elapsed();
             match result {
@@ -154,10 +140,10 @@ pub async fn save_clusters(pool: &PgPool, reviewed_results: &[LLMReviewResult]) 
 }
 
 /// Process a batch of match groups identified by their indices
-/// Process a batch of match groups identified by their indices
 async fn process_batch_by_indices(
     pool: &PgPool, 
     all_results: &[LLMReviewResult],
+    all_hierarchical: &[HierarchicalMatchGroup],
     indices: &[usize], 
     batch_number: usize,
     total_batches: usize
@@ -173,9 +159,8 @@ async fn process_batch_by_indices(
     let cluster_stmt = transaction
         .prepare(
             "INSERT INTO match_clusters 
-             (confidence, notes, reasoning, is_reviewed) 
-             VALUES ($1, $2, $3, $4)
-             RETURNING id"
+             (id, confidence, notes, reasoning, is_reviewed) 
+             VALUES ($1, $2, $3, $4, $5)"
         )
         .await
         .context("Failed to prepare cluster statement")?;
@@ -183,17 +168,26 @@ async fn process_batch_by_indices(
     let entity_stmt = transaction
         .prepare(
             "INSERT INTO cluster_entities 
-             (cluster_id, entity_type, entity_id) 
-             VALUES ($1, $2, $3)"
+             (id, cluster_id, primary_entity, created_at) 
+             VALUES ($1, $2, $3, CURRENT_TIMESTAMP)"
         )
         .await
         .context("Failed to prepare entity statement")?;
         
+    let feature_stmt = transaction
+        .prepare(
+            "INSERT INTO entity_features
+             (id, cluster_entity_id, table_name, table_id, feature_type, weight)
+             VALUES ($1, $2, $3, $4, $5, $6)"
+        )
+        .await
+        .context("Failed to prepare feature statement")?;
+        
     let method_stmt = transaction
         .prepare(
             "INSERT INTO matching_methods 
-             (cluster_id, method_name, confidence) 
-             VALUES ($1, $2, $3)"
+             (id, cluster_id, method_name, confidence) 
+             VALUES ($1, $2, $3, $4)"
         )
         .await
         .context("Failed to prepare method statement")?;
@@ -208,11 +202,15 @@ async fn process_batch_by_indices(
                     batch_number, total_batches, idx + 1, indices.len());
         }
         
+        // Generate a new UUID for the cluster
+        let cluster_id = Uuid::new_v4();
+        
         // 1. Insert the match cluster using prepared statement
-        let cluster_row = transaction
-            .query_one(
+        let cluster_result = transaction
+            .execute(
                 &cluster_stmt,
                 &[
+                    &cluster_id,
                     &result.group.confidence,
                     &result.group.notes,
                     &result.reasoning,
@@ -221,87 +219,101 @@ async fn process_batch_by_indices(
             )
             .await;
             
-        match cluster_row {
-            Ok(row) => {
-                let cluster_id = row.get::<_, Uuid>(0);
+        if let Err(e) = cluster_result {
+            error_count += 1;
+            eprintln!("Error saving match cluster: {}", e);
+            continue;
+        }
+        
+        // 2. Find the hierarchical group data for this result by matching record_ids
+        let hierarchical_data = all_hierarchical
+            .iter()
+            .find(|hg| hg.base_group.record_ids == result.group.record_ids);
+            
+        if let Some(hier_data) = hierarchical_data {
+            let mut entity_success = true;
+            
+            // Process each entity in the hierarchical structure
+            for entity in &hier_data.entities {
+                let entity_id = match &entity.id {
+                    Some(id) => match Uuid::parse_str(id) {
+                        Ok(uuid) => uuid,
+                        Err(_) => Uuid::new_v4(),
+                    },
+                    None => Uuid::new_v4(),
+                };
                 
-                // 2. Insert each entity in the cluster
-                let mut entity_success = true;
-                
-                for record_id in &result.group.record_ids {
-                    // Parse entity type and ID from the prefixed record_id
-                    let parts: Vec<&str> = record_id.split(':').collect();
-                    if parts.len() != 2 {
-                        eprintln!("Invalid record ID format: {}", record_id);
-                        entity_success = false;
-                        continue;
-                    }
-
-                    let entity_type = parts[0];
-                    let entity_id = parts[1];
+                // Insert the cluster entity
+                let entity_result = transaction
+                    .execute(
+                        &entity_stmt,
+                        &[&entity_id, &cluster_id, &entity.is_primary],
+                    )
+                    .await;
                     
-                    // Use prepared statement for entity insertion
-                    let entity_result = transaction
+                if let Err(e) = entity_result {
+                    eprintln!("Error saving entity: {}", e);
+                    entity_success = false;
+                    continue;
+                }
+                
+                // Insert all features for this entity
+                for feature in &entity.features {
+                    let feature_id = Uuid::new_v4();
+                    let table_id = match Uuid::parse_str(&feature.table_id) {
+                        Ok(uuid) => uuid,
+                        Err(_) => {
+                            // If it's not a valid UUID, skip this feature
+                            eprintln!("Invalid UUID in table_id: {}", feature.table_id);
+                            continue;
+                        }
+                    };
+                    
+                    let feature_result = transaction
                         .execute(
-                            &entity_stmt,
-                            &[&cluster_id, &entity_type, &entity_id],
+                            &feature_stmt,
+                            &[
+                                &feature_id,
+                                &entity_id,
+                                &feature.table_name,
+                                &table_id,
+                                &feature.feature_type,
+                                &feature.weight,
+                            ],
                         )
                         .await;
-                    
-                    if let Err(e) = entity_result {
-                        eprintln!("Error saving entity {}: {}", record_id, e);
+                        
+                    if let Err(e) = feature_result {
+                        eprintln!("Error saving feature: {}", e);
                         entity_success = false;
                     }
                 }
+            }
+            
+            // If entities were processed successfully, consider this a success
+            if entity_success {
+                // Now handle methods
+                let method_success = insert_methods(&transaction, &method_stmt, &result.group.method, cluster_id, result.group.confidence).await;
                 
-                // 3. Insert the matching method(s)
-                match &result.group.method {
-                    MatchingMethod::Merged(methods) => {
-                        // For merged methods, insert each contributing method
-                        for method in methods {
-                            let method_name = method_to_string(method);
-                            
-                            // Use prepared statement for method insertion
-                            let method_result = transaction
-                                .execute(
-                                    &method_stmt,
-                                    &[&cluster_id, &method_name, &result.group.confidence],
-                                )
-                                .await;
-                                
-                            if let Err(e) = method_result {
-                                eprintln!("Error saving method {}: {}", method_name, e);
-                                entity_success = false;
-                            }
-                        }
-                    },
-                    _ => {
-                        let method_name = method_to_string(&result.group.method);
-                        
-                        // Use prepared statement for method insertion
-                        let method_result = transaction
-                            .execute(
-                                &method_stmt,
-                                &[&cluster_id, &method_name, &result.group.confidence],
-                            )
-                            .await;
-                            
-                        if let Err(e) = method_result {
-                            eprintln!("Error saving method {}: {}", method_name, e);
-                            entity_success = false;
-                        }
-                    }
-                }
-                
-                if entity_success {
+                if method_success {
                     success_count += 1;
                 } else {
                     error_count += 1;
                 }
-            },
-            Err(e) => {
+            } else {
                 error_count += 1;
-                eprintln!("Error saving match cluster: {}", e);
+            }
+        } else {
+            // No hierarchical data found, use legacy approach
+            eprintln!("Warning: No hierarchical data found for cluster, using legacy approach");
+            
+            // Insert methods
+            let method_success = insert_methods(&transaction, &method_stmt, &result.group.method, cluster_id, result.group.confidence).await;
+            
+            if method_success {
+                success_count += 1;
+            } else {
+                error_count += 1;
             }
         }
     }
@@ -321,6 +333,62 @@ async fn process_batch_by_indices(
         Err(_) => {
             eprintln!("Timeout committing batch {}", batch_number);
             Err(anyhow::anyhow!("Transaction commit timeout after 30 seconds"))
+        }
+    }
+}
+
+// Helper function to insert matching methods
+async fn insert_methods(
+    transaction: &tokio_postgres::Transaction<'_>,
+    method_stmt: &tokio_postgres::Statement,
+    method: &MatchingMethod,
+    cluster_id: Uuid,
+    confidence: f32
+) -> bool {
+    match method {
+        MatchingMethod::Merged(methods) => {
+            // For merged methods, insert each contributing method
+            let mut success = true;
+            
+            for method in methods {
+                let method_name = method_to_string(method);
+                let method_id = Uuid::new_v4();
+                
+                // Use prepared statement for method insertion
+                let method_result = transaction
+                    .execute(
+                        method_stmt,
+                        &[&method_id, &cluster_id, &method_name, &confidence],
+                    )
+                    .await;
+                    
+                if let Err(e) = method_result {
+                    eprintln!("Error saving method {}: {}", method_name, e);
+                    success = false;
+                }
+            }
+            
+            success
+        },
+        _ => {
+            let method_name = method_to_string(method);
+            let method_id = Uuid::new_v4();
+            
+            // Use prepared statement for method insertion
+            let method_result = transaction
+                .execute(
+                    method_stmt,
+                    &[&method_id, &cluster_id, &method_name, &confidence],
+                )
+                .await;
+                
+            match method_result {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!("Error saving method {}: {}", method_name, e);
+                    false
+                }
+            }
         }
     }
 }

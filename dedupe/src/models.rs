@@ -20,7 +20,7 @@ pub struct MatchGroup {
     /// Confidence score [0.0 - 1.0], used to prioritize human review or auto-confirmation
     pub confidence: f32,
 
-    /// Optional justification or evidence for the match (e.g., “emails identical”)
+    /// Optional justification or evidence for the match (e.g., "emails identical")
     pub notes: Option<String>,
 
     /// Indicates if a human has reviewed this match group
@@ -78,10 +78,10 @@ pub struct LLMReviewResult {
 /// This can be used to populate classifications during semantic processing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaxonomyLabel {
-    /// E.g., “BD-1800.2000-300”
+    /// E.g., "BD-1800.2000-300"
     pub code: String,
 
-    /// E.g., “Gluten Free Food”
+    /// E.g., "Gluten Free Food"
     pub label: String,
 
     /// Optional: hierarchical depth or score
@@ -107,3 +107,42 @@ pub struct RecordFingerprint {
 /// Stores a sparse similarity matrix between records.
 /// You can use this during LLM review or cluster merging to avoid recomputing.
 pub type SimilarityMatrix = HashMap<(String, String), f32>;
+
+/// Represents a feature of an entity (organization, service, location, etc.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityFeature {
+    /// The table this feature comes from
+    pub table_name: String,
+    
+    /// The ID of the record in that table
+    pub table_id: String,
+    
+    /// Optional feature type (e.g., "primary", "secondary")
+    pub feature_type: Option<String>,
+    
+    /// Optional importance weight
+    pub weight: Option<f32>,
+}
+
+/// Represents a complete entity within a cluster
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterEntity {
+    /// Generated ID for this entity
+    pub id: Option<String>,
+    
+    /// Whether this is the primary entity in the cluster (usually the organization)
+    pub is_primary: bool,
+    
+    /// All features that make up this entity
+    pub features: Vec<EntityFeature>,
+}
+
+/// Extended version of MatchGroup that supports hierarchical entities
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HierarchicalMatchGroup {
+    /// Original flat match group
+    pub base_group: MatchGroup,
+    
+    /// Organized hierarchical entities
+    pub entities: Vec<ClusterEntity>,
+}
