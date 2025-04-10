@@ -1,8 +1,6 @@
-// TODO: Types
-
 // app/api/clusters/[id]/edit/route.ts
 import { NextResponse } from 'next/server';
-import prisma from '@/lib/db/primsa';
+import prisma from '@/lib/db/prisma';
 
 interface Params {
   params: {

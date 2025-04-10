@@ -1,8 +1,6 @@
-// TODO: Types
-
 // app/api/clusters/[id]/split/route.ts
 import { NextResponse } from 'next/server';
-import prisma from '@/lib/db/primsa';
+import prisma from '@/lib/db/prisma';
 import { v4 as uuidv4 } from 'uuid';
 
 interface Params {
@@ -106,7 +104,6 @@ export async function POST(request: Request, { params }: Params) {
               cluster_id: newClusterId,
               method_name: method.method_name,
               confidence: method.confidence * 0.9, // Slightly reduce confidence
-              details: method.details,
               created_at: new Date()
             }
           });

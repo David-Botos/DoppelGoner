@@ -1,6 +1,6 @@
 // app/api/clusters/[id]/review/route.ts
 import { NextResponse } from 'next/server';
-import prisma from '@/lib/db/primsa';
+import prisma from '@/lib/db/prisma';
 
 interface Params {
   params: {
