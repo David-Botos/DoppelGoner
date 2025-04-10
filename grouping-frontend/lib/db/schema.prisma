@@ -1,0 +1,188 @@
+// lib/db/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Entity Resolution Cluster Models
+model match_clusters {
+  id           String            @id @default(uuid()) @db.Uuid
+  confidence   Float
+  notes        String?
+  reasoning    String?
+  is_reviewed  Boolean           @default(false)
+  review_result Boolean?
+  reviewed_by  String?
+  reviewed_at  DateTime?         @db.Timestamptz
+  created_at   DateTime          @default(now()) @db.Timestamptz
+  updated_at   DateTime          @default(now()) @db.Timestamptz
+  entities     cluster_entities[]
+  methods      matching_methods[]
+}
+
+model cluster_entities {
+  id          String         @id @default(uuid()) @db.Uuid
+  cluster_id  String         @db.Uuid
+  cluster     match_clusters @relation(fields: [cluster_id], references: [id])
+  entity_type String
+  entity_id   String
+  created_at  DateTime       @default(now()) @db.Timestamptz
+
+  @@unique([entity_type, entity_id])
+}
+
+model matching_methods {
+  id          String         @id @default(uuid()) @db.Uuid
+  cluster_id  String         @db.Uuid
+  cluster     match_clusters @relation(fields: [cluster_id], references: [id])
+  method_name String
+  confidence  Float
+  created_at  DateTime       @default(now()) @db.Timestamptz
+}
+
+// Source Data Models (based on the schema provided)
+model organization {
+  id                     String    @id @db.Char(36)
+  name                   String
+  alternate_name         String?
+  description            String?
+  email                  String?
+  url                    String?
+  tax_status             String?
+  tax_id                 String?
+  year_incorporated      String?   @db.Char(4)
+  legal_status           String?
+  parent_organization_id String?   @db.Char(36)
+  last_modified          DateTime? @db.Timestamp()
+  created                DateTime? @db.Timestamp()
+  original_id            String?
+  original_translations_id String?
+  
+  // Relations
+  parent_organization    organization? @relation("ParentChildOrg", fields: [parent_organization_id], references: [id])
+  child_organizations    organization[] @relation("ParentChildOrg")
+  locations              location[]
+  services               service[]
+  phones                 phone[]
+}
+
+model location {
+  id                     String    @id @db.Char(36)
+  organization_id        String    @db.Char(36)
+  name                   String?
+  alternate_name         String?
+  description            String?
+  short_description      String?
+  transportation         String?
+  latitude               Decimal?  @db.Decimal(10, 6)
+  longitude              Decimal?  @db.Decimal(10, 6)
+  location_type          String?
+  last_modified          DateTime? @db.Timestamp()
+  created                DateTime? @db.Timestamp()
+  original_id            String?
+  original_translations_id String?
+  
+  // Relations
+  organization           organization @relation(fields: [organization_id], references: [id])
+  addresses              address[]
+  services_at_location   service_at_location[]
+  phones                 phone[]
+}
+
+model service {
+  id                       String    @id @db.Char(36)
+  organization_id          String    @db.Char(36)
+  program_id               String?   @db.Char(36)
+  name                     String
+  alternate_name           String?
+  description              String?
+  short_description        String?
+  url                      String?
+  email                    String?
+  status                   String
+  interpretation_services  String?
+  application_process      String?
+  wait_time                String?
+  fees_description         String?
+  accreditations           String?
+  licenses                 String?
+  minimum_age              Int?
+  maximum_age              Int?
+  eligibility_description  String?
+  alert                    String?
+  last_modified            DateTime? @db.Timestamp()
+  created                  DateTime? @db.Timestamp()
+  original_id              String?
+  original_translations_id String?
+  
+  // Relations
+  organization             organization @relation(fields: [organization_id], references: [id])
+  services_at_location     service_at_location[]
+  phones                   phone[]
+}
+
+model address {
+  id               String    @id @db.Char(36)
+  location_id      String    @db.Char(36)
+  attention        String?
+  address_1        String
+  address_2        String?
+  city             String
+  region           String?
+  state_province   String
+  postal_code      String
+  country          String    @db.Char(2)
+  address_type     String
+  last_modified    DateTime? @db.Timestamp()
+  created          DateTime? @db.Timestamp()
+  original_id      String?
+  
+  // Relations
+  location         location  @relation(fields: [location_id], references: [id])
+}
+
+model phone {
+  id                   String    @id @db.Char(36)
+  location_id          String?   @db.Char(36)
+  service_id           String?   @db.Char(36)
+  organization_id      String?   @db.Char(36)
+  contact_id           String?   @db.Char(36)
+  service_at_location_id String? @db.Char(36)
+  number               String
+  extension            String?
+  type                 String?
+  language             String?   @default("en")
+  description          String?
+  priority             Int?
+  last_modified        DateTime? @db.Timestamp()
+  created              DateTime? @db.Timestamp()
+  original_id          String?
+  original_translations_id String?
+  
+  // Relations
+  location             location? @relation(fields: [location_id], references: [id])
+  service              service?  @relation(fields: [service_id], references: [id])
+  organization         organization? @relation(fields: [organization_id], references: [id])
+  service_at_location  service_at_location? @relation(fields: [service_at_location_id], references: [id])
+}
+
+model service_at_location {
+  id                     String    @id @db.Char(36)
+  service_id             String    @db.Char(36)
+  location_id            String    @db.Char(36)
+  description            String?
+  last_modified          DateTime? @db.Timestamp()
+  created                DateTime? @db.Timestamp()
+  original_id            String?
+  original_translations_id String?
+  
+  // Relations
+  service                service  @relation(fields: [service_id], references: [id])
+  location               location @relation(fields: [location_id], references: [id])
+  phones                 phone[]
+}
