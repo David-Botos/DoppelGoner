@@ -8,7 +8,6 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 use std::time::{Duration, Instant};
-use futures::StreamExt;
 // use tokio_postgres::Row;
 
 /// Save the cluster results to database for human review using concurrent processing

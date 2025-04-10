@@ -28,7 +28,7 @@ pub async fn match_phones(pool: &PgPool) -> Result<Vec<MatchGroup>> {
     
     // Process each phone row
     for row in phone_rows {
-        let phone_id: String = row.get("id");
+        // let phone_id: String = row.get("id");
         let phone_number: String = row.get("number");
         
         // Check all possible foreign keys to determine the parent entity

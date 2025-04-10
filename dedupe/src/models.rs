@@ -1,7 +1,7 @@
 // src/models.rs
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+// use std::collections::HashMap;
 
 /// Represents a group of similar entities (organizations/services)
 /// that have been matched based on one or more criteria.
@@ -106,7 +106,7 @@ pub struct RecordFingerprint {
 
 /// Stores a sparse similarity matrix between records.
 /// You can use this during LLM review or cluster merging to avoid recomputing.
-pub type SimilarityMatrix = HashMap<(String, String), f32>;
+// pub type SimilarityMatrix = HashMap<(String, String), f32>;
 
 /// Represents a feature of an entity (organization, service, location, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
