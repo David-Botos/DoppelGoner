@@ -1,0 +1,63 @@
+# Rust specific ignores
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Environment files
+.env
+.env.*
+
+# Python specific ignores
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Explicitly ignore the download_models.py script
+download_models.py
+
+# Ignore models directory (transformer models) but keep models.rs
+/models/
+!src/models.rs
+
+# Markdown documents
+*.md
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

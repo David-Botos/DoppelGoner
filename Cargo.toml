@@ -1,0 +1,81 @@
+[package]
+name = "dedupe"
+version = "0.1.0"
+edition = "2024"
+authors = ["David Botos"]
+description = "A deduplication system for HSDS"
+
+# Force specific versions of rand-related dependencies
+[dependencies.rand]
+version = "=0.8.5"
+features = ["std", "std_rng"]
+# Pin version exactly with =
+
+[dependencies.rand_core]
+version = "=0.6.4"
+# Pin version exactly with =
+
+[dependencies.rand_chacha]
+version = "=0.3.1"
+# Pin version exactly with =
+
+[dependencies]
+# Error handling
+anyhow = "1.0.98"
+
+# Logging
+log = "0.4.27"
+env_logger = "0.11.3"
+
+# Date and time
+chrono = { version = "0.4.40", features = ["serde"] }
+
+# UUID generation
+uuid = { version = "1.16.0", features = ["v4", "serde"] }
+
+# Async runtime
+tokio = { version = "1.44.2", features = ["full"] }
+
+# PostgreSQL
+tokio-postgres = { version = "0.7.13", features = ["with-serde_json-1", "with-chrono-0_4"] }
+bb8 = "0.8.6"
+bb8-postgres = "0.8.1"
+deadpool-postgres = "0.10.5"
+
+# Async utilities
+futures = "0.3.30"
+
+# URL handling
+url = "2.5.4"
+
+# Serialization/Deserialization
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+
+# Machine Learning - Updated to ensure layer-norm is available
+candle-core = { version = "0.8.4", features = ["metal", "accelerate"] }
+candle-nn = { version = "0.8.4", features = ["metal"] }
+candle-transformers = { version = "0.8.4" }
+tokenizers = "0.13.4"
+
+# Reconciling storage types
+pgvector = { version = "0.4", features = ["postgres"] }
+
+# Graph algorithms
+petgraph = "0.6.5"
+
+# Override half crate with specific version
+half = "2.6.0"
+
+# Define multiple binary targets
+[[bin]]
+name = "dedupe"
+path = "src/main.rs"
+
+[[bin]]
+name = "run_service_embeddings"
+path = "src/bin/run_service_embeddings.rs"
+
+[lib]
+name = "dedupe_lib"
+path = "src/lib.rs"

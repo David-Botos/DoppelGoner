@@ -1,0 +1,511 @@
+# HSDS Entity Grouping and Clustering System
+
+## System Overview
+
+The entity grouping system identifies and links related organizations across a federated database. The process works in five phases:
+
+1. **Entity Identification**: Extract entities from the `organization` table and their related records
+2. **Group Formation**: Match entities based on various criteria (URL, phone, email, address, etc.)
+3. **Cluster Consolidation**: Combine overlapping groups into unified clusters
+4. **Service Embedding**: Generate vector embeddings for service names and descriptions
+5. **Service Matching**: Identify potentially identical services within clusters using semantic similarity
+
+## Database Schema Extension
+
+The system uses the following tables to track entities, groups, and matches:
+
+- `entity`: Represents organization metadata
+- `entity_feature`: Links entities to records in other HSDS tables
+- `entity_group`: Represents a collection of matched entities
+- `group_entity`: Maps which entities belong to which groups
+- `group_method`: Records how entities in a group were matched
+- `group_cluster`: Represents a consolidated set of overlapping groups
+- `service_cluster`: Maps services to their corresponding clusters
+- `service_match`: Records potential matches between services
+
+## Processing Flow
+
+### 1. Entity Identification
+
+First, the system creates an entity for each organization and links it to related records:
+
+```
+┌─────────────┐          ┌─────────┐          ┌────────────────┐
+│ Organization│─────────▶│ Entity  │◀─────────│ Entity Feature │
+└─────────────┘          └─────────┘          └────────────────┘
+```
+
+1. Create an `entity` record for each `organization` in the HSDS data
+2. Find all related records (services, phones, locations, etc.)
+3. Create `entity_feature` links between entities and related records
+
+The system checks for existing entities first to avoid creating duplicates.
+
+### 2. Incremental Group Formation
+
+For each matching method (URL, phone, email, address, geospatial), the system:
+
+```
+                 [GROUP METHOD]
+        ┌─────────┐           ┌─────────┐
+        │ ENTITY  │           │ ENTITY  │
+        └─────────┘           └─────────┘
+                      │
+                      ▼
+                ┌─────────────┐
+                │   ENTITY    │
+                │   GROUP     │
+                └─────────────┘
+```
+
+1. **Identifies unprocessed entities**:
+   - Queries the database to find entities that have not been processed by this specific matching method
+   - Skips entities that have already been checked in previous runs
+
+2. **First checks against existing groups**:
+   - For each unprocessed entity, checks if it matches the criteria of any existing group
+   - If a match is found, adds the entity to that existing group
+   - Updates the group's entity count and match values
+
+3. **Processes remaining entities**:
+   - For entities that don't match existing groups, compares them against each other
+   - Forms new groups for sets of matching entities (when 2+ entities match)
+
+4. **Records all relationships**:
+   - Creates `group_entity` records to link entities to their groups
+   - Creates or updates `group_method` records with match details
+   - Assigns confidence scores based on match quality
+
+This incremental approach significantly improves efficiency for subsequent pipeline runs.
+
+### 3. Cluster Consolidation
+
+After all matching methods have run, the system consolidates overlapping groups:
+
+```
+┌─────────────┐
+│  ENTITY A   │──┐
+└─────────────┘  │
+┌─────────────┐  ├──► GROUP ───┐
+│  ENTITY B   │──┘             │
+└─────────────┘                │
+                               ├──► CLUSTER
+┌─────────────┐                │
+│  ENTITY C   │──┐             │
+└─────────────┘  ├──► GROUP ───┘
+┌─────────────┐  │
+│  ENTITY A   │──┘
+└─────────────┘
+```
+
+1. Builds a graph where groups are nodes and shared entities create edges
+2. Finds connected components in this graph (each component becomes a cluster)
+3. Creates `group_cluster` records and updates groups with their cluster ID
+
+The `petgraph` crate provides efficient graph operations for this purpose. This clustering step allows for transitive relationships - groups that don't directly share entities can still be connected through intermediate shared relationships.
+
+### 4. Service Embedding Generation
+
+Before services can be compared semantically, the system generates vector embeddings:
+
+```
+┌───────────────┐     ┌────────────────┐     ┌─────────────────┐
+│    SERVICE    │     │   EMBEDDING    │     │ [1, 2, 3, ... ] │
+│ NAME + DESC.  │────▶│     MODEL      │────▶│ [5, 6, 7, ... ] │
+└───────────────┘     └────────────────┘     └─────────────────┘
+```
+
+1. **Model Loading**:
+   - Loads a pre-trained transformer model (BGE-small-en-v1.5)
+   - Initializes a tokenizer and sets up the embedding pipeline
+
+2. **Batch Processing**:
+   - Identifies services without embeddings
+   - Processes services in parallel batches to maximize throughput
+   - Uses GPU acceleration when available (Metal on Mac)
+
+3. **Text Preparation**:
+   - Combines service name and description into a unified text representation
+   - Tokenizes the text according to the model's requirements
+
+4. **Vector Generation**:
+   - Processes text through the transformer model
+   - Applies mean pooling to token embeddings to create a fixed-size document vector
+   - Normalizes vectors for cosine similarity calculations
+
+5. **Storage**:
+   - Stores the resulting embeddings in the `service.embedding` column as a `vector(384)` type
+   - Uses PostgreSQL's pgvector extension for efficient vector operations
+
+This step enables semantic comparison between services based on their textual content, allowing the system to identify similar services even when they use different terminology.
+
+### 5. Service Matching
+
+Finally, the system identifies potentially identical services within each cluster:
+
+
+┌───────────┐           ┌─────────────────────────────┐
+│  CLUSTER  │────GROUP──│ Service - SHELTER SERVICES  │
+└───────────┘ │         └─────────────────────────────┘
+              │                      │
+              │       ┌─────────────────────────────┐
+              │       │ Service - BEDS FOR THOSE IN NEED
+              └──────▶│                             │
+                GROUP │                             │
+                      └─────────────────────────────┘
+                                    │
+                                    ▼
+                             SERVICE_MATCH
+```
+
+1. **Cluster-Based Processing**:
+   - Processes one cluster at a time to limit comparison scope
+   - Only compares services within the same organizational cluster
+
+2. **Vector Similarity**:
+   - Uses vector cosine similarity to find semantically similar services
+   - Identifies nearest neighbors using PostgreSQL's vector operators
+   - Applies a similarity threshold (0.85) to filter potential matches
+
+3. **Match Recording**:
+   - Creates `service_match` records for service pairs above the similarity threshold
+   - Stores similarity scores and match reasons for later review
+   - Prevents duplicate matches through ordered ID comparison
+
+4. **Incremental Updates**:
+   - Only processes services that have embeddings but haven't been matched
+   - Adds to existing match sets when new services are found
+
+The service matching process allows for identifying potential service duplicates even when they have different names or descriptions but serve the same purpose.
+
+## Matching Methods
+
+### 1. URL Matching
+
+**Data Source**: `organization.url` and `service.url`
+
+**Algorithm**:
+1. Extract and normalize domains from URLs
+2. Group entities by identical normalized domains
+
+**Incremental Processing**:
+- Maintains a record of entities already processed by URL matching
+- Checks if new entities' domains match existing groups before creating new ones
+- Updates existing groups when matches are found
+
+**Confidence**: 0.9 (high) for exact domain matches
+
+### 2. Phone Matching
+
+**Data Source**: `phone` table linked to entities
+
+**Algorithm**:
+1. Normalize phone numbers by removing formatting and standardizing
+2. Group entities by identical normalized phone numbers
+
+**Incremental Processing**:
+- Skips entities already included in phone matching groups
+- Adds new entities to existing phone groups when numbers match
+- Creates new groups only for previously unmatched numbers with multiple entities
+
+**Confidence**: 0.95 (very high) for exact numbers, 0.85 for matches with different extensions
+
+### 3. Email Matching
+
+**Data Source**: `organization.email` and `service.email`
+
+**Algorithm**:
+1. Normalize email addresses (lowercasing, standardizing Gmail dots, etc.)
+2. Group entities by identical normalized emails
+
+**Incremental Processing**:
+- Tracks processed entities to avoid redundant checks
+- Efficiently updates existing email groups with new matching entities
+- Maintains historical match information when adding to groups
+
+**Confidence**: 1.0 (maximum) for exact email matches
+
+### 4. Address Matching
+
+**Data Source**: `address` table linked via `location` table
+
+**Algorithm**:
+1. Normalize addresses (standardize abbreviations, remove units, etc.)
+2. Group entities by similar addresses
+
+**Incremental Processing**:
+- Identifies entities not yet processed by address matching
+- Checks new addresses against existing normalized address groups
+- Adds to existing groups or creates new ones as appropriate
+
+**Confidence**: 0.95 (high) for exact address matches after normalization
+
+### 5. Geospatial Matching
+
+**Data Source**: `location.latitude` and `location.longitude`
+
+**Algorithm**:
+1. Calculate distances between location points using haversine formula
+2. Group entities with locations within threshold distances
+
+**Incremental Processing**:
+- Converts PostgreSQL numeric types to double precision for compatibility
+- Filters out already processed entities for efficient reprocessing
+- Uses distance thresholds to assign entities to existing proximity groups
+- Creates centroids dynamically as groups grow
+
+**Confidence**: Based on distance - 0.95 (very close, <100m), 0.85 (close, <500m), 0.75 (nearby, <2km)
+
+## Service Embedding and Matching
+
+### Embedding Model
+
+The system uses a pre-trained language model to generate semantic representations:
+
+**Model**: BGE-Small-English-v1.5
+- A lightweight but effective transformer model specialized for embedding generation
+- 384-dimensional output embeddings
+- Optimized for semantic similarity tasks
+
+**Configuration**:
+- Model files stored in `./models/bge-small-en-v1.5/`
+- Tokenizer, configuration, and weights loaded at runtime
+- Hardware acceleration used when available (Metal on Mac, CPU fallback)
+
+### Embedding Process Details
+
+The embedding process is designed for efficiency and scalability:
+
+1. **Parallel Processing**:
+   - Uses concurrent batch processing with configurable batch size (default: 64)
+   - Processes multiple batches in parallel (default: 4 concurrent batches)
+   - Employs tokio for async operations and futures for parallelism
+
+2. **Tensor Operations**:
+   - Uses the Candle library for tensor operations
+   - Handles padding, attention masks, and batching
+   - Performs mean pooling across token embeddings
+
+3. **Performance Optimization**:
+   - Employs connection pooling with bb8 and tokio-postgres
+   - Uses transactions for batch updates
+   - Provides detailed logging with timing information for monitoring
+
+4. **Progress Tracking**:
+   - Maintains real-time statistics on processing progress
+   - Logs batch completion and overall progress percentage
+   - Captures error conditions for later analysis
+
+### Service Matching Algorithm
+
+The service matching algorithm leverages vector similarity to identify potential duplicates:
+
+1. **Cluster-Based Scope**:
+   - Only compares services within the same organizational cluster
+   - Dramatically reduces the comparison space from O(n²) to much smaller subsets
+
+2. **Vector Search**:
+   - Uses PostgreSQL's pgvector extension for ANN (Approximate Nearest Neighbors) search
+   - Employs the cosine distance operator (`<=>`) for similarity calculations
+   - Returns the top 20 most similar services for each service
+
+3. **Filtering**:
+   - Applies a similarity threshold (0.85 by default)
+   - Ensures service pairs are unique (ordered by ID to prevent duplicates)
+   - Labels matches as "potential" for later human review
+
+4. **Result Storage**:
+   - Stores match information in `service_match` table
+   - Records similarity scores and match reasons
+   - Includes timestamp and status information
+
+## Implementation Approach
+
+### Incremental Processing Strategy
+
+The matching pipeline is designed to be rerun efficiently when new data arrives. The system accomplishes this through:
+
+1. **Only Processing New Entities**: 
+   - For each matching method, the system first identifies entities that have already been processed
+   - Only entities that haven't been checked by a particular matching method are processed
+   - This prevents redundant work when the pipeline is run repeatedly
+
+2. **Intelligent Group Assignment**:
+   - When new entities are found, they are checked against existing groups first
+   - If a match is found with an existing group, the entity is added to that group
+   - Match values and entity counts are updated accordingly
+   - Only when a set of new entities matches each other (but doesn't match any existing group) is a new group created
+
+3. **Transaction Safety**:
+   - All database operations are performed within transactions
+   - This ensures consistency even if processing is interrupted
+
+4. **Embedding Efficiency**:
+   - Only processes services without existing embeddings
+   - Uses batching and parallelism for optimal throughput
+   - Provides detailed progress information for monitoring
+
+This approach significantly improves performance for subsequent pipeline runs, especially as the database grows in size. It also preserves existing groupings while incorporating new entities appropriately.
+
+### Group Reconciliation Strategy
+
+When groups overlap (share entities), they are consolidated into clusters:
+
+1. Build an undirected graph where:
+   - Nodes are groups
+   - Edges exist between groups that share at least one entity
+
+2. Find connected components in this graph (each component is a cluster)
+
+3. For each connected component:
+   - Create a `group_cluster` record
+   - Calculate metrics like entity count and group count
+   - Update all groups with their cluster ID
+
+The `petgraph` crate provides efficient graph operations for this purpose.
+
+### Service Matching Strategy
+
+Once clusters are formed and services are embedded, the matching process:
+
+1. For each cluster, collects all services linked to its entities
+2. Compares each service using vector similarity:
+   - Vector cosine similarity for semantic comparison
+   - Nearest neighbor search using pgvector's operators
+
+3. Calculates similarity scores (1 - cosine distance)
+4. Creates `service_match` records for pairs above a threshold (0.85)
+
+## Performance Considerations
+
+The implementation includes several optimizations:
+
+1. **Connection Pooling**: Efficient connection management with `bb8` and `tokio-postgres`
+
+2. **Batch Processing**: Operations are batched to reduce database roundtrips
+
+3. **Type Safety**: Strongly-typed domain models minimize runtime errors
+
+4. **Incremental Processing**:
+   - Only process entities that haven't been processed by a specific matching method
+   - Add new entities to existing groups when appropriate
+   - Create new groups only when necessary
+   - This dramatically reduces processing time for subsequent pipeline runs
+
+5. **Database Type Compatibility**:
+   - Explicit casting between PostgreSQL types (like `numeric` to `double precision`) 
+   - Ensures compatibility with Rust types like `f64`
+
+6. **Parallel Processing**:
+   - Uses async Rust and tokio for concurrency
+   - Service embedding runs in parallel batches
+   - Configurable concurrency levels based on available resources
+
+7. **Vector Operations**:
+   - Uses pgvector for efficient vector storage and search
+   - Leverages ANN (Approximate Nearest Neighbors) for similarity search
+   - Optimized tensor operations with the Candle library
+
+## Business Value
+
+This system provides significant benefits:
+
+1. **Elimination of Duplicates**: Identifies when the same organization appears multiple times
+
+2. **Enhanced Data Quality**: Connects related records across the database
+
+3. **Improved Service Discovery**: Helps clients find all services from an organization
+
+4. **Better Analysis**: Enables more accurate reporting by consolidating duplicate records
+
+5. **Workflow Efficiency**: Reduces manual data cleansing work
+
+6. **Scalability**: The incremental approach allows efficient processing as data grows
+
+7. **Semantic Understanding**: Identifies similar services even when descriptions vary
+
+## Example Walk-through
+
+Let's walk through a complete example:
+
+1. **Initial Run**:
+   - System processes all organizations and creates entities
+   - Matching methods find groups (e.g., two organizations sharing phone number 555-123-4567)
+   - Groups are clustered and service embeddings generated
+   - Service matches identified within clusters
+
+2. **Later Run with New Data**:
+   - New organization "Community Food Bank" is added with phone 555-123-4567
+   - Entity identification creates a new entity
+   - Phone matching checks this entity against existing groups
+   - The entity is added to the existing phone match group
+   - Cluster consolidation updates the affected cluster
+   - Service embedding generates vectors for the new organization's services
+   - Service matching checks for new potential service matches
+
+This incremental approach saves significant processing time compared to re-processing all entities.
+
+## Service Embedding Example
+
+For a service named "Emergency Food Assistance" with description "Provides food boxes to households in crisis":
+
+1. The text "Emergency Food Assistance Provides food boxes to households in crisis" is tokenized
+2. Tokens are processed through the BGE-Small model
+3. The resulting embedding is a 384-dimensional vector
+4. This vector is stored in the `service.embedding` column
+5. During matching, this service might be matched with another service called "Food Pantry" if their embeddings have high similarity
+
+This semantic matching goes beyond simple text comparison, understanding that concepts like "food boxes" and "food pantry" are related even though they use different terminology.
+
+## Deployment and Usage
+
+The system is designed with flexible deployment options to accommodate different operational needs:
+
+### Binary Targets
+
+The project includes multiple binary targets:
+
+1. **Full Pipeline** (`dedupe`): 
+   - Entry point: `src/main.rs`
+   - Runs the complete pipeline (entity identification, matching, clustering, embedding, service matching)
+   - Command: `cargo run --release --bin dedupe`
+
+2. **Service Embeddings Only** (`run_service_embeddings`): 
+   - Entry point: `src/bin/run_service_embeddings.rs`
+   - Only processes service embedding generation
+   - Useful for computationally intensive embedding updates without rerunning the entire pipeline
+   - Command: `cargo run --release --bin run_service_embeddings`
+
+3. **Library** (`dedupe_lib`):
+   - Entry point: `src/lib.rs`
+   - Enables importing the functionality into other Rust applications
+   - Makes components reusable in different contexts
+
+### Configuration
+
+1. **Environment Variables**: Set database connection parameters and other configuration options
+2. **Local Configuration**: The system checks for `.env`, `.env.local`, and `../env` files in that order
+3. **Model Paths**: Embedding models are expected in the `./models/` directory
+
+### Execution Workflow
+
+For a typical deployment:
+
+1. **Initial Setup**:
+   - Ensure PostgreSQL with pgvector and PostGIS extension is available
+   - Download required models to the `./models/` directory
+   - Configure environment variables
+
+2. **Regular Processing**:
+   - Run the full pipeline periodically (e.g., daily or weekly) to process new data
+   - `cargo run --release --bin dedupe`
+
+3. **Embedding Updates**:
+   - Run the embedding generator separately when needed for service embedding updates
+   - `cargo run --release --bin run_service_embeddings`
+
+4. **Monitoring**:
+   - Watch logs for progress and statistics
+   - Check database for updated entity groups, clusters, and service matches
+
+The system is designed to be run periodically as new data arrives, efficiently processing only what's changed since the previous run.
