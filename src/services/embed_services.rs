@@ -119,7 +119,7 @@ pub async fn embed_services(pool: &Pool<PostgresConnectionManager<NoTls>>) -> Re
     let device = Arc::new(device);
 
     // Get total count for progress tracking
-    info!("Querying database for services requiring embeddings");
+    info!("Querying database for services requiring taxonomy-enhanced embeddings");
     let db_start = Instant::now();
     let client = match pool.get().await {
         Ok(c) => c,
@@ -130,7 +130,7 @@ pub async fn embed_services(pool: &Pool<PostgresConnectionManager<NoTls>>) -> Re
     };
 
     let row = match client
-        .query_one("SELECT COUNT(*) FROM service WHERE embedding IS NULL", &[])
+        .query_one("SELECT COUNT(*) FROM service WHERE embedding_v2 IS NULL", &[])
         .await
     {
         Ok(r) => r,
@@ -142,7 +142,7 @@ pub async fn embed_services(pool: &Pool<PostgresConnectionManager<NoTls>>) -> Re
 
     let total_count: i64 = row.get(0);
     info!("Database query completed in {:.2?}", db_start.elapsed());
-    info!("Found {} services without embeddings", total_count);
+    info!("Found {} services without taxonomy-enhanced embeddings (embedding_v2)", total_count);
 
     if total_count == 0 {
         info!("No services to embed, skipping");
@@ -180,7 +180,7 @@ pub async fn embed_services(pool: &Pool<PostgresConnectionManager<NoTls>>) -> Re
         let rows = match client
             .query(
                 &format!(
-                    "SELECT id FROM service WHERE embedding IS NULL LIMIT {}",
+                    "SELECT id FROM service WHERE embedding_v2 IS NULL LIMIT {}",
                     BATCH_SIZE * CONCURRENT_BATCHES
                 ),
                 &[],
@@ -296,7 +296,7 @@ pub async fn embed_services(pool: &Pool<PostgresConnectionManager<NoTls>>) -> Re
     let processed_lock = processed.lock().await;
 
     info!(
-        "Completed embedding generation for all {} services in {:.2?}",
+        "Completed taxonomy-enhanced embedding generation (embedding_v2) for all {} services in {:.2?}",
         *processed_lock, total_elapsed
     );
 
@@ -309,8 +309,15 @@ pub async fn embed_services(pool: &Pool<PostgresConnectionManager<NoTls>>) -> Re
     }
 
     info!(
-        "Total embedding service execution time: {:.2?}",
+        "Total taxonomy-enhanced embedding service execution time: {:.2?}",
         start_time.elapsed()
+    );
+    
+    // Optional: Log a reminder about creating the index after the process completes
+    info!(
+        "NOTE: After all embeddings are generated, consider creating an index with: 
+        CREATE INDEX service_embedding_v2_idx ON service 
+        USING ivfflat (embedding_v2 vector_cosine_ops) WITH (lists = 100);"
     );
     Ok(())
 }
@@ -821,7 +828,7 @@ async fn process_batch(
 
         match transaction
             .execute(
-                "UPDATE service SET embedding = $1 WHERE id = $2",
+                "UPDATE service SET embedding_v2 = $1, embedding_v2_updated_at = NOW() WHERE id = $2",
                 &[&pgvector, id],
             )
             .await
