@@ -19,6 +19,14 @@ const TOKENIZER_PATH: &str = "./models/bge-small-en-v1.5/tokenizer.json";
 const CONFIG_PATH: &str = "./models/bge-small-en-v1.5/config.json";
 const BATCH_SIZE: usize = 64; // Adjust based on GPU memory
 const CONCURRENT_BATCHES: usize = 4; // Adjust based on CPU cores and memory
+// Max token length for BGE small (BERT-based models typically have 512 token limit)
+const MAX_TOKEN_LENGTH: usize = 512;
+
+/// A struct to hold taxonomy information
+struct TaxonomyInfo {
+    term: String,
+    description: Option<String>,
+}
 
 /// Generate embeddings for services using MiniLM
 pub async fn embed_services(pool: &Pool<PostgresConnectionManager<NoTls>>) -> Result<()> {
@@ -307,6 +315,40 @@ pub async fn embed_services(pool: &Pool<PostgresConnectionManager<NoTls>>) -> Re
     Ok(())
 }
 
+/// Fetch taxonomy information for a service
+async fn fetch_taxonomy_info(
+    client: &tokio_postgres::Client, 
+    service_id: &str
+) -> Result<Vec<TaxonomyInfo>> {
+    debug!("Fetching taxonomy info for service: {}", service_id);
+    
+    let query = "
+        SELECT tt.term, tt.description
+        FROM service_taxonomy st
+        JOIN taxonomy_term tt ON st.taxonomy_term_id = tt.id
+        WHERE st.service_id = $1
+    ";
+    
+    let rows = match client.query(query, &[&service_id]).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Failed to fetch taxonomy info: {}", e);
+            return Err(anyhow::anyhow!("Failed to fetch taxonomy info: {}", e));
+        }
+    };
+    
+    let mut taxonomy_info = Vec::with_capacity(rows.len());
+    for row in rows {
+        taxonomy_info.push(TaxonomyInfo {
+            term: row.get("term"),
+            description: row.get("description"),
+        });
+    }
+    
+    debug!("Found {} taxonomy terms for service {}", taxonomy_info.len(), service_id);
+    Ok(taxonomy_info)
+}
+
 /// Generate embeddings for a batch of texts
 fn generate_batch_embeddings(
     model: &BertModel,
@@ -511,6 +553,88 @@ fn generate_batch_embeddings(
     Ok(pooled_embeddings)
 }
 
+/// Build text for embedding that includes taxonomy information
+fn build_text_for_embedding(
+    name: &str, 
+    description: &str, 
+    taxonomies: &[TaxonomyInfo],
+    tokenizer: &Tokenizer,
+) -> String {
+    // Extract taxonomy terms and descriptions
+    let taxonomy_terms: Vec<String> = taxonomies.iter()
+        .map(|t| t.term.clone())
+        .collect();
+    
+    let taxonomy_descriptions: Vec<String> = taxonomies.iter()
+        .filter_map(|t| t.description.clone())
+        .collect();
+    
+    // Use the templated approach with section markers
+    let text = format!(
+        "[SERVICE] {} [DESCRIPTION] {} [CATEGORIES] {} [CATEGORY_DETAILS] {}",
+        name.trim(),
+        description.trim(),
+        taxonomy_terms.join(", "),
+        taxonomy_descriptions.join(" ")
+    );
+    
+    // Check if the text is too long for the model and truncate if necessary
+    let encoding = tokenizer.encode(text.clone(), true).unwrap();
+    if encoding.get_ids().len() > MAX_TOKEN_LENGTH {
+        debug!("Text too long ({} tokens), truncating to {} tokens", 
+               encoding.get_ids().len(), MAX_TOKEN_LENGTH);
+        
+        // Start with the most important parts - service name and taxonomy terms
+        let essential_text = format!(
+            "[SERVICE] {} [CATEGORIES] {}",
+            name.trim(), 
+            taxonomy_terms.join(", ")
+        );
+        
+        // Calculate remaining space
+        let essential_encoding = tokenizer.encode(essential_text.clone(), true).unwrap();
+        let remaining_tokens = MAX_TOKEN_LENGTH - essential_encoding.get_ids().len();
+        
+        if remaining_tokens <= 0 {
+            // Just return the essential parts
+            return essential_text;
+        }
+        
+        // Now add description and taxonomy details with even split
+        let desc_tokens = remaining_tokens / 2;
+        let desc_encoding = tokenizer.encode(description.trim(), true).unwrap();
+        let desc_truncated = if desc_encoding.get_ids().len() > desc_tokens {
+            // Truncate description text (this is simplified - ideally would truncate at word boundaries)
+            let desc_token_ids = desc_encoding.get_ids();
+            let truncated_ids = &desc_token_ids[0..desc_tokens];
+            tokenizer.decode(truncated_ids, false).unwrap()
+        } else {
+            description.trim().to_string()
+        };
+        
+        let tax_desc_tokens = remaining_tokens - desc_encoding.get_ids().len().min(desc_tokens);
+        let tax_desc_text = taxonomy_descriptions.join(" ");
+        let tax_desc_encoding = tokenizer.encode(tax_desc_text.clone(), true).unwrap();
+        let tax_desc_truncated = if tax_desc_encoding.get_ids().len() > tax_desc_tokens {
+            let tax_desc_token_ids = tax_desc_encoding.get_ids();
+            let truncated_ids = &tax_desc_token_ids[0..tax_desc_tokens];
+            tokenizer.decode(truncated_ids, false).unwrap()
+        } else {
+            tax_desc_text
+        };
+        
+        format!(
+            "[SERVICE] {} [DESCRIPTION] {} [CATEGORIES] {} [CATEGORY_DETAILS] {}",
+            name.trim(),
+            desc_truncated.trim(),
+            taxonomy_terms.join(", "),
+            tax_desc_truncated.trim()
+        )
+    } else {
+        text
+    }
+}
+
 /// Process a single batch of service IDs
 async fn process_batch(
     pool: &Pool<PostgresConnectionManager<NoTls>>,
@@ -600,7 +724,21 @@ async fn process_batch(
             .get::<_, Option<String>>("description")
             .unwrap_or_default();
 
-        let text = format!("{} {}", name, description);
+        // Fetch taxonomy information for this service
+        let taxonomy_info = match fetch_taxonomy_info(&client, &id).await {
+            Ok(info) => info,
+            Err(e) => {
+                warn!(
+                    "Batch {}: Failed to fetch taxonomy info for service {}: {}. Continuing with empty taxonomy.",
+                    batch_id, id, e
+                );
+                Vec::new()
+            }
+        };
+
+        // Build text for embedding
+        let text = build_text_for_embedding(&name, &description, &taxonomy_info, tokenizer);
+        
         if !text.trim().is_empty() {
             batch_ids.push(id);
             texts.push(text);
