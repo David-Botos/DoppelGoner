@@ -158,7 +158,7 @@ async fn run_pipeline(
     // Phase 4: Generate embeddings
     info!("Phase 4: Embed services");
     let phase4_start = Instant::now();
-    services::embed_services::embed_services(pool)
+    services::embed_services::embed_services_m2_optimized(pool)
         .await
         .context("Failed to embed services")?;
     let phase4_duration = phase4_start.elapsed();

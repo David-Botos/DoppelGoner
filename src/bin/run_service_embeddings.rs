@@ -4,7 +4,7 @@ use log::info;
 use std::path::Path;
 
 // Import modules from the main crate
-use dedupe_lib::{db, services::embed_services::embed_services};
+use dedupe_lib::{db, services::embed_services::embed_services_m2_optimized};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
 
     // Run just the embed_services module
     info!("Running embed_services in isolation...");
-    embed_services(&pool)
+    embed_services_m2_optimized(&pool, )
         .await
         .context("Failed to embed services")?;
 

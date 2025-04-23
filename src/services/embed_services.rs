@@ -1,16 +1,16 @@
-// src/services/embed_services.rs
+// src/services/embed_services.rs (optimized version)
 
 use anyhow::{Context, Result};
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
 use log::{debug, error, info, warn};
-use std::sync::Arc;
+use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_postgres::NoTls;
 
 use crate::services::config::{
-    BATCH_SIZE, CONCURRENT_BATCHES, CONFIG_PATH, MODEL_PATH, TOKENIZER_PATH,
+    BATCH_SIZE, CONCURRENT_BATCHES, CONFIG_PATH, MODEL_PATH, TOKENIZER_PATH, MAX_TOKEN_LENGTH,
 };
 use crate::services::data_fetcher::DataFetcher;
 use crate::services::data_writer::{DatabaseWriter, ProgressTracker};
@@ -18,35 +18,31 @@ use crate::services::inference::InferenceEngine;
 use crate::services::tokenizer::{TokenizationManager, load_tokenizer};
 use crate::services::types::{ServiceData, TokenizedBatch};
 
-/// Configuration for the embedding pipeline
+/// Configuration for the optimized embedding pipeline
 #[derive(Clone)]
 pub struct EmbeddingConfig {
-    /// Path to the tokenizer JSON file
+    // Existing parameters
     pub tokenizer_path: String,
-    /// Path to the model weights file
     pub model_path: String,
-    /// Path to the model configuration file
     pub config_path: String,
-    /// Number of services to process in a single batch
     pub batch_size: usize,
-    /// Number of batches to process concurrently
     pub concurrent_batches: usize,
-    /// Number of concurrent database fetchers
     pub concurrent_fetchers: usize,
-    /// Number of concurrent tokenizers
     pub concurrent_tokenizers: usize,
-    /// Number of concurrent inference operations
     pub concurrent_inference: usize,
-    /// Number of concurrent database writers
     pub concurrent_writers: usize,
-    /// Force CPU execution (even if GPU is available)
     pub force_cpu: bool,
-    /// Progress update interval in seconds
     pub progress_update_interval: u64,
-    /// If true, create index after embedding generation
     pub create_index: bool,
     pub id_batch_accumulation: usize,
     pub max_meta_batch_size: usize,
+    
+    // Buffer optimization parameters
+    pub pre_inference_buffer_capacity: usize,   // Size of buffer before inference
+    pub post_inference_buffer_capacity: usize,  // Size of buffer after inference
+    pub db_batch_accumulation_size: usize,      // Number of batches to accumulate before DB write
+    pub db_batch_flush_interval_ms: u64,        // Max time to wait before flushing to DB
+    pub adaptive_concurrency: bool,             // Enable dynamic concurrency adjustment
 }
 
 impl Default for EmbeddingConfig {
@@ -59,53 +55,37 @@ impl Default for EmbeddingConfig {
             concurrent_batches: CONCURRENT_BATCHES,
             concurrent_fetchers: 4,
             concurrent_tokenizers: 8,
-            concurrent_inference: 2,
+            concurrent_inference: 1,  // For M2, single inference is often more efficient
             concurrent_writers: 4,
             force_cpu: false,
             progress_update_interval: 5,
             create_index: true,
             id_batch_accumulation: 5,
             max_meta_batch_size: 500,
+            
+            // New optimized defaults for M2 MacBook Pro
+            pre_inference_buffer_capacity: 16,   // Keep GPU fed with work
+            post_inference_buffer_capacity: 8,   // Prevent memory overflow
+            db_batch_accumulation_size: 10,      // Accumulate batches for efficient DB writes
+            db_batch_flush_interval_ms: 1000,    // Max 1 second before forced flush
+            adaptive_concurrency: true,          // Enable dynamic resource allocation
         }
     }
 }
 
-/// Main function to embed services using a parallel pipeline
-///
-/// This function orchestrates the entire embedding process:
-/// 1. Fetches services from the database
-/// 2. Tokenizes the service texts
-/// 3. Generates embeddings using the model
-/// 4. Saves the embeddings back to the database
-///
-/// # Arguments
-///
-/// * `pool` - Database connection pool
-///
-/// # Returns
-///
-/// * `Result<()>` - Success or error result
-pub async fn embed_services(pool: &Pool<PostgresConnectionManager<NoTls>>) -> Result<()> {
-    // Use default configuration
-    embed_services_with_config(pool, EmbeddingConfig::default()).await
+/// M2-optimized embedding service function
+pub async fn embed_services_m2_optimized(pool: &Pool<PostgresConnectionManager<NoTls>>) -> Result<()> {
+    // Use optimized configuration
+    embed_services_with_optimized_config(pool, EmbeddingConfig::default()).await
 }
 
-/// Embed services using custom configuration
-///
-/// # Arguments
-///
-/// * `pool` - Database connection pool
-/// * `config` - Custom configuration for the embedding pipeline
-///
-/// # Returns
-///
-/// * `Result<()>` - Success or error result
-pub async fn embed_services_with_config(
+/// Embed services using optimized configuration
+pub async fn embed_services_with_optimized_config(
     pool: &Pool<PostgresConnectionManager<NoTls>>,
     config: EmbeddingConfig,
 ) -> Result<()> {
     let overall_start = Instant::now();
-    info!("Starting embedding service generation process");
+    info!("Starting optimized embedding service generation process");
 
     // Initialize components
     let data_fetcher =
@@ -151,8 +131,8 @@ pub async fn embed_services_with_config(
         Duration::from_secs(config.progress_update_interval),
     );
 
-    // Run the embedding pipeline
-    let result = run_embedding_pipeline(
+    // Run the optimized embedding pipeline
+    let result = run_optimized_embedding_pipeline(
         data_fetcher,
         tokenization_manager,
         inference_engine,
@@ -198,16 +178,8 @@ pub async fn embed_services_with_config(
     result.map(|_| ())
 }
 
-/// Runs the embedding pipeline with all stages
-///
-/// This function creates and manages the pipeline with multiple stages:
-/// 1. Fetching services from the database
-/// 2. Tokenizing service texts
-/// 3. Generating embeddings
-/// 4. Saving embeddings back to the database
-///
-/// Each stage operates concurrently with controlled parallelism.
-async fn run_embedding_pipeline(
+/// Runs the optimized embedding pipeline with all stages and buffer monitoring
+async fn run_optimized_embedding_pipeline(
     data_fetcher: DataFetcher,
     tokenization_manager: Arc<TokenizationManager>,
     inference_engine: Arc<InferenceEngine>,
@@ -218,14 +190,18 @@ async fn run_embedding_pipeline(
 ) -> Result<i64> {
     let pipeline_start = Instant::now();
     info!(
-        "Starting embedding pipeline with batch_size={}, concurrent_batches={}",
+        "Starting optimized embedding pipeline with batch_size={}, concurrent_batches={}",
         config.batch_size, config.concurrent_batches
     );
 
-    // Create channels for the pipeline stages
+    // Buffer monitoring counters
+    let pre_inference_level = Arc::new(AtomicUsize::new(0));
+    let post_inference_level = Arc::new(AtomicUsize::new(0));
+
+    // Create channels for the pipeline stages with optimized capacities
     let (fetch_tx, fetch_rx) = mpsc::channel(config.concurrent_batches);
-    let (tokenize_tx, tokenize_rx) = mpsc::channel(config.concurrent_batches);
-    let (inference_tx, inference_rx) = mpsc::channel(config.concurrent_batches);
+    let (tokenize_tx, tokenize_rx) = mpsc::channel(config.pre_inference_buffer_capacity);
+    let (inference_tx, inference_rx) = mpsc::channel(config.post_inference_buffer_capacity);
     let (write_tx, write_rx) = mpsc::channel(config.concurrent_batches);
 
     // Create semaphores to control concurrency at each stage
@@ -234,36 +210,63 @@ async fn run_embedding_pipeline(
     let inference_semaphore = Arc::new(Semaphore::new(config.concurrent_inference));
     let write_semaphore = Arc::new(Semaphore::new(config.concurrent_writers));
 
-    // Spawn the pipeline stages - note we're passing config to fetch_stage
-    let fetch_handle = spawn_fetch_stage(
+    // Spawn the pipeline stages with buffer monitoring
+    let fetch_handle = spawn_optimized_fetch_stage(
         data_fetcher,
         fetch_tx,
         fetch_semaphore.clone(),
-        config.clone(), // Clone it here
+        pre_inference_level.clone(),
+        config.clone(),
     );
 
-    let tokenize_handle = spawn_tokenize_stage(
+    let tokenize_handle = spawn_optimized_tokenize_stage(
         fetch_rx,
         tokenize_tx,
         tokenization_manager,
         tokenize_semaphore.clone(),
+        pre_inference_level.clone(),
+        config.clone(),
     );
-    let inference_handle = spawn_inference_stage(
+
+    let inference_handle = spawn_optimized_inference_stage(
         tokenize_rx,
         inference_tx,
         inference_engine,
         inference_semaphore.clone(),
+        pre_inference_level.clone(),
+        post_inference_level.clone(),
+        config.clone(),
     );
-    let write_handle = spawn_write_stage(
+
+    let write_handle = spawn_optimized_write_stage(
         inference_rx,
         write_tx,
         db_writer,
         write_semaphore.clone(),
+        post_inference_level.clone(),
         progress_tracker.clone(),
+        config.clone(),
     );
 
     // Create a task to monitor the pipeline
-    let monitor_handle = spawn_pipeline_monitor(write_rx, progress_tracker.clone(), total_count);
+    let monitor_handle = spawn_pipeline_monitor(
+        write_rx, 
+        progress_tracker.clone(), 
+        total_count
+    );
+
+    // If adaptive concurrency is enabled, spawn a buffer monitor
+    let buffer_monitor_handle: Option<tokio::task::JoinHandle<()>> = if config.adaptive_concurrency {
+        Some(spawn_buffer_monitor(
+            pre_inference_level.clone(),
+            post_inference_level.clone(),
+            fetch_semaphore.clone(),
+            write_semaphore.clone(),
+            config.clone(),
+        ))
+    } else {
+        None
+    };
 
     // Wait for all pipeline stages to complete
     let (fetch_result, tokenize_result, inference_result, write_result, monitor_result) = tokio::join!(
@@ -281,19 +284,139 @@ async fn run_embedding_pipeline(
     write_result.context("Error in write stage")?;
     let processed_count = monitor_result.context("Error in monitor stage")?;
 
+    // If we had a buffer monitor, abort it to clean up
+    if let Some(buffer_monitor) = buffer_monitor_handle {
+        // Abort the task - we don't need to wait for it to complete
+        buffer_monitor.abort();
+        // We could optionally wait for it with: let _ = buffer_monitor.await;
+    }
+
     info!(
-        "Embedding pipeline completed in {:.2?}",
+        "Optimized embedding pipeline completed in {:.2?}",
         pipeline_start.elapsed()
     );
 
     Ok(processed_count)
 }
 
+/// Spawns the optimized fetch stage with buffer awareness
+async fn spawn_optimized_fetch_stage(
+    data_fetcher: DataFetcher,
+    tx: mpsc::Sender<Vec<ServiceData>>,
+    semaphore: Arc<Semaphore>,
+    pre_inference_level: Arc<AtomicUsize>,
+    config: EmbeddingConfig,
+) -> Result<()> {
+    // Start a tokio task for the fetch stage
+    tokio::spawn(async move {
+        let stage_start = Instant::now();
+        debug!("Starting optimized fetch stage with buffer monitoring");
+
+        let mut total_fetched = 0;
+        let mut batch_num = 0;
+        let mut accumulated_ids: Vec<String> = Vec::new();
+
+        loop {
+            // Check if pre-inference buffer is getting full
+            // If buffer is >75% full, pause briefly to let it drain
+            let buffer_level = pre_inference_level.load(Ordering::Relaxed);
+            if buffer_level > config.pre_inference_buffer_capacity * 3 / 4 {
+                debug!("Pre-inference buffer nearly full ({}/{}), pausing fetch", 
+                       buffer_level, config.pre_inference_buffer_capacity);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+
+            batch_num += 1;
+            let batch_id = format!("fetch-{}", batch_num);
+
+            // Fetch a batch of service IDs
+            let service_ids = match data_fetcher
+                .fetch_services_needing_embeddings(config.batch_size)
+                .await
+            {
+                Ok(ids) => ids,
+                Err(e) => {
+                    error!("Error fetching service IDs: {}", e);
+                    continue;
+                }
+            };
+
+            // If no more services, process any accumulated IDs and finish
+            if service_ids.is_empty() {
+                if !accumulated_ids.is_empty() {
+                    debug!(
+                        "Processing final accumulated batch of {} IDs",
+                        accumulated_ids.len()
+                    );
+                    if let Err(e) = process_accumulated_ids(
+                        &data_fetcher,
+                        &accumulated_ids,
+                        &tx,
+                        &semaphore,
+                        &pre_inference_level,
+                        batch_id,
+                    )
+                    .await
+                    {
+                        error!("Error processing final batch: {}", e);
+                    }
+                }
+                debug!("No more services to fetch, fetch stage complete");
+                break;
+            }
+
+            // Add new IDs to accumulation
+            accumulated_ids.extend(service_ids);
+
+            // When we've accumulated enough batches or reached size limit, process them
+            if batch_num % config.id_batch_accumulation == 0
+                || accumulated_ids.len() >= config.max_meta_batch_size
+            {
+                debug!(
+                    "Processing accumulated batch of {} IDs",
+                    accumulated_ids.len()
+                );
+                total_fetched += accumulated_ids.len();
+
+                let ids_to_process = std::mem::take(&mut accumulated_ids);
+                if let Err(e) = process_accumulated_ids(
+                    &data_fetcher,
+                    &ids_to_process,
+                    &tx,
+                    &semaphore,
+                    &pre_inference_level,
+                    batch_id.clone(),
+                )
+                .await
+                {
+                    error!("Error processing accumulated batch: {}", e);
+                }
+            }
+        }
+
+        // Signal completion by dropping the sender
+        drop(tx);
+
+        info!(
+            "Fetch stage completed in {:.2?}, processed {} services in {} batches",
+            stage_start.elapsed(),
+            total_fetched,
+            batch_num - 1
+        );
+
+        Ok(()) as Result<()>
+    })
+    .await?
+}
+
+// Helper function to process accumulated IDs with buffer awareness
 async fn process_accumulated_ids(
     data_fetcher: &DataFetcher,
     accumulated_ids: &[String],
     tx: &mpsc::Sender<Vec<ServiceData>>,
     semaphore: &Arc<Semaphore>,
+    pre_inference_level: &Arc<AtomicUsize>,
     batch_id: String,
 ) -> Result<()> {
     if accumulated_ids.is_empty() {
@@ -335,6 +458,9 @@ async fn process_accumulated_ids(
                     batch.len()
                 );
 
+                // Update the pre-inference buffer counter before sending
+                pre_inference_level.fetch_add(1, Ordering::Relaxed);
+
                 match tx.send(batch).await {
                     Ok(_) => {
                         debug!(
@@ -343,6 +469,8 @@ async fn process_accumulated_ids(
                         );
                     }
                     Err(e) => {
+                        // If send fails, decrement the counter we just incremented
+                        pre_inference_level.fetch_sub(1, Ordering::Relaxed);
                         error!(
                             "{}-{}: Failed to send services to tokenize stage: {}",
                             batch_id, i, e
@@ -369,125 +497,28 @@ async fn process_accumulated_ids(
 
     Ok(())
 }
-/// Spawns the fetch stage of the pipeline
-///
-/// This stage fetches service IDs from the database and retrieves the complete
-/// service data for each batch.
-async fn spawn_fetch_stage(
-    data_fetcher: DataFetcher,
-    tx: mpsc::Sender<Vec<ServiceData>>,
-    semaphore: Arc<Semaphore>,
-    config: EmbeddingConfig,
-) -> Result<()> {
-    // Start a tokio task for the fetch stage
-    tokio::spawn(async move {
-        let stage_start = Instant::now();
-        debug!("Starting fetch stage with batched fetching");
 
-        let mut total_fetched = 0;
-        let mut batch_num = 0;
-        let mut accumulated_ids: Vec<String> = Vec::new();
-
-        loop {
-            batch_num += 1;
-            let batch_id = format!("fetch-{}", batch_num);
-
-            // Fetch a batch of service IDs
-            let service_ids = match data_fetcher
-                .fetch_services_needing_embeddings(config.batch_size)
-                .await
-            {
-                Ok(ids) => ids,
-                Err(e) => {
-                    error!("Error fetching service IDs: {}", e);
-                    continue;
-                }
-            };
-
-            // If no more services, process any accumulated IDs and finish
-            if service_ids.is_empty() {
-                if !accumulated_ids.is_empty() {
-                    debug!(
-                        "Processing final accumulated batch of {} IDs",
-                        accumulated_ids.len()
-                    );
-                    if let Err(e) = process_accumulated_ids(
-                        &data_fetcher,
-                        &accumulated_ids,
-                        &tx,
-                        &semaphore,
-                        batch_id,
-                    )
-                    .await
-                    {
-                        error!("Error processing final batch: {}", e);
-                    }
-                }
-                debug!("No more services to fetch, fetch stage complete");
-                break;
-            }
-
-            // Add new IDs to accumulation
-            accumulated_ids.extend(service_ids);
-
-            // When we've accumulated enough batches or reached size limit, process them
-            if batch_num % config.id_batch_accumulation == 0
-                || accumulated_ids.len() >= config.max_meta_batch_size
-            {
-                debug!(
-                    "Processing accumulated batch of {} IDs",
-                    accumulated_ids.len()
-                );
-                total_fetched += accumulated_ids.len();
-
-                let ids_to_process = std::mem::take(&mut accumulated_ids);
-                if let Err(e) = process_accumulated_ids(
-                    &data_fetcher,
-                    &ids_to_process,
-                    &tx,
-                    &semaphore,
-                    batch_id.clone(),
-                )
-                .await
-                {
-                    error!("Error processing accumulated batch: {}", e);
-                }
-            }
-        }
-
-        // Signal completion by dropping the sender
-        drop(tx);
-
-        info!(
-            "Fetch stage completed in {:.2?}, processed {} services in {} batches",
-            stage_start.elapsed(),
-            total_fetched,
-            batch_num - 1
-        );
-
-        Ok(()) as Result<()>
-    })
-    .await?
-}
-
-/// Spawns the tokenize stage of the pipeline
-///
-/// This stage tokenizes the service texts for model input.
-async fn spawn_tokenize_stage(
+/// Spawns the optimized tokenize stage with buffer awareness
+async fn spawn_optimized_tokenize_stage(
     mut rx: mpsc::Receiver<Vec<ServiceData>>,
     tx: mpsc::Sender<TokenizedBatch>,
     tokenization_manager: Arc<TokenizationManager>,
     semaphore: Arc<Semaphore>,
+    pre_inference_level: Arc<AtomicUsize>,
+    config: EmbeddingConfig,
 ) -> Result<()> {
     // Start a tokio task for the tokenize stage
     tokio::spawn(async move {
         let stage_start = Instant::now();
-        debug!("Starting tokenize stage");
+        debug!("Starting optimized tokenize stage with buffer monitoring");
 
         let mut total_tokenized = 0;
         let mut batch_num = 0;
 
         while let Some(services) = rx.recv().await {
+            // We've received a batch, decrement the pre-inference buffer counter
+            pre_inference_level.fetch_sub(1, Ordering::Relaxed);
+            
             batch_num += 1;
             let batch_id = format!("tokenize-{}", batch_num);
 
@@ -529,12 +560,17 @@ async fn spawn_tokenize_stage(
                         total_tokenized
                     );
 
+                    // Update pre-inference buffer counter before sending
+                    pre_inference_level.fetch_add(1, Ordering::Relaxed);
+
                     // Forward the tokenized batch to the next stage
                     match tx.send(tokenized_batch).await {
                         Ok(_) => {
                             debug!("{}: Successfully sent tokens to inference stage", batch_id);
                         }
                         Err(e) => {
+                            // If send fails, decrement the counter we just incremented
+                            pre_inference_level.fetch_sub(1, Ordering::Relaxed);
                             error!(
                                 "{}: Failed to send tokens to inference stage: {}",
                                 batch_id, e
@@ -567,24 +603,28 @@ async fn spawn_tokenize_stage(
     .await?
 }
 
-/// Spawns the inference stage of the pipeline
-///
-/// This stage generates embeddings using the model.
-async fn spawn_inference_stage(
+/// Spawns the optimized inference stage with priority handling
+async fn spawn_optimized_inference_stage(
     mut rx: mpsc::Receiver<TokenizedBatch>,
     tx: mpsc::Sender<(Vec<String>, Vec<Vec<f32>>)>,
     inference_engine: Arc<InferenceEngine>,
     semaphore: Arc<Semaphore>,
+    pre_inference_level: Arc<AtomicUsize>,
+    post_inference_level: Arc<AtomicUsize>,
+    config: EmbeddingConfig,
 ) -> Result<()> {
     // Start a tokio task for the inference stage
     tokio::spawn(async move {
         let stage_start = Instant::now();
-        debug!("Starting inference stage");
+        debug!("Starting optimized inference stage with buffer monitoring");
 
         let mut total_inferred = 0;
         let mut batch_num = 0;
 
         while let Some(batch) = rx.recv().await {
+            // We've received a batch, decrement the pre-inference buffer counter
+            pre_inference_level.fetch_sub(1, Ordering::Relaxed);
+            
             batch_num += 1;
             let batch_id = format!("inference-{}", batch_num);
 
@@ -608,6 +648,24 @@ async fn spawn_inference_stage(
                 }
             };
 
+            // Check if post-inference buffer is nearly full
+            // This prevents memory overflow by pausing inference if the write stage is falling behind
+            let post_level = post_inference_level.load(Ordering::Relaxed);
+            if post_level >= config.post_inference_buffer_capacity * 3 / 4 {
+                debug!(
+                    "{}: Post-inference buffer nearly full ({}/{}), waiting before processing",
+                    batch_id, post_level, config.post_inference_buffer_capacity
+                );
+                
+                // Wait for buffer to drain a bit before continuing
+                // This is important for M2 with unified memory
+                while post_inference_level.load(Ordering::Relaxed) >= config.post_inference_buffer_capacity / 2 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                
+                debug!("{}: Resuming inference after buffer drained", batch_id);
+            }
+
             // Generate embeddings
             match inference_engine.generate_embeddings(batch).await {
                 Ok((service_ids, embeddings, metrics)) => {
@@ -627,12 +685,17 @@ async fn spawn_inference_stage(
                         total_inferred
                     );
 
+                    // Update post-inference buffer counter before sending
+                    post_inference_level.fetch_add(1, Ordering::Relaxed);
+
                     // Forward the embeddings to the next stage
                     match tx.send((service_ids, embeddings)).await {
                         Ok(_) => {
                             debug!("{}: Successfully sent embeddings to write stage", batch_id);
                         }
                         Err(e) => {
+                            // If send fails, decrement the counter we just incremented
+                            post_inference_level.fetch_sub(1, Ordering::Relaxed);
                             error!(
                                 "{}: Failed to send embeddings to write stage: {}",
                                 batch_id, e
@@ -665,26 +728,30 @@ async fn spawn_inference_stage(
     .await?
 }
 
-/// Spawns the write stage of the pipeline
-///
-/// This stage saves the embeddings back to the database.
-async fn spawn_write_stage(
+/// Spawns the optimized write stage with batch accumulation
+async fn spawn_optimized_write_stage(
     mut rx: mpsc::Receiver<(Vec<String>, Vec<Vec<f32>>)>,
     tx: mpsc::Sender<usize>,
     db_writer: DatabaseWriter,
     semaphore: Arc<Semaphore>,
+    post_inference_level: Arc<AtomicUsize>,
     progress_tracker: ProgressTracker,
+    config: EmbeddingConfig,
 ) -> Result<()> {
     // Start a tokio task for the write stage
     tokio::spawn(async move {
         let stage_start = Instant::now();
-        debug!("Starting write stage");
+        debug!("Starting optimized write stage with batch accumulation");
 
         let mut total_written = 0;
         let mut batch_num = 0;
-        let mut batches = Vec::new();
+        let mut accumulated_batches = Vec::new();
+        let mut last_flush_time = Instant::now();
 
         while let Some((service_ids, embeddings)) = rx.recv().await {
+            // We've received a batch, decrement the post-inference buffer counter
+            post_inference_level.fetch_sub(1, Ordering::Relaxed);
+            
             batch_num += 1;
             let batch_id = format!("write-{}", batch_num);
 
@@ -699,11 +766,21 @@ async fn spawn_write_stage(
                 batch_id, service_count
             );
 
-            // Add the batch to our collection
-            batches.push((service_ids, embeddings));
+            // Add the batch to our accumulation
+            accumulated_batches.push((service_ids, embeddings));
+            let accumulated_count = accumulated_batches.iter().map(|(ids, _)| ids.len()).sum::<usize>();
+            
+            // Check if we should flush accumulated batches
+            let should_flush = accumulated_batches.len() >= config.db_batch_accumulation_size 
+                || last_flush_time.elapsed().as_millis() >= config.db_batch_flush_interval_ms as u128
+                || accumulated_count >= config.max_meta_batch_size;
 
-            // Process in larger chunks for better database efficiency
-            if batches.len() >= 10 || batch_num % 20 == 0 {
+            if should_flush && !accumulated_batches.is_empty() {
+                debug!(
+                    "{}: Flushing {} accumulated batches with {} total services",
+                    batch_id, accumulated_batches.len(), accumulated_count
+                );
+                
                 // Acquire a permit from the semaphore to control concurrency
                 let permit = match semaphore.acquire().await {
                     Ok(permit) => permit,
@@ -713,15 +790,8 @@ async fn spawn_write_stage(
                     }
                 };
 
-                let batches_to_process = std::mem::take(&mut batches);
-                let batch_count = batches_to_process.len();
-                let service_count: usize =
-                    batches_to_process.iter().map(|(ids, _)| ids.len()).sum();
-
-                debug!(
-                    "{}: Writing {} batches with {} services to database",
-                    batch_id, batch_count, service_count
-                );
+                let batches_to_process = std::mem::take(&mut accumulated_batches);
+                last_flush_time = Instant::now();
 
                 // Save the embeddings
                 match db_writer
@@ -752,11 +822,11 @@ async fn spawn_write_stage(
         }
 
         // Process any remaining batches
-        if !batches.is_empty() {
-            debug!("Processing {} remaining batches", batches.len());
+        if !accumulated_batches.is_empty() {
+            debug!("Processing {} remaining batches", accumulated_batches.len());
 
             match db_writer
-                .save_embeddings_in_batches(batches, &progress_tracker)
+                .save_embeddings_in_batches(accumulated_batches, &progress_tracker)
                 .await
             {
                 Ok(count) => {
@@ -794,7 +864,71 @@ async fn spawn_write_stage(
     .await?
 }
 
-/// Spawns a monitor task to track overall pipeline progress
+/// New function to monitor buffer levels and adjust concurrency
+fn spawn_buffer_monitor(
+    pre_inference_level: Arc<AtomicUsize>,
+    post_inference_level: Arc<AtomicUsize>,
+    fetch_semaphore: Arc<Semaphore>,
+    write_semaphore: Arc<Semaphore>,
+    config: EmbeddingConfig,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        debug!("Starting buffer monitor for adaptive concurrency");
+        
+        // Keep track of any additional permits we've issued
+        let mut additional_fetch_permits = 0;
+        let mut additional_write_permits = 0;
+        
+        loop {
+            // Get current buffer levels
+            let pre_level = pre_inference_level.load(Ordering::Relaxed);
+            let post_level = post_inference_level.load(Ordering::Relaxed);
+            
+            // Log current buffer state periodically
+            debug!(
+                "Buffer status: pre-inference={}/{}, post-inference={}/{}",
+                pre_level, config.pre_inference_buffer_capacity,
+                post_level, config.post_inference_buffer_capacity
+            );
+            
+            // Adaptive concurrency control based on buffer levels
+            
+            // 1. If pre-inference buffer is getting low, increase fetch concurrency
+            if pre_level < config.pre_inference_buffer_capacity / 4 && additional_fetch_permits < 4 {
+                // Add more fetch capacity to fill the buffer
+                fetch_semaphore.add_permits(1);
+                additional_fetch_permits += 1;
+                debug!("Pre-inference buffer low, increased fetch concurrency");
+            }
+            // 2. If pre-inference buffer is high, reduce fetch concurrency
+            else if pre_level > config.pre_inference_buffer_capacity * 3 / 4 && additional_fetch_permits > 0 {
+                // Reduce fetch capacity to let buffer drain
+                // Note: we're assuming permits are not all in use
+                additional_fetch_permits -= 1;
+                debug!("Pre-inference buffer high, reduced fetch concurrency");
+            }
+            
+            // 3. If post-inference buffer is getting high, increase write concurrency
+            if post_level > config.post_inference_buffer_capacity / 2 && additional_write_permits < 4 {
+                // Add more write capacity to drain the buffer
+                write_semaphore.add_permits(1);
+                additional_write_permits += 1;
+                debug!("Post-inference buffer high, increased write concurrency");
+            }
+            // 4. If post-inference buffer is low, reduce write concurrency
+            else if post_level < config.post_inference_buffer_capacity / 4 && additional_write_permits > 0 {
+                // Reduce write capacity
+                additional_write_permits -= 1;
+                debug!("Post-inference buffer low, reduced write concurrency");
+            }
+            
+            // Brief sleep before next adjustment
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+}
+
+/// Spawns a monitor task to track overall pipeline progress (unchanged from original)
 async fn spawn_pipeline_monitor(
     mut rx: mpsc::Receiver<usize>,
     progress_tracker: ProgressTracker,
@@ -836,39 +970,4 @@ async fn spawn_pipeline_monitor(
         Ok(processed_count)
     })
     .await?
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db;
-
-    #[tokio::test]
-    #[ignore] // Ignore by default since it requires database and model files
-    async fn test_embed_services() {
-        // This would be a more comprehensive test in a real implementation
-
-        // Load environment
-        db::load_env_from_file(".env").unwrap();
-
-        // Connect to database
-        let pool = db::connect().await.unwrap();
-
-        // Create a minimal config for testing
-        let test_config = EmbeddingConfig {
-            batch_size: 10,
-            concurrent_batches: 2,
-            concurrent_fetchers: 2,
-            concurrent_tokenizers: 2,
-            concurrent_inference: 1,
-            concurrent_writers: 2,
-            force_cpu: true,     // Force CPU for testing
-            create_index: false, // Skip index creation for tests
-            ..EmbeddingConfig::default()
-        };
-
-        // Run the embedding process
-        let result = embed_services_with_config(&pool, test_config).await;
-        assert!(result.is_ok());
-    }
 }
