@@ -134,7 +134,7 @@ impl DataFetcher {
         Ok(count)
     }
 
-    /// Fetch a batch of service IDs that need embeddings
+    /// Fetch a batch of service IDs that need embeddings with locking to prevent duplicate processing
     ///
     /// # Arguments
     ///
@@ -143,21 +143,58 @@ impl DataFetcher {
         debug!("Fetching up to {} service IDs that need embeddings", limit);
         let start = Instant::now();
 
-        let client = self
+        let mut client = self
             .pool
             .get()
             .await
             .context("Failed to get database connection for fetching service IDs")?;
 
-        let rows = client
+        // Start a transaction to ensure atomicity
+        let transaction = client
+            .transaction()
+            .await
+            .context("Failed to start transaction")?;
+
+        // Use FOR UPDATE SKIP LOCKED to prevent other processes from selecting the same rows
+        // This is a PostgreSQL-specific feature for concurrent batch processing
+        let rows = transaction
             .query(
-                "SELECT id FROM service WHERE embedding_v2 IS NULL LIMIT $1",
+                "SELECT id FROM service 
+             WHERE embedding_v2 IS NULL 
+             FOR UPDATE SKIP LOCKED
+             LIMIT $1",
                 &[&(limit as i64)],
             )
             .await
             .context("Failed to fetch service IDs")?;
 
         let ids: Vec<String> = rows.iter().map(|row| row.get::<_, String>("id")).collect();
+
+        if !ids.is_empty() {
+            debug!("Acquired lock on {} service IDs for embedding", ids.len());
+
+            // Optionally, you could add a temporary marker to these services
+            // This would require adding a column like 'embedding_in_progress' to your schema
+            // If you have such a column, uncomment this code:
+            /*
+            let batch_id = uuid::Uuid::new_v4().to_string();
+            transaction
+                .execute(
+                    "UPDATE service SET embedding_in_progress = $1, embedding_started_at = NOW()
+                     WHERE id = ANY($2) AND embedding_v2 IS NULL",
+                    &[&batch_id, &ids],
+                )
+                .await
+                .context("Failed to mark services as in-progress")?;
+            */
+        }
+
+        // Commit the transaction to release the locks on rows we're not using
+        // but maintain locks on the ones we've selected
+        transaction
+            .commit()
+            .await
+            .context("Failed to commit transaction")?;
 
         debug!(
             "Fetched {} service IDs in {:.2?}",

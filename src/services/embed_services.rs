@@ -3,14 +3,21 @@
 use anyhow::{Context, Result};
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
+use futures::lock::Mutex;
 use log::{debug, error, info, warn};
-use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
 use std::time::{Duration, Instant};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_postgres::NoTls;
 
 use crate::services::config::{
-    BATCH_SIZE, CONCURRENT_BATCHES, CONFIG_PATH, MODEL_PATH, TOKENIZER_PATH, MAX_TOKEN_LENGTH,
+    BATCH_SIZE, CONCURRENT_BATCHES, CONFIG_PATH, MAX_TOKEN_LENGTH, MODEL_PATH, TOKENIZER_PATH,
 };
 use crate::services::data_fetcher::DataFetcher;
 use crate::services::data_writer::{DatabaseWriter, ProgressTracker};
@@ -36,13 +43,13 @@ pub struct EmbeddingConfig {
     pub create_index: bool,
     pub id_batch_accumulation: usize,
     pub max_meta_batch_size: usize,
-    
+
     // Buffer optimization parameters
-    pub pre_inference_buffer_capacity: usize,   // Size of buffer before inference
-    pub post_inference_buffer_capacity: usize,  // Size of buffer after inference
-    pub db_batch_accumulation_size: usize,      // Number of batches to accumulate before DB write
-    pub db_batch_flush_interval_ms: u64,        // Max time to wait before flushing to DB
-    pub adaptive_concurrency: bool,             // Enable dynamic concurrency adjustment
+    pub pre_inference_buffer_capacity: usize, // Size of buffer before inference
+    pub post_inference_buffer_capacity: usize, // Size of buffer after inference
+    pub db_batch_accumulation_size: usize,    // Number of batches to accumulate before DB write
+    pub db_batch_flush_interval_ms: u64,      // Max time to wait before flushing to DB
+    pub adaptive_concurrency: bool,           // Enable dynamic concurrency adjustment
 }
 
 impl Default for EmbeddingConfig {
@@ -55,26 +62,28 @@ impl Default for EmbeddingConfig {
             concurrent_batches: CONCURRENT_BATCHES,
             concurrent_fetchers: 4,
             concurrent_tokenizers: 8,
-            concurrent_inference: 1,  // For M2, single inference is often more efficient
+            concurrent_inference: 6,
             concurrent_writers: 4,
             force_cpu: false,
             progress_update_interval: 5,
             create_index: true,
             id_batch_accumulation: 5,
             max_meta_batch_size: 500,
-            
+
             // New optimized defaults for M2 MacBook Pro
-            pre_inference_buffer_capacity: 16,   // Keep GPU fed with work
-            post_inference_buffer_capacity: 8,   // Prevent memory overflow
-            db_batch_accumulation_size: 10,      // Accumulate batches for efficient DB writes
-            db_batch_flush_interval_ms: 1000,    // Max 1 second before forced flush
-            adaptive_concurrency: true,          // Enable dynamic resource allocation
+            pre_inference_buffer_capacity: 16, // Keep GPU fed with work
+            post_inference_buffer_capacity: 8, // Prevent memory overflow
+            db_batch_accumulation_size: 10,    // Accumulate batches for efficient DB writes
+            db_batch_flush_interval_ms: 1000,  // Max 1 second before forced flush
+            adaptive_concurrency: true,        // Enable dynamic resource allocation
         }
     }
 }
 
 /// M2-optimized embedding service function
-pub async fn embed_services_m2_optimized(pool: &Pool<PostgresConnectionManager<NoTls>>) -> Result<()> {
+pub async fn embed_services_m2_optimized(
+    pool: &Pool<PostgresConnectionManager<NoTls>>,
+) -> Result<()> {
     // Use optimized configuration
     embed_services_with_optimized_config(pool, EmbeddingConfig::default()).await
 }
@@ -178,7 +187,7 @@ pub async fn embed_services_with_optimized_config(
     result.map(|_| ())
 }
 
-/// Runs the optimized embedding pipeline with all stages and buffer monitoring
+/// Runs the optimized embedding pipeline with fixed progress tracking
 async fn run_optimized_embedding_pipeline(
     data_fetcher: DataFetcher,
     tokenization_manager: Arc<TokenizationManager>,
@@ -202,7 +211,12 @@ async fn run_optimized_embedding_pipeline(
     let (fetch_tx, fetch_rx) = mpsc::channel(config.concurrent_batches);
     let (tokenize_tx, tokenize_rx) = mpsc::channel(config.pre_inference_buffer_capacity);
     let (inference_tx, inference_rx) = mpsc::channel(config.post_inference_buffer_capacity);
+
+    // NEW: Use a separate channel for tracking write status
     let (write_tx, write_rx) = mpsc::channel(config.concurrent_batches);
+
+    // NEW: Create a channel for sending progress updates directly from DB writer to monitor
+    let (progress_tx, progress_rx) = mpsc::channel(config.concurrent_batches);
 
     // Create semaphores to control concurrency at each stage
     let fetch_semaphore = Arc::new(Semaphore::new(config.concurrent_fetchers));
@@ -210,7 +224,7 @@ async fn run_optimized_embedding_pipeline(
     let inference_semaphore = Arc::new(Semaphore::new(config.concurrent_inference));
     let write_semaphore = Arc::new(Semaphore::new(config.concurrent_writers));
 
-    // Spawn the pipeline stages with buffer monitoring
+    // Spawn the pipeline stages with improved progress tracking
     let fetch_handle = spawn_optimized_fetch_stage(
         data_fetcher,
         fetch_tx,
@@ -238,25 +252,28 @@ async fn run_optimized_embedding_pipeline(
         config.clone(),
     );
 
-    let write_handle = spawn_optimized_write_stage(
+    // MODIFIED: Pass progress_tx instead of updating progress directly
+    let write_handle = spawn_optimized_write_stage_fixed(
         inference_rx,
         write_tx,
+        progress_tx, // NEW: Separate channel for progress updates
         db_writer,
         write_semaphore.clone(),
         post_inference_level.clone(),
-        progress_tracker.clone(),
         config.clone(),
     );
 
-    // Create a task to monitor the pipeline
-    let monitor_handle = spawn_pipeline_monitor(
-        write_rx, 
-        progress_tracker.clone(), 
-        total_count
+    // MODIFIED: Use progress_rx to update the tracker only after confirmed DB writes
+    let monitor_handle = spawn_pipeline_monitor_fixed(
+        write_rx,
+        progress_rx, // NEW: Receive confirmed writes
+        progress_tracker.clone(),
+        total_count,
     );
 
     // If adaptive concurrency is enabled, spawn a buffer monitor
-    let buffer_monitor_handle: Option<tokio::task::JoinHandle<()>> = if config.adaptive_concurrency {
+    let buffer_monitor_handle: Option<tokio::task::JoinHandle<()>> = if config.adaptive_concurrency
+    {
         Some(spawn_buffer_monitor(
             pre_inference_level.clone(),
             post_inference_level.clone(),
@@ -286,9 +303,7 @@ async fn run_optimized_embedding_pipeline(
 
     // If we had a buffer monitor, abort it to clean up
     if let Some(buffer_monitor) = buffer_monitor_handle {
-        // Abort the task - we don't need to wait for it to complete
         buffer_monitor.abort();
-        // We could optionally wait for it with: let _ = buffer_monitor.await;
     }
 
     info!(
@@ -321,8 +336,10 @@ async fn spawn_optimized_fetch_stage(
             // If buffer is >75% full, pause briefly to let it drain
             let buffer_level = pre_inference_level.load(Ordering::Relaxed);
             if buffer_level > config.pre_inference_buffer_capacity * 3 / 4 {
-                debug!("Pre-inference buffer nearly full ({}/{}), pausing fetch", 
-                       buffer_level, config.pre_inference_buffer_capacity);
+                debug!(
+                    "Pre-inference buffer nearly full ({}/{}), pausing fetch",
+                    buffer_level, config.pre_inference_buffer_capacity
+                );
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
@@ -518,7 +535,7 @@ async fn spawn_optimized_tokenize_stage(
         while let Some(services) = rx.recv().await {
             // We've received a batch, decrement the pre-inference buffer counter
             pre_inference_level.fetch_sub(1, Ordering::Relaxed);
-            
+
             batch_num += 1;
             let batch_id = format!("tokenize-{}", batch_num);
 
@@ -624,7 +641,7 @@ async fn spawn_optimized_inference_stage(
         while let Some(batch) = rx.recv().await {
             // We've received a batch, decrement the pre-inference buffer counter
             pre_inference_level.fetch_sub(1, Ordering::Relaxed);
-            
+
             batch_num += 1;
             let batch_id = format!("inference-{}", batch_num);
 
@@ -656,13 +673,15 @@ async fn spawn_optimized_inference_stage(
                     "{}: Post-inference buffer nearly full ({}/{}), waiting before processing",
                     batch_id, post_level, config.post_inference_buffer_capacity
                 );
-                
+
                 // Wait for buffer to drain a bit before continuing
                 // This is important for M2 with unified memory
-                while post_inference_level.load(Ordering::Relaxed) >= config.post_inference_buffer_capacity / 2 {
+                while post_inference_level.load(Ordering::Relaxed)
+                    >= config.post_inference_buffer_capacity / 2
+                {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                
+
                 debug!("{}: Resuming inference after buffer drained", batch_id);
             }
 
@@ -729,19 +748,18 @@ async fn spawn_optimized_inference_stage(
 }
 
 /// Spawns the optimized write stage with batch accumulation
-async fn spawn_optimized_write_stage(
+async fn spawn_optimized_write_stage_fixed(
     mut rx: mpsc::Receiver<(Vec<String>, Vec<Vec<f32>>)>,
     tx: mpsc::Sender<usize>,
+    progress_tx: mpsc::Sender<(Vec<String>, usize)>, // NEW: Send service IDs with count
     db_writer: DatabaseWriter,
     semaphore: Arc<Semaphore>,
     post_inference_level: Arc<AtomicUsize>,
-    progress_tracker: ProgressTracker,
     config: EmbeddingConfig,
 ) -> Result<()> {
-    // Start a tokio task for the write stage
     tokio::spawn(async move {
         let stage_start = Instant::now();
-        debug!("Starting optimized write stage with batch accumulation");
+        debug!("Starting fixed optimized write stage with batch accumulation");
 
         let mut total_written = 0;
         let mut batch_num = 0;
@@ -751,7 +769,7 @@ async fn spawn_optimized_write_stage(
         while let Some((service_ids, embeddings)) = rx.recv().await {
             // We've received a batch, decrement the post-inference buffer counter
             post_inference_level.fetch_sub(1, Ordering::Relaxed);
-            
+
             batch_num += 1;
             let batch_id = format!("write-{}", batch_num);
 
@@ -768,19 +786,25 @@ async fn spawn_optimized_write_stage(
 
             // Add the batch to our accumulation
             accumulated_batches.push((service_ids, embeddings));
-            let accumulated_count = accumulated_batches.iter().map(|(ids, _)| ids.len()).sum::<usize>();
-            
+            let accumulated_count = accumulated_batches
+                .iter()
+                .map(|(ids, _)| ids.len())
+                .sum::<usize>();
+
             // Check if we should flush accumulated batches
-            let should_flush = accumulated_batches.len() >= config.db_batch_accumulation_size 
-                || last_flush_time.elapsed().as_millis() >= config.db_batch_flush_interval_ms as u128
+            let should_flush = accumulated_batches.len() >= config.db_batch_accumulation_size
+                || last_flush_time.elapsed().as_millis()
+                    >= config.db_batch_flush_interval_ms as u128
                 || accumulated_count >= config.max_meta_batch_size;
 
             if should_flush && !accumulated_batches.is_empty() {
                 debug!(
                     "{}: Flushing {} accumulated batches with {} total services",
-                    batch_id, accumulated_batches.len(), accumulated_count
+                    batch_id,
+                    accumulated_batches.len(),
+                    accumulated_count
                 );
-                
+
                 // Acquire a permit from the semaphore to control concurrency
                 let permit = match semaphore.acquire().await {
                     Ok(permit) => permit,
@@ -793,17 +817,28 @@ async fn spawn_optimized_write_stage(
                 let batches_to_process = std::mem::take(&mut accumulated_batches);
                 last_flush_time = Instant::now();
 
+                // Collect all service IDs for progress tracking
+                let all_service_ids: Vec<String> = batches_to_process
+                    .iter()
+                    .flat_map(|(ids, _)| ids.clone())
+                    .collect();
+
                 // Save the embeddings
                 match db_writer
-                    .save_embeddings_in_batches(batches_to_process, &progress_tracker)
+                    .save_embeddings_in_batches_fixed(batches_to_process)
                     .await
                 {
                     Ok(count) => {
                         total_written += count;
                         debug!(
-                            "{}: Wrote {} embeddings, total so far: {}",
+                            "{}: Successfully wrote {} embeddings, total so far: {}",
                             batch_id, count, total_written
                         );
+
+                        // Forward the successful IDs and count to the progress tracker
+                        if let Err(e) = progress_tx.send((all_service_ids, count)).await {
+                            error!("{}: Failed to send progress update: {}", batch_id, e);
+                        }
 
                         // Forward the count to the monitor
                         if let Err(e) = tx.send(count).await {
@@ -825,13 +860,24 @@ async fn spawn_optimized_write_stage(
         if !accumulated_batches.is_empty() {
             debug!("Processing {} remaining batches", accumulated_batches.len());
 
+            // Collect all service IDs for progress tracking
+            let all_service_ids: Vec<String> = accumulated_batches
+                .iter()
+                .flat_map(|(ids, _)| ids.clone())
+                .collect();
+
             match db_writer
-                .save_embeddings_in_batches(accumulated_batches, &progress_tracker)
+                .save_embeddings_in_batches_fixed(accumulated_batches)
                 .await
             {
                 Ok(count) => {
                     total_written += count;
                     debug!("Wrote {} embeddings, total: {}", count, total_written);
+
+                    // Forward the service IDs and count to the progress tracker
+                    if let Err(e) = progress_tx.send((all_service_ids, count)).await {
+                        error!("Failed to send final progress update: {}", e);
+                    }
 
                     // Forward the count to the monitor
                     if let Err(e) = tx.send(count).await {
@@ -844,8 +890,9 @@ async fn spawn_optimized_write_stage(
             }
         }
 
-        // Signal completion by dropping the sender
+        // Signal completion by dropping the senders
         drop(tx);
+        drop(progress_tx);
 
         info!(
             "Write stage completed in {:.2?}, saved {} embeddings in {} batches",
@@ -854,16 +901,10 @@ async fn spawn_optimized_write_stage(
             batch_num
         );
 
-        // Log final statistics
-        if let Err(e) = db_writer.log_embedding_stats(&progress_tracker).await {
-            warn!("Failed to log final embedding statistics: {}", e);
-        }
-
         Ok(()) as Result<()>
     })
     .await?
 }
-
 /// New function to monitor buffer levels and adjust concurrency
 fn spawn_buffer_monitor(
     pre_inference_level: Arc<AtomicUsize>,
@@ -874,54 +915,63 @@ fn spawn_buffer_monitor(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         debug!("Starting buffer monitor for adaptive concurrency");
-        
+
         // Keep track of any additional permits we've issued
         let mut additional_fetch_permits = 0;
         let mut additional_write_permits = 0;
-        
+
         loop {
             // Get current buffer levels
             let pre_level = pre_inference_level.load(Ordering::Relaxed);
             let post_level = post_inference_level.load(Ordering::Relaxed);
-            
+
             // Log current buffer state periodically
             debug!(
                 "Buffer status: pre-inference={}/{}, post-inference={}/{}",
-                pre_level, config.pre_inference_buffer_capacity,
-                post_level, config.post_inference_buffer_capacity
+                pre_level,
+                config.pre_inference_buffer_capacity,
+                post_level,
+                config.post_inference_buffer_capacity
             );
-            
+
             // Adaptive concurrency control based on buffer levels
-            
+
             // 1. If pre-inference buffer is getting low, increase fetch concurrency
-            if pre_level < config.pre_inference_buffer_capacity / 4 && additional_fetch_permits < 4 {
+            if pre_level < config.pre_inference_buffer_capacity / 4 && additional_fetch_permits < 4
+            {
                 // Add more fetch capacity to fill the buffer
                 fetch_semaphore.add_permits(1);
                 additional_fetch_permits += 1;
                 debug!("Pre-inference buffer low, increased fetch concurrency");
             }
             // 2. If pre-inference buffer is high, reduce fetch concurrency
-            else if pre_level > config.pre_inference_buffer_capacity * 3 / 4 && additional_fetch_permits > 0 {
+            else if pre_level > config.pre_inference_buffer_capacity * 3 / 4
+                && additional_fetch_permits > 0
+            {
                 // Reduce fetch capacity to let buffer drain
                 // Note: we're assuming permits are not all in use
                 additional_fetch_permits -= 1;
                 debug!("Pre-inference buffer high, reduced fetch concurrency");
             }
-            
+
             // 3. If post-inference buffer is getting high, increase write concurrency
-            if post_level > config.post_inference_buffer_capacity / 2 && additional_write_permits < 4 {
+            if post_level > config.post_inference_buffer_capacity / 2
+                && additional_write_permits < 4
+            {
                 // Add more write capacity to drain the buffer
                 write_semaphore.add_permits(1);
                 additional_write_permits += 1;
                 debug!("Post-inference buffer high, increased write concurrency");
             }
             // 4. If post-inference buffer is low, reduce write concurrency
-            else if post_level < config.post_inference_buffer_capacity / 4 && additional_write_permits > 0 {
+            else if post_level < config.post_inference_buffer_capacity / 4
+                && additional_write_permits > 0
+            {
                 // Reduce write capacity
                 additional_write_permits -= 1;
                 debug!("Post-inference buffer low, reduced write concurrency");
             }
-            
+
             // Brief sleep before next adjustment
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -929,17 +979,68 @@ fn spawn_buffer_monitor(
 }
 
 /// Spawns a monitor task to track overall pipeline progress (unchanged from original)
-async fn spawn_pipeline_monitor(
+async fn spawn_pipeline_monitor_fixed(
     mut rx: mpsc::Receiver<usize>,
+    mut progress_rx: mpsc::Receiver<(Vec<String>, usize)>,
     progress_tracker: ProgressTracker,
     total_count: i64,
 ) -> Result<i64> {
-    // Start a tokio task for the monitor
     tokio::spawn(async move {
         let monitor_start = Instant::now();
-        debug!("Starting pipeline monitor");
+        debug!("Starting fixed pipeline monitor");
 
         let mut processed_count = 0;
+
+        // Create a shared HashSet for tracking service IDs
+        let tracked_service_ids = Arc::new(Mutex::new(HashSet::<String>::new()));
+
+        // Clone the progress tracker and tracked_service_ids for the nested task
+        let progress_tracker_for_handler = progress_tracker.clone();
+        let tracked_ids_for_handler = tracked_service_ids.clone();
+
+        // Create a task to handle progress updates separately
+        // The progress_rx is moved into this task automatically
+        let progress_handler = tokio::spawn(async move {
+            while let Some((service_ids, count)) = progress_rx.recv().await {
+                // Update progress only with successfully written services
+                let mut duplicate_ids = 0;
+                let mut unique_ids = 0;
+
+                // Lock the tracked IDs set
+                let mut ids = tracked_ids_for_handler.lock().await;
+
+                for id in &service_ids {
+                    if ids.insert(id.clone()) {
+                        unique_ids += 1;
+                    } else {
+                        duplicate_ids += 1;
+                    }
+                }
+
+                // Release the lock
+                drop(ids);
+
+                if duplicate_ids > 0 {
+                    warn!(
+                        "Detected {} duplicate service IDs in progress update",
+                        duplicate_ids
+                    );
+                }
+
+                // Only update progress with unique IDs
+                if unique_ids > 0 {
+                    if let Err(e) = progress_tracker_for_handler
+                        .update(unique_ids as i64, "db-confirmed", false)
+                        .await
+                    {
+                        warn!("Failed to update progress: {}", e);
+                    }
+                }
+            }
+
+            // progress_rx is implicitly dropped when this task ends
+            debug!("Progress handler task completed");
+        });
 
         // Process counts coming from the write stage
         while let Some(count) = rx.recv().await {
@@ -957,6 +1058,23 @@ async fn spawn_pipeline_monitor(
         if let Err(e) = progress_tracker.update(0, "final", true).await {
             warn!("Failed to update final progress: {}", e);
         }
+
+        // Wait for progress handler to complete (with timeout for safety)
+        let timeout = tokio::time::Duration::from_secs(10);
+        match tokio::time::timeout(timeout, progress_handler).await {
+            Ok(result) => {
+                if let Err(e) = result {
+                    warn!("Error in progress handler: {}", e);
+                }
+            }
+            Err(_) => {
+                warn!("Timeout waiting for progress handler to complete");
+            }
+        }
+
+        // Log the total number of unique service IDs
+        let unique_count = tracked_service_ids.lock().await.len();
+        info!("Total unique service IDs tracked: {}", unique_count);
 
         let completion_percentage = (processed_count as f64 / total_count as f64) * 100.0;
 

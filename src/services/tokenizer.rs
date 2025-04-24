@@ -33,13 +33,14 @@ fn split_into_sentences(text: &str) -> Vec<String> {
     let mut sentences = Vec::new();
     let mut current_sentence = String::new();
     let mut chars = text.chars().peekable();
-    
+
     while let Some(c) = chars.next() {
         current_sentence.push(c);
-        
+
         // Check for end of sentence
-        if (c == '.' || c == '?' || c == '!') && 
-           (chars.peek().map_or(true, |next| next.is_whitespace())) {
+        if (c == '.' || c == '?' || c == '!')
+            && (chars.peek().map_or(true, |next| next.is_whitespace()))
+        {
             // Add current sentence if not empty
             if !current_sentence.trim().is_empty() {
                 sentences.push(current_sentence.trim().to_string());
@@ -47,17 +48,17 @@ fn split_into_sentences(text: &str) -> Vec<String> {
             }
         }
     }
-    
+
     // Add any remaining text as a sentence
     if !current_sentence.trim().is_empty() {
         sentences.push(current_sentence.trim().to_string());
     }
-    
+
     // If no sentences were found (no punctuation), just return the whole text as one sentence
     if sentences.is_empty() && !text.trim().is_empty() {
         sentences.push(text.trim().to_string());
     }
-    
+
     sentences
 }
 
@@ -108,9 +109,9 @@ pub fn build_text_for_embedding(service: &ServiceData, tokenizer: &Tokenizer) ->
                     Ok(enc) => enc.get_ids().len(),
                     Err(_) => 10, // Safe fallback if encoding fails
                 };
-                
+
                 let mut remaining_tokens = MAX_TOKEN_LENGTH - service_name_tokens;
-                
+
                 // 2. Smart sentence-by-sentence allocation for description
                 let desc_allocation = (remaining_tokens as f32 * 0.6).floor() as usize;
                 let description_truncated = if desc_allocation > 0 {
@@ -118,14 +119,14 @@ pub fn build_text_for_embedding(service: &ServiceData, tokenizer: &Tokenizer) ->
                     let sentences = split_into_sentences(&service.description);
                     let mut selected_sentences = Vec::new();
                     let mut token_count = 0;
-                    
+
                     // First pass: add sentences until we approach the limit
                     for sentence in sentences.clone() {
                         let sentence_tokens = match tokenizer.encode(sentence.clone(), true) {
                             Ok(enc) => enc.get_ids().len(),
                             Err(_) => sentence.split_whitespace().count(), // Rough estimation
                         };
-                        
+
                         if token_count + sentence_tokens <= desc_allocation {
                             selected_sentences.push(sentence.clone());
                             token_count += sentence_tokens;
@@ -134,7 +135,7 @@ pub fn build_text_for_embedding(service: &ServiceData, tokenizer: &Tokenizer) ->
                             break;
                         }
                     }
-                    
+
                     // If we didn't select any sentences but have allocation,
                     // take at least the first sentence and truncate it
                     if selected_sentences.is_empty() && !sentences.is_empty() {
@@ -152,28 +153,29 @@ pub fn build_text_for_embedding(service: &ServiceData, tokenizer: &Tokenizer) ->
                                 } else {
                                     selected_sentences.push(first_sentence);
                                 }
-                            },
+                            }
                             Err(_) => selected_sentences.push(first_sentence),
                         }
                     }
-                    
+
                     selected_sentences.join(" ")
                 } else {
                     "".to_string()
                 };
-                
+
                 // Calculate actual tokens used by description
-                let desc_actual_tokens = match tokenizer.encode(description_truncated.clone(), true) {
+                let desc_actual_tokens = match tokenizer.encode(description_truncated.clone(), true)
+                {
                     Ok(enc) => enc.get_ids().len(),
                     Err(_) => desc_allocation,
                 };
-                
+
                 remaining_tokens -= desc_actual_tokens;
-                
-                // 3. Allocate tokens to taxonomy terms 
+
+                // 3. Allocate tokens to taxonomy terms
                 let taxonomy_terms_text = taxonomy_terms.join(", ");
                 let taxonomy_allocation = (remaining_tokens as f32 * 0.6).floor() as usize;
-                
+
                 let taxonomy_truncated = if taxonomy_allocation > 0 {
                     match tokenizer.encode(taxonomy_terms_text.clone(), true) {
                         Ok(tax_encoding) => {
@@ -182,24 +184,27 @@ pub fn build_text_for_embedding(service: &ServiceData, tokenizer: &Tokenizer) ->
                                 let terms_list = taxonomy_terms.clone();
                                 let mut selected_terms = Vec::new();
                                 let mut token_count = 0;
-                                
+
                                 for term in terms_list {
                                     let term_tokens = match tokenizer.encode(term.clone(), true) {
                                         Ok(enc) => enc.get_ids().len(),
                                         Err(_) => term.split_whitespace().count(),
                                     };
-                                    
+
                                     // Add separator tokens (comma, space)
-                                    let separator_tokens = if selected_terms.is_empty() { 0 } else { 2 };
-                                    
-                                    if token_count + term_tokens + separator_tokens <= taxonomy_allocation {
+                                    let separator_tokens =
+                                        if selected_terms.is_empty() { 0 } else { 2 };
+
+                                    if token_count + term_tokens + separator_tokens
+                                        <= taxonomy_allocation
+                                    {
                                         selected_terms.push(term);
                                         token_count += term_tokens + separator_tokens;
                                     } else {
                                         break;
                                     }
                                 }
-                                
+
                                 selected_terms.join(", ")
                             } else {
                                 taxonomy_terms_text
@@ -210,45 +215,46 @@ pub fn build_text_for_embedding(service: &ServiceData, tokenizer: &Tokenizer) ->
                 } else {
                     "".to_string()
                 };
-                
+
                 // Calculate actual tokens used by taxonomy terms
                 let tax_actual_tokens = match tokenizer.encode(taxonomy_truncated.clone(), true) {
                     Ok(enc) => enc.get_ids().len(),
                     Err(_) => taxonomy_allocation,
                 };
-                
+
                 remaining_tokens -= tax_actual_tokens;
-                
+
                 // 4. Use any remaining tokens for taxonomy descriptions
                 // Split taxonomy descriptions into sentences too
                 let all_tax_desc_sentences = taxonomy_descriptions
                     .iter()
                     .flat_map(|desc| split_into_sentences(desc))
                     .collect::<Vec<String>>();
-                
-                let tax_desc_truncated = if remaining_tokens > 0 && !all_tax_desc_sentences.is_empty() {
-                    let mut selected_sentences = Vec::new();
-                    let mut token_count = 0;
-                    
-                    for sentence in all_tax_desc_sentences {
-                        let sentence_tokens = match tokenizer.encode(sentence.clone(), true) {
-                            Ok(enc) => enc.get_ids().len(),
-                            Err(_) => sentence.split_whitespace().count(),
-                        };
-                        
-                        if token_count + sentence_tokens <= remaining_tokens {
-                            selected_sentences.push(sentence);
-                            token_count += sentence_tokens;
-                        } else {
-                            break;
+
+                let tax_desc_truncated =
+                    if remaining_tokens > 0 && !all_tax_desc_sentences.is_empty() {
+                        let mut selected_sentences = Vec::new();
+                        let mut token_count = 0;
+
+                        for sentence in all_tax_desc_sentences {
+                            let sentence_tokens = match tokenizer.encode(sentence.clone(), true) {
+                                Ok(enc) => enc.get_ids().len(),
+                                Err(_) => sentence.split_whitespace().count(),
+                            };
+
+                            if token_count + sentence_tokens <= remaining_tokens {
+                                selected_sentences.push(sentence);
+                                token_count += sentence_tokens;
+                            } else {
+                                break;
+                            }
                         }
-                    }
-                    
-                    selected_sentences.join(" ")
-                } else {
-                    "".to_string()
-                };
-                
+
+                        selected_sentences.join(" ")
+                    } else {
+                        "".to_string()
+                    };
+
                 // Combine all parts with proper section markers
                 format!(
                     "[SERVICE] {} [DESCRIPTION] {} [CATEGORIES] {} [CATEGORY_DETAILS] {}",

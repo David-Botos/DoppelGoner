@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
 
     // Run just the embed_services module
     info!("Running embed_services in isolation...");
-    embed_services_m2_optimized(&pool, )
+    embed_services_m2_optimized(&pool)
         .await
         .context("Failed to embed services")?;
 
