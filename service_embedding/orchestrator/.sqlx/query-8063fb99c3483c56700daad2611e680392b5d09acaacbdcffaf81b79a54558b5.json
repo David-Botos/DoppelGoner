@@ -1,0 +1,103 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    SELECT \n                        id, \n                        hostname, \n                        ip_address, \n                        worker_type as \"worker_type: _\", \n                        capabilities as \"capabilities: sqlx::types::Json<WorkerCapabilities>\", \n                        status as \"status: _\", \n                        last_heartbeat, \n                        current_batch_size, \n                        current_load, \n                        active_jobs, \n                        created_at\n                    FROM embedding.workers\n                    WHERE id = $1\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "hostname",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "ip_address",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "worker_type: _",
+        "type_info": {
+          "Custom": {
+            "name": "worker_type",
+            "kind": {
+              "Enum": [
+                "orchestrator",
+                "inference"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "capabilities: sqlx::types::Json<WorkerCapabilities>",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "status: _",
+        "type_info": {
+          "Custom": {
+            "name": "worker_status",
+            "kind": {
+              "Enum": [
+                "online",
+                "offline",
+                "busy"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "last_heartbeat",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 7,
+        "name": "current_batch_size",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "current_load",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 9,
+        "name": "active_jobs",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "8063fb99c3483c56700daad2611e680392b5d09acaacbdcffaf81b79a54558b5"
+}

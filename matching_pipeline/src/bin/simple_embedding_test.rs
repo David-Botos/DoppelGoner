@@ -6,9 +6,9 @@ use std::path::Path;
 use std::time::Instant;
 
 // Import modules from the main crate
-use dedupe_lib::services::config::{CONFIG_PATH, MODEL_PATH, TOKENIZER_PATH};
-use dedupe_lib::services::data_fetcher::DataFetcher;
-use dedupe_lib::{db, services::inference::InferenceEngine, services::tokenizer};
+use dedupe_lib::service_embedding::config::{CONFIG_PATH, MODEL_PATH, TOKENIZER_PATH};
+use dedupe_lib::service_embedding::data_fetcher::DataFetcher;
+use dedupe_lib::{db, service_embedding::inference::InferenceEngine, service_embedding::tokenizer};
 
 #[tokio::main]
 async fn main() -> Result<()> {

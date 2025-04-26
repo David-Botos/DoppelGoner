@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE public.service\n                SET \n                    embedding_v2 = $1::float4[]::vector(384),\n                    embedding_v2_updated_at = NOW()\n                WHERE id = $2\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Float4Array",
+        "Bpchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "01ae6b8c2bd5120bfaf41a0b882845c762d4e36cd914fabee05b9df97b52e36e"
+}

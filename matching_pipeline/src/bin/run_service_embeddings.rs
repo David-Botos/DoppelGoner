@@ -4,7 +4,7 @@ use log::info;
 use std::path::Path;
 
 // Import modules from the main crate
-use dedupe_lib::{db, services::embed_services::embed_services_m2_optimized};
+use dedupe_lib::{db, service_embedding::embed_services::embed_services_m2_optimized};
 
 #[tokio::main]
 async fn main() -> Result<()> {
