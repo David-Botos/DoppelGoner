@@ -1,7 +1,13 @@
 # Rust specific ignores
-/target/
+**/target/
 **/*.rs.bk
 Cargo.lock
+
+# ML Ignores
+**/models
+
+# Dev Documentation
+**/intermediary
 
 # Environment files
 .env
