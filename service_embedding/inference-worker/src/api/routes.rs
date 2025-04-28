@@ -22,9 +22,8 @@ use crate::config::AppConfig;
 use crate::inference::engine::InferenceEngine;
 use crate::telemetry::gpu_metrics::GPUMetrics;
 use crate::types::types::{
-    BatchProcessRequest, BatchProcessResponse, BatchStatistics, EmbeddingResult, PipelineMetric,
-    PipelineStage, TokenizedDocument, WorkerCapabilities, WorkerStatus, WorkerStatusResponse,
-    WorkerType,
+    BatchProcessRequest, BatchProcessResponse, BatchStatistics, PipelineMetric, PipelineStage,
+    WorkerStatus, WorkerType,
 };
 
 // Query parameters for batch endpoints
@@ -309,7 +308,7 @@ pub fn create_api_router(app_state: Arc<AppState>) -> Router {
 
 async fn process_batch(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Query(params): Query<BatchQueryParams>,
     Json(mut request): Json<BatchProcessRequest>,
 ) -> Result<Json<BatchProcessResponse>, ApiError> {
@@ -904,7 +903,9 @@ async fn pause_worker(State(state): State<Arc<AppState>>) -> Result<Json<Value>,
 
     if let Some(url) = orchestrator_url {
         tokio::spawn(async move {
-            update_worker_status(&url, &worker_id, WorkerStatus::Offline).await;
+            if let Err(e) = update_worker_status(&url, &worker_id, WorkerStatus::Offline).await {
+                tracing::error!("Failed to update worker status: {}", e);
+            }
         });
     }
 
@@ -935,7 +936,9 @@ async fn resume_worker(State(state): State<Arc<AppState>>) -> Result<Json<Value>
     if let Some(url) = orchestrator_url {
         let status_clone = status;
         tokio::spawn(async move {
-            update_worker_status(&url, &worker_id, status_clone).await;
+            if let Err(e) = update_worker_status(&url, &worker_id, status_clone).await {
+                tracing::error!("Failed to update worker status: {}", e);
+            }
         });
     }
 

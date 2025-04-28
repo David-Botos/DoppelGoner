@@ -47,6 +47,13 @@ candle-transformers = "0.8.4"
 tokenizers = "0.13.4"
 safetensors = "0.3.1"
 
+# Testing and Benchmarking
+[dev-dependencies]
+tokio-test="0.4"
+criterion="0.4"
+hyper = { version = "0.14", features = ["full"] }
+tower = { version = "0.4", features = ["util"] }
+
 # Features configuration
 [features]
 default = ["metal"]  # Default to metal on macOS

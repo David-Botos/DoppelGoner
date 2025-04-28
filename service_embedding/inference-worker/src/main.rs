@@ -1,5 +1,11 @@
 // inference_worker/src/main.rs
 use axum::Server;
+use inference_worker::api::routes::{create_api_router, AppState, WorkerStats};
+use inference_worker::config::AppConfig;
+use inference_worker::inference::engine::InferenceEngine;
+use inference_worker::inference::model::get_best_device;
+use inference_worker::telemetry::gpu_metrics::GPUMetrics;
+use inference_worker::types::types::WorkerCapabilities;
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use std::net::SocketAddr;
@@ -8,20 +14,6 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
-
-mod api;
-mod auth;
-mod config;
-mod inference;
-mod telemetry;
-mod types;
-
-use crate::api::routes::{create_api_router, AppState, WorkerStats};
-use crate::config::AppConfig;
-use crate::inference::engine::InferenceEngine;
-use crate::inference::model::get_best_device;
-use crate::telemetry::gpu_metrics::GPUMetrics;
-use crate::types::types::WorkerCapabilities;
 
 // Enhanced capability detection function
 async fn detect_hardware_capabilities() -> anyhow::Result<WorkerCapabilities> {

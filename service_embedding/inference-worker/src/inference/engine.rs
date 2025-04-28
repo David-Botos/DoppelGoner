@@ -52,7 +52,7 @@ pub struct InferenceEngine {
     device: Device,
     current_load: f32,
     active_jobs: usize,
-    circuit_open: bool,
+    pub circuit_open: bool,
     consecutive_errors: usize,
     error_threshold: usize,
 
@@ -235,7 +235,7 @@ impl InferenceEngine {
     async fn process_document_chunk(
         model_wrapper: Arc<ModelWrapper>,
         documents: Vec<TokenizedDocument>,
-        batch_id: Uuid,
+        _batch_id: Uuid,
     ) -> Result<Vec<EmbeddingResult>> {
         let start_time = Instant::now();
 
