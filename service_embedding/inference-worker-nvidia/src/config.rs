@@ -61,7 +61,7 @@ impl AppConfig {
             listen_port: env::var("LISTEN_PORT")
                 .unwrap_or_else(|_| "3000".to_string())
                 .parse()?,
-            api_key: env::var("API_KEY").unwrap_or_else(|_| "default-api-key".to_string()),
+            api_key: env::var("API_KEY").unwrap_or_else(|_| "fart".to_string()),
             request_timeout_secs: env::var("REQUEST_TIMEOUT_SECS")
                 .unwrap_or_else(|_| "60".to_string())
                 .parse()?,

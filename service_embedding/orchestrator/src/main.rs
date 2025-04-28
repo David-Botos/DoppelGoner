@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting orchestrator service...");
 
     // Load configuration from environment
-    let api_key = std::env::var("API_KEY").unwrap_or_else(|_| "default-api-key".to_string());
+    let api_key = std::env::var("API_KEY").unwrap_or_else(|_| "fart".to_string());
 
     // Get database connection details
     let host = std::env::var("POSTGRES_HOST").unwrap_or("localhost".into());

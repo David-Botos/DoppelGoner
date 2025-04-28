@@ -49,7 +49,7 @@ async fn setup_test_app(initialize_model: bool) -> Arc<AppState> {
         max_token_length: 512,
         listen_addr: "127.0.0.1".to_string(),
         listen_port: 3000,
-        api_key: "test-api-key".to_string(),
+        api_key: "fart".to_string(),
         request_timeout_secs: 60,
         min_batch_size: 1,
         max_batch_size: 32,

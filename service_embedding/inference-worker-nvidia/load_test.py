@@ -17,7 +17,7 @@ console = Console()
 
 # Default configuration
 DEFAULT_WORKER_URL = "http://localhost:3000"
-DEFAULT_API_KEY = "your-api-key"
+DEFAULT_API_KEY = "fart"
 DEFAULT_MODEL_ID = "bge-small-en-v1.5"
 DEFAULT_BATCH_SIZE = 10  # Documents per batch
 DEFAULT_NUM_BATCHES = 10

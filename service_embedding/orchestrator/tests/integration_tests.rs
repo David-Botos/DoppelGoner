@@ -466,7 +466,7 @@ fn create_worker_client(
     Arc<tokio::sync::Mutex<Vec<Vec<orchestrator::types::types::TokenizedDocument>>>>,
 ) {
     let config = WorkerClientConfig {
-        api_key: "test-api-key".to_string(),
+        api_key: "fart".to_string(),
         request_timeout_secs: 60,
         max_concurrent_requests: 5,
         max_retries: 1,

@@ -3,7 +3,7 @@
 # A collection of simple tests for the inference worker service
 
 # Configuration
-API_KEY="your-api-key"
+API_KEY="fart"
 WORKER_HOST="localhost"
 WORKER_PORT="3000"
 MODEL_ID="bge-small-en-v1.5"
