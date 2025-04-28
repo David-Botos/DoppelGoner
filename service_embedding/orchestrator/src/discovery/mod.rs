@@ -88,11 +88,15 @@ async fn register_worker(
         _ => return Err(StatusCode::BAD_REQUEST),
     };
 
+    // Get original IP from request headers if available
+    // This helps with container networking where the hostname might be different
+    // from what the worker thinks it is
+    
     // Create worker record
     let worker = Worker {
         id: registration.worker_id,
         hostname: registration.hostname,
-        ip_address: registration.ip_address,
+        ip_address: registration.ip_address,  // Use provided IP or container hostname
         worker_type,
         capabilities: registration.capabilities,
         status,

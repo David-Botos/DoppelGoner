@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// Pipeline statistics for monitoring
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PipelineStats {
+    pub jobs_queued: usize,
     pub jobs_processed: usize,
     pub services_fetched: usize,
     pub documents_tokenized: usize,
@@ -24,6 +25,7 @@ impl PipelineStats {
     }
 
     pub fn add(&mut self, other: &Self) {
+        self.jobs_queued += other.jobs_queued;
         self.jobs_processed += other.jobs_processed;
         self.services_fetched += other.services_fetched;
         self.documents_tokenized += other.documents_tokenized;

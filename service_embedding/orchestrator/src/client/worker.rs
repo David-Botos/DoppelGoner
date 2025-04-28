@@ -640,7 +640,20 @@ impl WorkerClient {
         worker: &Worker,
         request: BatchProcessRequest,
     ) -> Result<BatchProcessResponse> {
-        let worker_url = format!("http://{}:3000/api/batches", worker.hostname);
+        let server_address = if let Some(ip) = &worker.ip_address {
+            if ip.contains(':') {
+                // ip_address already has a port, use it directly
+                ip.clone()
+            } else {
+                // No port in ip_address, append default
+                format!("{}:3000", ip)
+            }
+        } else {
+            // Fall back to hostname with default port
+            format!("{}:3000", worker.hostname)
+        };
+        
+        let worker_url = format!("http://{}/api/batches", server_address);
 
         // Send request to worker
         let response = self
@@ -704,7 +717,20 @@ impl WorkerClient {
             None => return Err(anyhow!("Worker not found: {}", worker_id)),
         };
 
-        let url = format!("http://{}:3000/api/health", worker.hostname);
+        let server_address = if let Some(ip) = &worker.ip_address {
+            if ip.contains(':') {
+                // ip_address already has a port, use it directly
+                ip.clone()
+            } else {
+                // No port in ip_address, append default
+                format!("{}:3000", ip)
+            }
+        } else {
+            // Fall back to hostname with default port
+            format!("{}:3000", worker.hostname)
+        };
+        
+        let url = format!("http://{}/api/health", server_address);
 
         match self.http_client.get(&url).send().await {
             Ok(response) => {

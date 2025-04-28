@@ -70,12 +70,12 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "60".to_string())
         .parse::<u64>()?;
 
-    // Parse worker locations from environment
-    let default_worker_locations = std::env::var("WORKER_LOCATIONS")
-        .unwrap_or_else(|_| "10.0.0.3:3000,10.0.0.4:3000".to_string())
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .collect::<Vec<String>>();
+// Parse worker locations from environment
+let default_worker_locations = std::env::var("WORKER_LOCATIONS")
+    .unwrap_or_else(|_| "inference-worker-cuda:3000,inference-worker-metal:3000".to_string())
+    .split(',')
+    .map(|s| s.trim().to_string())
+    .collect::<Vec<String>>();
 
     // Setup database connection
     info!("Connecting to database: {}", db_url);
