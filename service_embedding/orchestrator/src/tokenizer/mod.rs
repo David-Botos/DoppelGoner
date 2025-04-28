@@ -1,9 +1,4 @@
-// src/tokenizer/mod.rs
+// orchestrator/src/tokenizer/mod.rs
+pub mod service;
 
-mod service;
-
-pub use service::{
-    ServiceTokenizer,
-    TokenizerConfig,
-    TruncationStrategy,
-};
+pub use service::{ServiceTokenizer, TokenizerConfig, TruncationStrategy};

@@ -2,8 +2,8 @@
 // This file contains all shared types used across the application
 
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
 use sqlx::types::Json;
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 //

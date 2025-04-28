@@ -6,6 +6,9 @@ Cargo.lock
 # ML Ignores
 **/models
 
+#SQLx ignore
+**/.sqlx
+
 # Dev Documentation
 **/intermediary
 

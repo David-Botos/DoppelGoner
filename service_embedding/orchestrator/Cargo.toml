@@ -46,6 +46,9 @@ opentelemetry = { version = "0.19", features = ["rt-tokio"] }
 metrics = "0.21"
 metrics-exporter-prometheus = "0.12"
 
+# Tokenizer
+tokenizers = "0.14"
+
 # Configuration
 config = "0.13"
 dotenv = "0.15"
