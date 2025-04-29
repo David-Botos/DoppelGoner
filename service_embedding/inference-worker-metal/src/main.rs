@@ -24,8 +24,10 @@ async fn detect_hardware_capabilities() -> anyhow::Result<WorkerCapabilities> {
     let mut gpu_metrics = GPUMetrics::new();
 
     // Determine GPU type and memory
+    // With Accelerate we're using CPU, so adjust accordingly
     let supports_cuda = device.is_cuda();
     let supports_metal = device.is_metal();
+    let is_accelerate = !supports_cuda && !supports_metal;
 
     let mut gpu_type = None;
     let mut gpu_memory_mb = None;
@@ -36,15 +38,24 @@ async fn detect_hardware_capabilities() -> anyhow::Result<WorkerCapabilities> {
     } else if supports_metal {
         gpu_type = Some("Apple Silicon GPU".to_string());
         gpu_memory_mb = Some(gpu_metrics.get_memory_total_mb() as u64);
+    } else if is_accelerate {
+        gpu_type = Some("Apple Silicon (Accelerate)".to_string());
+        // For Accelerate, we're still using Apple Silicon but through CPU interface
+        // Report system memory or a large enough value
+        gpu_memory_mb = Some(16 * 1024); // 16GB as a default value
     }
 
-    // Determine optimal and max batch sizes based on available memory
-    let (optimal_batch_size, max_batch_size) = match gpu_memory_mb {
-        Some(mem) if mem >= 24 * 1024 => (64, 128), // High-end GPU (24GB+)
-        Some(mem) if mem >= 12 * 1024 => (32, 64),  // Mid-range GPU (12GB+)
-        Some(mem) if mem >= 6 * 1024 => (16, 32),   // Entry GPU (6GB+)
-        Some(mem) if mem >= 2 * 1024 => (8, 16),    // Low-end GPU (2GB+)
-        _ => (4, 8),                                // Very low memory or CPU
+    // Adjust batch sizes for Accelerate
+    let (optimal_batch_size, max_batch_size) = if is_accelerate {
+        (16, 32)  // Conservative default for Accelerate
+    } else {
+        match gpu_memory_mb {
+            Some(mem) if mem >= 24 * 1024 => (64, 128), // High-end GPU (24GB+)
+            Some(mem) if mem >= 12 * 1024 => (32, 64),  // Mid-range GPU (12GB+)
+            Some(mem) if mem >= 6 * 1024 => (16, 32),   // Entry GPU (6GB+)
+            Some(mem) if mem >= 2 * 1024 => (8, 16),    // Low-end GPU (2GB+)
+            _ => (4, 8),                                // Very low memory or CPU
+        }
     };
 
     Ok(WorkerCapabilities {

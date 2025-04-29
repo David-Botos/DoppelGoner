@@ -25,7 +25,7 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_DB=embeddings
-      - WORKER_LOCATIONS=10.0.0.3:3000
+      - WORKER_LOCATIONS=10.0.0.2:3000
       - BATCH_SIZE=10
       - MODEL_ID=bge-small-en-v1.5
       - PIPELINE_INTERVAL_SECS=60

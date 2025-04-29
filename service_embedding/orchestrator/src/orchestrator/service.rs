@@ -70,11 +70,11 @@ impl OrchestratorService {
                 error!("FATAL: Failed to load tokenizer: {}. Cannot continue.", e);
                 // This will stop the program immediately
                 panic!("Failed to initialize tokenizer: {}", e);
-                
+
                 // Alternative approach using process::exit
                 // std::process::exit(1);
             });
-        
+
         Self {
             config,
             worker_client,
@@ -85,20 +85,32 @@ impl OrchestratorService {
     }
 
     /// Queue new jobs for services with missing embeddings
-/// Queue new jobs for services with missing embeddings
-pub async fn queue_new_jobs(&self, batch_limit: i32) -> Result<i32> {
-    // Using query_scalar instead of query! to avoid compile-time checking
-    let count = sqlx::query_scalar::<_, i32>(
-        "SELECT embedding.queue_new_jobs($1)"
-    )
-    .bind(batch_limit)
-    .fetch_one(&self.pool)
-    .await?;
+    pub async fn queue_new_jobs(&self, batch_limit: i32) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            WITH inserted_jobs AS (
+                INSERT INTO embedding.embedding_jobs (id, service_id)
+                SELECT gen_random_uuid(), s.id
+                FROM public.service s
+                WHERE s.embedding_v2 IS NULL
+                AND NOT EXISTS (
+                    SELECT 1 
+                    FROM embedding.embedding_jobs ej 
+                    WHERE ej.service_id = s.id 
+                    AND ej.status IN ('queued', 'processing')
+                )
+                LIMIT $1
+                RETURNING 1
+            )
+            SELECT COUNT(*) FROM inserted_jobs
+            "#,
+        )
+        .bind(batch_limit)
+        .fetch_one(&self.pool)
+        .await?;
     
-    info!("Queued {} new jobs for services needing embeddings", count);
-    
-    Ok(count)
-}
+        Ok(count)
+    }
 
     // Get current pipeline stats
     pub async fn get_stats(&self) -> PipelineStats {
@@ -469,128 +481,128 @@ pub async fn queue_new_jobs(&self, batch_limit: i32) -> Result<i32> {
     }
 
     // Store embedding results in the database with parallel processing
-// Store embedding results in the database with parallel processing
-pub async fn store_embeddings(
-    &self,
-    results: &[(EmbeddingJob, EmbeddingResult)],
-) -> Result<()> {
-    if results.is_empty() {
-        return Ok(());
-    }
+    // Store embedding results in the database with parallel processing
+    pub async fn store_embeddings(
+        &self,
+        results: &[(EmbeddingJob, EmbeddingResult)],
+    ) -> Result<()> {
+        if results.is_empty() {
+            return Ok(());
+        }
 
-    let concurrency = 10; // Database writes can be done in parallel
-    let (tx, mut rx) = mpsc::channel(results.len());
+        let concurrency = 10; // Database writes can be done in parallel
+        let (tx, mut rx) = mpsc::channel(results.len());
 
-    let mut handles = Vec::new();
-    for (job, result) in results {
-        let job_clone = job.clone();
-        let result_clone = result.clone();
-        let tx = tx.clone();
-        let pool = self.pool.clone();
+        let mut handles = Vec::new();
+        for (job, result) in results {
+            let job_clone = job.clone();
+            let result_clone = result.clone();
+            let tx = tx.clone();
+            let pool = self.pool.clone();
 
-        let handle = tokio::spawn(async move {
-            let job_id = job_clone.id;
+            let handle = tokio::spawn(async move {
+                let job_id = job_clone.id;
 
-            // Update service with embedding - using query instead of query! macro
-            match sqlx::query(
-                r#"
+                // Update service with embedding - using query instead of query! macro
+                match sqlx::query(
+                    r#"
                 UPDATE public.service
                 SET 
                     embedding_v2 = $1::float4[]::vector(384),
                     embedding_v2_updated_at = NOW()
                 WHERE id = $2
-                "#
-            )
-            .bind(&result_clone.embedding)
-            .bind(&result_clone.service_id)
-            .execute(&pool)
-            .await
-            {
-                Ok(_) => {
-                    // Update job status to completed
-                    let metadata = serde_json::json!({
-                        "model_id": result_clone.model_id,
-                        "processing_time_ms": result_clone.processing_time_ms,
-                        "embedding_dimensions": result_clone.embedding.len()
-                    });
+                "#,
+                )
+                .bind(&result_clone.embedding)
+                .bind(&result_clone.service_id)
+                .execute(&pool)
+                .await
+                {
+                    Ok(_) => {
+                        // Update job status to completed
+                        let metadata = serde_json::json!({
+                            "model_id": result_clone.model_id,
+                            "processing_time_ms": result_clone.processing_time_ms,
+                            "embedding_dimensions": result_clone.embedding.len()
+                        });
 
-                    match db::update_job_status(
-                        &pool,
-                        &job_id,
-                        JobStatus::Completed,
-                        None,
-                        Some(result_clone.token_count as i32),
-                        Some(&metadata),
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            let _ = tx.send(Ok(job_id)).await;
-                        }
-                        Err(e) => {
-                            error!("Failed to update job status for {}: {}", job_id, e);
-                            let _ = tx
-                                .send(Err((
-                                    job_id,
-                                    anyhow!("Failed to update job status: {}", e),
-                                )))
-                                .await;
+                        match db::update_job_status(
+                            &pool,
+                            &job_id,
+                            JobStatus::Completed,
+                            None,
+                            Some(result_clone.token_count as i32),
+                            Some(&metadata),
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                let _ = tx.send(Ok(job_id)).await;
+                            }
+                            Err(e) => {
+                                error!("Failed to update job status for {}: {}", job_id, e);
+                                let _ = tx
+                                    .send(Err((
+                                        job_id,
+                                        anyhow!("Failed to update job status: {}", e),
+                                    )))
+                                    .await;
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to store embedding for service {}: {}",
-                        result_clone.service_id, e
-                    );
+                    Err(e) => {
+                        error!(
+                            "Failed to store embedding for service {}: {}",
+                            result_clone.service_id, e
+                        );
 
-                    // Update job status to failed
-                    let error_msg = format!("Embedding storage error: {}", e);
-                    let _ = db::update_job_status(
-                        &pool,
-                        &job_id,
-                        JobStatus::Failed,
-                        Some(&error_msg),
-                        None,
-                        None,
-                    )
-                    .await;
+                        // Update job status to failed
+                        let error_msg = format!("Embedding storage error: {}", e);
+                        let _ = db::update_job_status(
+                            &pool,
+                            &job_id,
+                            JobStatus::Failed,
+                            Some(&error_msg),
+                            None,
+                            None,
+                        )
+                        .await;
 
-                    let _ = tx.send(Err((job_id, anyhow!(error_msg)))).await;
+                        let _ = tx.send(Err((job_id, anyhow!(error_msg)))).await;
+                    }
                 }
+            });
+
+            handles.push(handle);
+
+            // Limit concurrency
+            if handles.len() >= concurrency {
+                let _ = futures::future::join_all(handles.drain(..1)).await;
             }
-        });
-
-        handles.push(handle);
-
-        // Limit concurrency
-        if handles.len() >= concurrency {
-            let _ = futures::future::join_all(handles.drain(..1)).await;
         }
-    }
 
-    // Drop the original sender
-    drop(tx);
+        // Drop the original sender
+        drop(tx);
 
-    // Process results for error tracking
-    let mut errors = 0;
-    while let Some(res) = rx.recv().await {
-        if let Err(_) = res {
-            errors += 1;
+        // Process results for error tracking
+        let mut errors = 0;
+        while let Some(res) = rx.recv().await {
+            if let Err(_) = res {
+                errors += 1;
+            }
         }
-    }
 
-    // Wait for all remaining tasks to complete
-    for handle in handles {
-        let _ = handle.await;
-    }
+        // Wait for all remaining tasks to complete
+        for handle in handles {
+            let _ = handle.await;
+        }
 
-    if errors > 0 {
-        warn!("{} embeddings failed to store", errors);
-    }
+        if errors > 0 {
+            warn!("{} embeddings failed to store", errors);
+        }
 
-    Ok(())
-}
+        Ok(())
+    }
 
     // Update job status
     pub async fn update_job_status(
@@ -616,49 +628,52 @@ pub async fn store_embeddings(
     pub async fn run_embedding_pipeline(&self) -> Result<PipelineStats> {
         let start_time = Instant::now();
         let mut stats = PipelineStats::default();
-    
+
         // 1. Queue new jobs for services needing embeddings
         let queue_batch_size = self.config.batch_size * 2; // Queue more than we'll process
         let newly_queued = self.queue_new_jobs(queue_batch_size).await?;
-        
-        info!("Queued {} new jobs for services needing embeddings", newly_queued);
-        
+
+        info!(
+            "Queued {} new jobs for services needing embeddings",
+            newly_queued
+        );
+
         // 2. Determine optimal batch size based on available workers
         let batch_size = self.get_optimal_batch_size().await;
-    
+
         // 3. Claim jobs
         let fetch_start = Instant::now();
         let jobs = self.claim_jobs(batch_size).await?;
-    
+
         if jobs.is_empty() {
             // No jobs to process
             return Ok(stats);
         }
-    
-        stats.jobs_processed = jobs.len();
+
+        stats.jobs_processed = jobs.len() as i64;
         info!("Claimed {} jobs for processing", jobs.len());
-    
+
         // 4. Fetch service data
         let services_data = self.fetch_service_data(&jobs).await?;
         stats.services_fetched = services_data.len();
         stats.fetch_time_ms = fetch_start.elapsed().as_millis() as u64;
-    
+
         if services_data.is_empty() {
             info!("No valid services found for the claimed jobs");
             return Ok(stats);
         }
-    
+
         // 5. Tokenize services
         let tokenize_start = Instant::now();
         let tokenized_data = self.tokenize_services(&services_data).await?;
-        stats.documents_tokenized = tokenized_data.len();
+        stats.documents_tokenized = tokenized_data.len() as i64;
         stats.tokenize_time_ms = tokenize_start.elapsed().as_millis() as u64;
-    
+
         if tokenized_data.is_empty() {
             info!("No documents were successfully tokenized");
             return Ok(stats);
         }
-    
+
         // 6. Process through inference workers
         let inference_start = Instant::now();
         let results = match self.process_tokenized_batch(&tokenized_data).await {
@@ -672,28 +687,28 @@ pub async fn store_embeddings(
                 return Ok(stats);
             }
         };
-    
-        stats.embeddings_generated = results.len();
+
+        stats.embeddings_generated = results.len() as i64;
         stats.inference_time_ms = inference_start.elapsed().as_millis() as u64;
-    
+
         // 7. Store embeddings
         let storage_start = Instant::now();
         if let Err(e) = self.store_embeddings(&results).await {
             error!("Failed to store embeddings: {}", e);
             stats.errors = stats.embeddings_generated; // All embeddings failed to store
         }
-    
+
         stats.storage_time_ms = storage_start.elapsed().as_millis() as u64;
         stats.total_time_ms = start_time.elapsed().as_millis() as u64;
-    
+
         info!(
             "Pipeline completed: processed {} jobs, tokenized {} documents, generated {} embeddings in {}ms",
             stats.jobs_processed, stats.documents_tokenized, stats.embeddings_generated, stats.total_time_ms
         );
-    
+
         // Update global stats
         self.update_stats(stats.clone()).await;
-    
+
         Ok(stats)
     }
 
@@ -718,14 +733,14 @@ pub async fn store_embeddings(
     // Register fixed inference workers if they're not already registered
     pub async fn register_default_workers(&self) -> Result<Vec<Worker>> {
         let mut registered_workers = Vec::new();
-    
+
         // Check which workers are already registered
         let existing_workers = self.worker_client.get_all_workers().await;
         let existing_hostnames: std::collections::HashSet<String> = existing_workers
             .iter()
             .map(|w| w.hostname.clone())
             .collect();
-    
+
         // Register workers that aren't already registered
         for location in &self.config.default_worker_locations {
             // Handle both formats: "hostname" and "hostname:port"
@@ -740,24 +755,24 @@ pub async fn store_embeddings(
                 // Default port if not specified
                 (location.clone(), "3000".to_string())
             };
-    
+
             // Skip if already registered
             if existing_hostnames.contains(&hostname) {
                 info!("Worker {} already registered", hostname);
                 continue;
             }
-    
+
             // Store full address for API calls
             let full_address = if hostname.contains(':') {
                 hostname.clone()
             } else {
                 format!("{}:{}", hostname, port_str)
             };
-    
+
             // Try to connect to worker and get its status
             let client = reqwest::Client::new();
             let url = format!("http://{}/api/status", full_address);
-    
+
             match client
                 .get(&url)
                 .header("X-API-Key", &self.worker_client.config.api_key)
@@ -769,7 +784,7 @@ pub async fn store_embeddings(
                     if response.status().is_success() {
                         // Register worker
                         let worker_id = format!("inference-{}", Uuid::new_v4());
-    
+
                         let worker = Worker {
                             id: worker_id.clone(),
                             hostname: hostname.clone(),
@@ -792,7 +807,7 @@ pub async fn store_embeddings(
                             active_jobs: 0,
                             created_at: SystemTime::now(),
                         };
-    
+
                         // Register with database
                         if let Err(e) = db::register_worker(
                             &self.pool,
@@ -807,7 +822,7 @@ pub async fn store_embeddings(
                             error!("Failed to register worker in database: {}", e);
                             continue;
                         }
-    
+
                         // Register with registry
                         self.worker_client
                             .registry
@@ -828,7 +843,7 @@ pub async fn store_embeddings(
                 }
             }
         }
-    
+
         Ok(registered_workers)
     }
 }

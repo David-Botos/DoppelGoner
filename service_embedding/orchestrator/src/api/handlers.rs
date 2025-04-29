@@ -44,7 +44,6 @@ pub fn create_api_routes(app_state: Arc<AppState>) -> Router {
         .route("/api/pipeline/pause", post(pause_pipeline))
         .route("/api/pipeline/resume", post(resume_pipeline))
         .route("/api/stats", get(get_stats))
-        .route("/api/workers", get(get_workers))
         .with_state(app_state)
 }
 
@@ -132,13 +131,5 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> ApiResult<PipelineStat
     match state.worker_manager.get_stats().await {
         Ok(stats) => api_success(stats),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e),
-    }
-}
-
-// Get all registered workers
-async fn get_workers(State(state): State<Arc<AppState>>) -> ApiResult<Vec<Worker>> {
-    match state.orchestrator.get_all_workers().await {
-        Ok(workers) => api_success(workers),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

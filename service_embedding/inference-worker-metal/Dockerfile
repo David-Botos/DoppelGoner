@@ -1,5 +1,5 @@
 # Start with a Mac-compatible base image
-FROM --platform=linux/arm64 rust:1.76-slim-bookworm as builder
+FROM --platform=linux/arm64 rust:1.81-slim-bookworm as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y \
 
 # Create a new empty project
 WORKDIR /app
+
+# Copy the manifests and lock file
 COPY Cargo.toml Cargo.lock ./
 
 # Create empty source files to build dependencies
@@ -49,10 +51,13 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy the binary from the builder stage
-COPY --from=builder /app/target/release/inference-worker .
+COPY --from=builder /app/target/release/inference_worker ./inference-worker
 
-# Create models directory
+# Create models directory and copy models
 RUN mkdir -p models
+
+# Copy model files (if needed during container build)
+# COPY models models/
 
 # Set environment variables with defaults from config.rs
 ENV MODEL_ID="bge-small-en-v1.5"
@@ -60,7 +65,7 @@ ENV MODEL_PATH="./models/bge-small-en-v1.5"
 ENV MAX_TOKEN_LENGTH="512"
 ENV LISTEN_ADDR="0.0.0.0"
 ENV LISTEN_PORT="3000"
-ENV API_KEY="default-api-key"
+ENV API_KEY="fart"
 ENV REQUEST_TIMEOUT_SECS="60"
 ENV MIN_BATCH_SIZE="1"
 ENV MAX_BATCH_SIZE="64"

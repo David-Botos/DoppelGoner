@@ -5,10 +5,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{routing::get, Router};
+use dotenv::dotenv;
 use sqlx::postgres::PgPoolOptions;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use dotenv::dotenv;
 
 // Internal modules
 mod api;
@@ -57,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
     let db_url = format!("postgres://{}:{}@{}:{}/{}", user, pass, host, port, db);
 
     let port = std::env::var("PORT")
-        .unwrap_or_else(|_| "3001".to_string())
+        .unwrap_or_else(|_| "3002".to_string())
         .parse::<u16>()?;
 
     let batch_size = std::env::var("BATCH_SIZE")
@@ -70,12 +70,12 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "60".to_string())
         .parse::<u64>()?;
 
-// Parse worker locations from environment
-let default_worker_locations = std::env::var("WORKER_LOCATIONS")
-    .unwrap_or_else(|_| "inference-worker-cuda:3000,inference-worker-metal:3000".to_string())
-    .split(',')
-    .map(|s| s.trim().to_string())
-    .collect::<Vec<String>>();
+    // Parse worker locations from environment
+    let default_worker_locations = std::env::var("WORKER_LOCATIONS")
+        .unwrap_or_else(|_| "localhost:3000".to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect::<Vec<String>>();
 
     // Setup database connection
     info!("Connecting to database: {}", db_url);

@@ -19,8 +19,8 @@ fn test_tokenizer_no_truncation_needed() {
     };
 
     // Unwrap the Result to get the tokenizer
-    let tokenizer = ServiceTokenizer::with_config(config.clone())
-        .expect("Failed to create tokenizer");
+    let tokenizer =
+        ServiceTokenizer::with_config(config.clone()).expect("Failed to create tokenizer");
 
     // Create a document that shouldn't need truncation
     let doc = EmbeddingDocument {
@@ -88,8 +88,7 @@ fn test_tokenizer_intelligent_truncation() {
     };
 
     // Unwrap the Result to get the tokenizer
-    let tokenizer = ServiceTokenizer::with_config(config)
-        .expect("Failed to create tokenizer");
+    let tokenizer = ServiceTokenizer::with_config(config).expect("Failed to create tokenizer");
 
     // Create a document with lots of content that will need truncation
     let doc = EmbeddingDocument {
@@ -170,8 +169,7 @@ fn test_tokenizer_prioritization() {
     };
 
     // Unwrap the Result to get the tokenizer
-    let tokenizer = ServiceTokenizer::with_config(config)
-        .expect("Failed to create tokenizer");
+    let tokenizer = ServiceTokenizer::with_config(config).expect("Failed to create tokenizer");
 
     // Create a document with more content than the token limit
     let doc = EmbeddingDocument {
@@ -346,8 +344,7 @@ fn test_tokenizer_sentence_boundary_truncation() {
     };
 
     // Unwrap the Result to get the tokenizer
-    let tokenizer = ServiceTokenizer::with_config(config)
-        .expect("Failed to create tokenizer");
+    let tokenizer = ServiceTokenizer::with_config(config).expect("Failed to create tokenizer");
 
     // Create a document with multiple sentences
     let doc = EmbeddingDocument {
@@ -415,8 +412,8 @@ fn test_tokenizer_url_inclusion() {
     };
 
     // Unwrap the Result to get the tokenizer
-    let tokenizer = ServiceTokenizer::with_config(config.clone())
-        .expect("Failed to create tokenizer");
+    let tokenizer =
+        ServiceTokenizer::with_config(config.clone()).expect("Failed to create tokenizer");
 
     // Create a document with a URL in the service_id
     let doc = EmbeddingDocument {
@@ -442,8 +439,7 @@ fn test_tokenizer_url_inclusion() {
     };
 
     // Unwrap the Result to get the tokenizer
-    let tokenizer = ServiceTokenizer::with_config(config)
-        .expect("Failed to create tokenizer");
+    let tokenizer = ServiceTokenizer::with_config(config).expect("Failed to create tokenizer");
 
     // Tokenize again
     let (tokenized, _) = tokenizer.tokenize(&doc).unwrap();
@@ -478,9 +474,9 @@ fn test_tokenizer_different_strategies() {
     };
 
     // Unwrap the Result to get the tokenizer
-    let simple_tokenizer = ServiceTokenizer::with_config(simple_config)
-        .expect("Failed to create simple tokenizer");
-    
+    let simple_tokenizer =
+        ServiceTokenizer::with_config(simple_config).expect("Failed to create simple tokenizer");
+
     let (simple_result, simple_count) = simple_tokenizer.tokenize(&doc).unwrap();
 
     assert!(
@@ -496,9 +492,9 @@ fn test_tokenizer_different_strategies() {
     };
 
     // Unwrap the Result to get the tokenizer
-    let start_tokenizer = ServiceTokenizer::with_config(start_config)
-        .expect("Failed to create start_only tokenizer");
-    
+    let start_tokenizer =
+        ServiceTokenizer::with_config(start_config).expect("Failed to create start_only tokenizer");
+
     let (start_result, start_count) = start_tokenizer.tokenize(&doc).unwrap();
 
     assert!(
@@ -518,9 +514,9 @@ fn test_tokenizer_different_strategies() {
     };
 
     // Unwrap the Result to get the tokenizer
-    let end_tokenizer = ServiceTokenizer::with_config(end_config)
-        .expect("Failed to create end_only tokenizer");
-    
+    let end_tokenizer =
+        ServiceTokenizer::with_config(end_config).expect("Failed to create end_only tokenizer");
+
     let (end_result, end_count) = end_tokenizer.tokenize(&doc).unwrap();
 
     assert!(

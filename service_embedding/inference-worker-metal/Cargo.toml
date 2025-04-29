@@ -41,9 +41,9 @@ metrics = "0.21"
 metrics-exporter-prometheus = "0.12"
 
 # ML dependencies
-candle-core = { version = "0.8.4" }
-candle-nn = "0.8.4"
-candle-transformers = "0.8.4"
+candle-core = { version = "0.9.0" }
+candle-nn = "0.9.0"
+candle-transformers = "0.9.0"
 tokenizers = "0.13.4"
 safetensors = "0.3.1"
 
@@ -56,9 +56,10 @@ tower = { version = "0.4", features = ["util"] }
 
 # Features configuration
 [features]
-default = ["metal"]  # Default to metal on macOS
+default = ["accelerate"]  # Changed from "metal" to "accelerate"
 cuda = ["candle-core/cuda"]
-metal = ["candle-core/metal", "candle-core/accelerate"]
+metal = ["candle-core/metal"]  # Removed accelerate from here
+accelerate = ["candle-core/accelerate"]  # Added separate accelerate feature
 
 [profile.release]
 lto = true

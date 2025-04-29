@@ -652,7 +652,7 @@ impl WorkerClient {
             // Fall back to hostname with default port
             format!("{}:3000", worker.hostname)
         };
-        
+
         let worker_url = format!("http://{}/api/batches", server_address);
 
         // Send request to worker
@@ -729,7 +729,7 @@ impl WorkerClient {
             // Fall back to hostname with default port
             format!("{}:3000", worker.hostname)
         };
-        
+
         let url = format!("http://{}/api/health", server_address);
 
         match self.http_client.get(&url).send().await {

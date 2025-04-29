@@ -212,9 +212,15 @@ impl BgeEmbeddingModel {
     }
 }
 
-// Function to determine the best device to use
 pub fn get_best_device() -> Result<Device> {
-    // Try CUDA first (for NVIDIA GPUs)
+    // First, check if we should use Accelerate framework without Metal
+    #[cfg(all(feature = "accelerate", not(feature = "metal"), not(feature = "cuda")))]
+    {
+        info!("Using CPU with Apple Accelerate framework");
+        return Ok(Device::Cpu);  // Accelerate operates through CPU but is highly optimized
+    }
+
+    // Try CUDA first if available
     #[cfg(feature = "cuda")]
     {
         if let Ok(device) = Device::cuda_if_available(0) {
@@ -225,18 +231,17 @@ pub fn get_best_device() -> Result<Device> {
         }
     }
 
-    // Try Metal next (for Apple GPUs)
+    // Try Metal if enabled and CUDA wasn't available
     #[cfg(feature = "metal")]
     {
-        // Use the correct method for Metal device initialization
         if let Ok(device) = Device::new_metal(0) {
             info!("Using Metal device");
             return Ok(device);
         }
     }
 
-    // Fall back to CPU
-    info!("No GPU available, using CPU");
+    // Fall back to CPU, with Accelerate if available
+    info!("Falling back to CPU device");
     Ok(Device::Cpu)
 }
 

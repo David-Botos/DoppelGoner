@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PipelineStats {
     pub jobs_queued: usize,
-    pub jobs_processed: usize,
+    pub jobs_processed: i64,
     pub services_fetched: usize,
-    pub documents_tokenized: usize,
-    pub embeddings_generated: usize,
-    pub errors: usize,
+    pub documents_tokenized: i64,
+    pub embeddings_generated: i64,
+    pub errors: i64,
     pub fetch_time_ms: u64,
     pub tokenize_time_ms: u64,
     pub inference_time_ms: u64,
