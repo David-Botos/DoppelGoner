@@ -4,8 +4,8 @@
 // focusing particularly on whether layer normalization works correctly on CUDA.
 
 use anyhow::Result;
-use candle_core::{Device, Tensor};
-use inference_worker::inference::model::{BgeEmbeddingModel, BgeTokenizer, get_best_device};
+use candle_core::Device;
+use inference_worker::inference::model::{BgeEmbeddingModel, BgeTokenizer};
 use inference_worker::telemetry::gpu_metrics::GPUMetrics;
 use inference_worker::types::types::{TokenizedDocument, WorkerCapabilities};
 use inference_worker::inference::engine::InferenceEngine;
@@ -36,15 +36,15 @@ async fn test_cuda_layer_normalization() -> Result<()> {
     let gpu_metrics = Arc::new(Mutex::new(GPUMetrics::new()));
 
     // Test data that will exercise layer normalization - intentionally varied inputs
-    let test_texts = vec![
+    let test_texts: Vec<String> = vec![
         // Regular text
-        "This is a standard input for embedding generation.",
+        "This is a standard input for embedding generation.".to_string(),
         // Text with extreme values (long repetitive content to create large activations)
-        "This text repeats words many many many many many many many many many many many many many times to create extreme activation values that will need significant normalization.",
+        "This text repeats words many many many many many many many many many many many many many times to create extreme activation values that will need significant normalization.".to_string(),
         // Very short text
-        "Short.",
+        "Short.".to_string(),
         // Mixed case and special characters
-        "UPPERCASE text with $pecial CH@R@CTERS and numbers 12345!",
+        "UPPERCASE text with $pecial CH@R@CTERS and numbers 12345!".to_string(),
     ];
 
     println!("Testing layer normalization in GPU vs CPU inference with {} test samples", test_texts.len());
@@ -127,8 +127,8 @@ async fn test_cuda_layer_normalization() -> Result<()> {
     // PART 4: Compare CUDA vs CPU results
     println!("\n=== Comparing CUDA vs CPU results ===");
     
-    let mut max_diff = 0.0;
-    let mut avg_diff = 0.0;
+    let mut max_diff: f32 = 0.0;
+    let mut avg_diff: f32 = 0.0;
     let mut total_values = 0;
     
     for (i, (cuda_emb, cpu_emb)) in cuda_embeddings.iter().zip(cpu_embeddings.iter()).enumerate() {
