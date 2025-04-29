@@ -42,25 +42,26 @@ async fn test_batch_optimizer_successful_batch() {
 async fn test_batch_optimizer_error_handling() {
     let gpu_metrics = Arc::new(Mutex::new(GPUMetrics::new()));
     let mut optimizer = BatchOptimizer::new(1, 64, 16, 500.0, gpu_metrics.clone());
-    
+
     println!("Initial batch size: {}", optimizer.get_optimal_batch_size());
-    
+
     // Start with some successful batches
     println!("Processing successful batches:");
     for i in 0..3 {
         optimizer.record_batch_result(true, 200.0);
-        println!("  After success #{}: batch_size={}, warmup={}, processed={}",
-            i+1,
+        println!(
+            "  After success #{}: batch_size={}, warmup={}, processed={}",
+            i + 1,
             optimizer.get_optimal_batch_size(),
             optimizer.is_warmup_phase,
             optimizer.warmup_batches_processed
         );
     }
-    
+
     // Check the size after successful batches
     let size_before_error = optimizer.get_optimal_batch_size();
     println!("Size before error: {}", size_before_error);
-    
+
     if optimizer.is_warmup_phase {
         // In warmup phase, check that batch size has increased according to the scale factor
         // Initial is 16, after 3 successes with 1.2 scale factor: 16 -> 19 -> 23 -> 27
@@ -79,37 +80,42 @@ async fn test_batch_optimizer_error_handling() {
             size_before_error
         );
     }
-    
+
     // Now record an error
     println!("Recording error batch");
     optimizer.record_batch_result(false, 300.0);
-    
+
     // Check post-error state
-    println!("After error: batch_size={}, consecutive_successes={}, last_had_error={}",
+    println!(
+        "After error: batch_size={}, consecutive_successes={}, last_had_error={}",
         optimizer.get_optimal_batch_size(),
         optimizer.consecutive_successful_batches,
         optimizer.last_batch_had_error
     );
-    
+
     // Should reset consecutive success count and reduce batch size
-    assert_eq!(optimizer.consecutive_successful_batches, 0, 
-        "Expected consecutive_successful_batches to be 0 after error");
-    assert!(optimizer.last_batch_had_error, 
-        "Expected last_batch_had_error to be true after error");
-    
+    assert_eq!(
+        optimizer.consecutive_successful_batches, 0,
+        "Expected consecutive_successful_batches to be 0 after error"
+    );
+    assert!(
+        optimizer.last_batch_had_error,
+        "Expected last_batch_had_error to be true after error"
+    );
+
     // Batch size should be reduced by about 25% but not below minimum
     let expected_size = (size_before_error as f64 * 0.75).ceil() as usize;
     let expected_min = optimizer.min_batch_size;
-    
+
     assert_eq!(
-        optimizer.get_optimal_batch_size(), 
+        optimizer.get_optimal_batch_size(),
         expected_size.max(expected_min),
         "Expected batch size to be max({}, {}) after error, but got {}",
         expected_size,
         expected_min,
         optimizer.get_optimal_batch_size()
     );
-    
+
     println!("✅ Error handling test passed with expected batch size reduction");
 }
 

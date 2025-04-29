@@ -4,11 +4,11 @@ use std::{
     collections::VecDeque,
     time::{Duration, Instant},
 };
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 // For CUDA metrics
 #[cfg(feature = "cuda")]
-use candle_core::cuda_backend::cudarc::driver::{CudaDevice, DevicePtr};
+use candle_core::cuda_backend::cudarc::driver::CudaDevice;
 
 // For Metal metrics (simplified since Metal doesn't provide as direct access)
 #[cfg(feature = "metal")]
@@ -44,7 +44,7 @@ pub struct GPUMetrics {
 
     // Backend-specific implementation
     #[cfg(feature = "cuda")]
-    cuda_device: Option<CudaDevice>,
+    cuda_device: Option<std::sync::Arc<CudaDevice>>,
 
     #[cfg(feature = "metal")]
     metal_last_used_memory: AtomicUsize,
@@ -81,7 +81,7 @@ impl GPUMetrics {
     }
 
     #[cfg(feature = "cuda")]
-    fn initialize_cuda_device() -> Option<CudaDevice> {
+    fn initialize_cuda_device() -> Option<std::sync::Arc<CudaDevice>> {
         match CudaDevice::new(0) {
             Ok(device) => {
                 info!("CUDA device initialized for metrics collection");
@@ -165,8 +165,9 @@ impl GPUMetrics {
     #[cfg(feature = "cuda")]
     fn update_cuda_metrics(&mut self) -> Result<()> {
         if let Some(device) = &self.cuda_device {
-            // Get memory info from CUDA
-            let (free, total) = device.free_and_total_memory()?;
+            // Get memory info from CUDA using the correct methods
+            let free = device.free_memory()?;
+            let total = device.total_memory()?;
 
             // Convert to MB
             let free_mb = free as f64 / 1024.0 / 1024.0;
