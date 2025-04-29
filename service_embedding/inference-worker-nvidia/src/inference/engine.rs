@@ -1,6 +1,5 @@
 // inference_worker/src/inference/engine.rs
 use anyhow::Result;
-use candle_core::Device;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -49,7 +48,7 @@ pub struct InferenceEngine {
     active_batches: HashMap<Uuid, PendingBatch>,
     batch_queue: Vec<PendingBatch>,
     capabilities: WorkerCapabilities,
-    device: Device,
+    device: String,
     current_load: f32,
     active_jobs: usize,
     pub circuit_open: bool,
@@ -71,12 +70,12 @@ impl InferenceEngine {
         gpu_metrics: Arc<Mutex<GPUMetrics>>,
     ) -> Self {
         // Get best available device
-        let device = get_best_device().unwrap_or(Device::Cpu);
+        let device = get_best_device().unwrap_or_else(|_| "cpu".to_string());
 
         // Update capabilities based on available hardware
         let mut updated_capabilities = capabilities;
-        updated_capabilities.supports_cuda = device.is_cuda();
-        updated_capabilities.supports_metal = device.is_metal();
+        updated_capabilities.supports_cuda = device == "cuda";
+        updated_capabilities.supports_metal = false; // tch-rs doesn't support Metal directly
 
         Self {
             model_id,
@@ -99,8 +98,6 @@ impl InferenceEngine {
     pub fn get_batch_processor(&self) -> Option<&Arc<BatchProcessor>> {
         self.batch_processor.as_ref()
     }
-
-    // Initialize method to pass GPU metrics to the model
 
     pub async fn initialize(&mut self) -> Result<()> {
         info!("Initializing BGE model from {}", self.model_path);

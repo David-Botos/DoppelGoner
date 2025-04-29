@@ -40,12 +40,9 @@ tracing-appender = "0.2"
 metrics = "0.21"
 metrics-exporter-prometheus = "0.12"
 
-# ML dependencies
-candle-core = { version = "0.8.4" }
-candle-nn = "0.8.4"
-candle-transformers = "0.8.4"
+# ML dependencies - replaced Candle with tch
+tch = "0.13.0"
 tokenizers = "0.13.4"
-safetensors = "0.3.1"
 
 # Testing and Benchmarking
 [dev-dependencies]
@@ -56,9 +53,8 @@ tower = { version = "0.4", features = ["util"] }
 
 # Features configuration
 [features]
-default = ["cuda"]  # Default to cuda on NVIDIA
-cuda = ["candle-core/cuda"]
-metal = ["candle-core/metal", "candle-core/accelerate"]
+default = ["cuda"]
+cuda = ["tch/cuda"]
 
 [profile.release]
 lto = true

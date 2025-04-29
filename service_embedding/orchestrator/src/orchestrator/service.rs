@@ -108,7 +108,7 @@ impl OrchestratorService {
         .bind(batch_limit)
         .fetch_one(&self.pool)
         .await?;
-    
+
         Ok(count)
     }
 

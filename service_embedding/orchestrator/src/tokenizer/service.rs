@@ -196,19 +196,19 @@ impl ServiceTokenizer {
 
     fn apply_truncation(&self, text: String, strategy: &TruncationStrategy) -> Result<String> {
         let approx_token_count = self.count_tokens(&text);
-    
+
         // If under max tokens, no truncation needed
         if approx_token_count <= self.config.max_tokens {
             return Ok(text);
         }
-    
+
         // Special case for extremely long content (more than 5x max tokens)
         // This ensures very long content is aggressively truncated
         if approx_token_count > self.config.max_tokens * 5 {
             // For extremely long content, use more aggressive truncation
             return self.aggressive_truncation(text);
         }
-    
+
         // Apply regular truncation strategies
         match strategy {
             TruncationStrategy::Simple => {
@@ -233,47 +233,50 @@ impl ServiceTokenizer {
             }
         }
     }
-    
+
     // Add a new aggressive_truncation method:
     fn aggressive_truncation(&self, text: String) -> Result<String> {
         let max_tokens = self.config.max_tokens;
-        
+
         // Extract high-priority information using regex patterns
         lazy_static! {
             static ref SERVICE_RE: Regex = Regex::new(r"Service:\s*(.+?)\n\n").unwrap();
             static ref CATEGORIES_RE: Regex = Regex::new(r"Categories:\s*(.+?)\n\n").unwrap();
         }
-        
+
         // Get service name and categories
         let service_name = SERVICE_RE
             .captures(&text)
             .map(|c| c[1].to_string())
             .unwrap_or_default();
-        
+
         let categories = CATEGORIES_RE
             .captures(&text)
             .map(|c| c[1].to_string())
             .unwrap_or_default();
-        
+
         // Create high-priority section
         let mut result = format!("Service: {}\n\n", service_name);
-        
+
         if !categories.is_empty() {
             // Add only the first 2-3 categories at most
             let category_list: Vec<&str> = categories.split(", ").collect();
             let limited_categories = if category_list.len() > 3 {
-                format!("{}, {}, {}...", category_list[0], category_list[1], category_list[2])
+                format!(
+                    "{}, {}, {}...",
+                    category_list[0], category_list[1], category_list[2]
+                )
             } else {
                 categories.clone()
             };
-            
+
             result.push_str(&format!("Categories: {}\n\n", limited_categories));
         }
-        
+
         // Add brief description if we have room
         let tokens_so_far = self.count_tokens(&result);
         let tokens_remaining = max_tokens.saturating_sub(tokens_so_far);
-        
+
         if tokens_remaining > 20 {
             // Add a very brief description (first sentence only)
             let description_re = Regex::new(r"Description:\s*(.+?)(?:\.|;|!|\?)").unwrap();
@@ -284,16 +287,16 @@ impl ServiceTokenizer {
                 }
             }
         }
-        
+
         // Verify final token count and truncate further if needed
         let final_tokens = self.count_tokens(&result);
         if final_tokens > max_tokens {
             return self.simple_truncation(result);
         }
-        
+
         Ok(result)
     }
-    
+
     /// Simple truncation that cuts off text at max tokens
     fn simple_truncation(&self, text: String) -> Result<String> {
         let max_tokens = self.config.max_tokens;

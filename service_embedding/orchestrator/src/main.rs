@@ -84,6 +84,17 @@ async fn main() -> anyhow::Result<()> {
         .connect(&db_url)
         .await?;
 
+    let load_balance_strategy = match std::env::var("LOAD_BALANCE_STRATEGY")
+        .unwrap_or_else(|_| "LeastLoaded".to_string())
+        .as_str()
+    {
+        "RoundRobin" => LoadBalanceStrategy::RoundRobin,
+        "Random" => LoadBalanceStrategy::Random,
+        "FastestResponse" => LoadBalanceStrategy::FastestResponse,
+        "OptimalBatchSize" => LoadBalanceStrategy::OptimalBatchSize,
+        _ => LoadBalanceStrategy::LeastLoaded,
+    };
+
     // Initialize worker client
     let worker_config = WorkerClientConfig {
         api_key: api_key.clone(),
@@ -94,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
         circuit_breaker_reset_secs: 300,
         stale_worker_threshold_secs: 60,
         worker_discovery_interval_secs: 30,
-        load_balance_strategy: LoadBalanceStrategy::LeastLoaded,
+        load_balance_strategy: load_balance_strategy,
     };
 
     info!("Initializing worker client");

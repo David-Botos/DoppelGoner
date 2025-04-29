@@ -24,17 +24,14 @@ async fn detect_hardware_capabilities() -> anyhow::Result<WorkerCapabilities> {
     let mut gpu_metrics = GPUMetrics::new();
 
     // Determine GPU type and memory
-    let supports_cuda = device.is_cuda();
-    let supports_metal = device.is_metal();
+    let supports_cuda = device == "cuda";
+    let supports_metal = false; // tch-rs doesn't support Metal directly
 
     let mut gpu_type = None;
     let mut gpu_memory_mb = None;
 
     if supports_cuda {
         gpu_type = Some("NVIDIA GPU".to_string());
-        gpu_memory_mb = Some(gpu_metrics.get_memory_total_mb() as u64);
-    } else if supports_metal {
-        gpu_type = Some("Apple Silicon GPU".to_string());
         gpu_memory_mb = Some(gpu_metrics.get_memory_total_mb() as u64);
     }
 

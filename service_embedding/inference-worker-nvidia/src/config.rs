@@ -39,9 +39,6 @@ pub struct AppConfig {
 
 impl AppConfig {
     /// Load configuration from environment variables with sensible defaults
-    // inference_worker/src/config.rs
-    // Update the from_env method to include safe defaults for GPU memory limits
-
     pub fn from_env() -> Result<Self> {
         // Create a temporary GPU metrics to detect total memory
         let mut gpu_metrics = crate::telemetry::gpu_metrics::GPUMetrics::new();
@@ -127,21 +124,12 @@ impl AppConfig {
         env::var("ORCHESTRATOR_URL").ok()
     }
 
-    /// Get whether CUDA is enabled
+    /// Check if CUDA is enabled
     pub fn is_cuda_enabled(&self) -> bool {
         #[cfg(feature = "cuda")]
-        return true;
+        return tch::Cuda::is_available();
 
         #[cfg(not(feature = "cuda"))]
-        return false;
-    }
-
-    /// Get whether Metal is enabled
-    pub fn is_metal_enabled(&self) -> bool {
-        #[cfg(feature = "metal")]
-        return true;
-
-        #[cfg(not(feature = "metal"))]
         return false;
     }
 }
