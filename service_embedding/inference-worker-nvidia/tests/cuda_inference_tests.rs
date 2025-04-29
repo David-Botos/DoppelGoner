@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use candle_core::Device;
+use candle_nn::LayerNorm;
 use inference_worker::inference::model::{BgeEmbeddingModel, BgeTokenizer};
 use inference_worker::telemetry::gpu_metrics::GPUMetrics;
 use inference_worker::types::types::{TokenizedDocument, WorkerCapabilities};
