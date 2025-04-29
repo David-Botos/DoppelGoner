@@ -164,30 +164,40 @@ impl GPUMetrics {
 
     #[cfg(feature = "cuda")]
     fn update_cuda_metrics(&mut self) -> Result<()> {
-        if let Some(device) = &self.cuda_device {
-            // Get memory info from CUDA using the correct methods
-            let free = device.free_memory()?;
-            let total = device.total_memory()?;
-
-            // Convert to MB
-            let free_mb = free as f64 / 1024.0 / 1024.0;
-            let total_mb = total as f64 / 1024.0 / 1024.0;
-            let used_mb = total_mb - free_mb;
-
-            self.total_memory_mb = total_mb;
-            self.memory_free_mb = free_mb;
-            self.memory_used_mb = used_mb;
-
-            // Calculate utilization percentages
-            self.memory_utilization = 100.0 * used_mb / total_mb;
-
-            // For CUDA, we'd ideally use NVML for utilization
-            // As a fallback, we'll estimate based on memory usage
-            self.compute_utilization = self.memory_utilization * 0.8; // Rough estimate
-            self.utilization = (self.compute_utilization + self.memory_utilization) / 2.0;
-
-            // Attempt to get more accurate utilization using nvidia-smi
-            // This is a hack but works in many environments
+        if let Some(_device) = &self.cuda_device {
+            // Use nvidia-smi to get memory and utilization info
+            if let Ok(output) = std::process::Command::new("nvidia-smi")
+                .args([
+                    "--query-gpu=memory.total,memory.used,memory.free,utilization.gpu,utilization.memory",
+                    "--format=csv,noheader,nounits",
+                ])
+                .output()
+            {
+                if output.status.success() {
+                    if let Ok(output_str) = String::from_utf8(output.stdout) {
+                        let parts: Vec<&str> = output_str.trim().split(',').collect();
+                        if parts.len() >= 5 {
+                            if let (Ok(total), Ok(used), Ok(free), Ok(gpu_util), Ok(mem_util)) = (
+                                parts[0].trim().parse::<f64>(),
+                                parts[1].trim().parse::<f64>(),
+                                parts[2].trim().parse::<f64>(),
+                                parts[3].trim().parse::<f64>(),
+                                parts[4].trim().parse::<f64>(),
+                            ) {
+                                self.total_memory_mb = total;
+                                self.memory_used_mb = used;
+                                self.memory_free_mb = free;
+                                self.compute_utilization = gpu_util;
+                                self.memory_utilization = mem_util;
+                                self.utilization = (gpu_util + mem_util) / 2.0;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Fallback to just getting utilization if we couldn't get full memory info
             if let Ok(output) = std::process::Command::new("nvidia-smi")
                 .args([
                     "--query-gpu=utilization.gpu,utilization.memory",
@@ -210,14 +220,18 @@ impl GPUMetrics {
                     }
                 }
             }
-        } else {
-            // Fallback values when CUDA device is not available
-            self.total_memory_mb = 16384.0;
-            self.memory_used_mb = 4096.0;
-            self.memory_free_mb = 12288.0;
-            self.utilization = 25.0;
-            self.compute_utilization = 30.0;
-            self.memory_utilization = 20.0;
+        }
+        
+        // If we couldn't get info from nvidia-smi, use fallback values
+        // This happens if either nvidia-smi is not available or we couldn't parse its output
+        if self.total_memory_mb == 0.0 {
+            debug!("Using fallback values for CUDA metrics (nvidia-smi failed)");
+            self.total_memory_mb = 16384.0;  // 16GB as default
+            self.memory_used_mb = 4096.0;    // 4GB as default usage
+            self.memory_free_mb = 12288.0;   // Remaining memory
+            self.utilization = 25.0;         // 25% default utilization
+            self.compute_utilization = 30.0; // 30% default compute util
+            self.memory_utilization = 20.0;  // 20% default memory util
         }
 
         Ok(())
