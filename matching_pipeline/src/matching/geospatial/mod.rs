@@ -6,25 +6,27 @@ mod config;
 mod core;
 mod database;
 mod postgis;
+mod service_utils;
 mod utils;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use log::{info, warn};
+use service_utils::SERVICE_SIMILARITY_THRESHOLD;
 use std::collections::HashSet;
 use std::time::Instant;
 
 use crate::db::PgPool;
 use crate::models::{MatchMethodType, MatchResult};
-use crate::results::{GeospatialMatchResult, MatchMethodStats};
+use crate::results::{EnhancedGeospatialMatchResult, MatchMethodStats};
 
 // Constants for batch processing
 const BATCH_SIZE: usize = 50; // Process 50 locations per batch
 const MAX_ERRORS_BEFORE_ABORT: usize = 3; // Maximum number of errors before aborting
 
 /// Main entry point for geospatial matching
-pub async fn find_matches(pool: &PgPool) -> Result<GeospatialMatchResult> {
-    info!("Starting geospatial matching...");
+pub async fn find_matches(pool: &PgPool) -> Result<EnhancedGeospatialMatchResult> {
+    info!("Starting geospatial matching with semantic service similarity check...");
     let start_time = Instant::now();
 
     let conn = pool
@@ -46,15 +48,18 @@ pub async fn find_matches(pool: &PgPool) -> Result<GeospatialMatchResult> {
 
     if location_results.locations.is_empty() {
         info!("No new locations to process, finishing early");
-        return Ok(GeospatialMatchResult {
+        return Ok(EnhancedGeospatialMatchResult {
             groups_created: 0,
             stats: MatchMethodStats {
-                method_type: MatchMethodType::Geospatial,
+                method_type: MatchMethodType::Custom("geospatial_with_service_similarity".to_string()),
                 groups_created: 0,
                 entities_matched: 0,
                 avg_confidence: 0.0,
                 avg_group_size: 0.0,
             },
+            rejected_by_service_similarity: 0,
+            avg_service_similarity: 0.0,
+            service_similarity_threshold: SERVICE_SIMILARITY_THRESHOLD,
         });
     }
 
@@ -90,10 +95,14 @@ pub async fn find_matches(pool: &PgPool) -> Result<GeospatialMatchResult> {
     };
     let mut error_count = 0;
 
-    // Track statistics for reporting
-    let mut confidence_scores = Vec::new();
-    let mut group_sizes = Vec::new();
-    let mut total_entities_matched = 0;
+// Track statistics for reporting
+let mut confidence_scores = Vec::new();
+let mut group_sizes = Vec::new();
+let mut total_entities_matched = 0;
+
+// Track service similarity statistics
+let mut service_similarity_scores = Vec::new();
+let mut rejected_by_service_similarity = 0;
 
     // Process matching to existing groups first (all batches)
     if !group_results.groups.is_empty() {
@@ -171,6 +180,11 @@ pub async fn find_matches(pool: &PgPool) -> Result<GeospatialMatchResult> {
                         group_sizes.push(avg_group_size);
                         total_entities_matched += entities_in_batch;
                     }
+                    
+// Collect service similarity statistics
+let batch_service_stats = collect_service_similarity_stats(&tx, &batch_result).await?;
+rejected_by_service_similarity += batch_service_stats.0;
+service_similarity_scores.extend(batch_service_stats.1);
 
                     // Commit this batch transaction
                     tx.commit()
@@ -269,6 +283,11 @@ pub async fn find_matches(pool: &PgPool) -> Result<GeospatialMatchResult> {
                         group_sizes.push(avg_group_size);
                         total_entities_matched += entities_in_batch;
                     }
+                    
+// Collect service similarity statistics
+let batch_service_stats = collect_service_similarity_stats(&tx, &batch_result).await?;
+rejected_by_service_similarity += batch_service_stats.0;
+service_similarity_scores.extend(batch_service_stats.1);
 
                     // Commit this batch transaction
                     tx.commit()
@@ -310,38 +329,53 @@ pub async fn find_matches(pool: &PgPool) -> Result<GeospatialMatchResult> {
         }
     }
 
-    // Calculate average confidence score and group size
-    let avg_confidence: f64 = if !confidence_scores.is_empty() {
-        (confidence_scores.iter().sum::<f64>() / confidence_scores.len() as f64).into()
-    } else {
-        0.8 // Default confidence for geospatial matching
-    };
+// Calculate average confidence score and group size
+let avg_confidence: f64 = if !confidence_scores.is_empty() {
+    (confidence_scores.iter().sum::<f64>() / confidence_scores.len() as f64).into()
+} else {
+    0.8 // Default confidence for geospatial matching
+};
 
-    let avg_group_size: f64 = if !group_sizes.is_empty() {
-        (group_sizes.iter().sum::<f64>() / group_sizes.len() as f64).into()
-    } else {
-        0.0
-    };
+let avg_group_size: f64 = if !group_sizes.is_empty() {
+    (group_sizes.iter().sum::<f64>() / group_sizes.len() as f64).into()
+} else {
+    0.0
+};
 
-    // Create method stats
-    let method_stats = MatchMethodStats {
-        method_type: MatchMethodType::Geospatial,
-        groups_created: overall_result.groups_created,
-        entities_matched: total_entities_matched,
-        avg_confidence,
-        avg_group_size,
-    };
+// Calculate average service similarity
+let avg_service_similarity: f64 = if !service_similarity_scores.is_empty() {
+    service_similarity_scores.iter().sum::<f64>() / service_similarity_scores.len() as f64
+} else {
+    0.0
+};
 
-    let elapsed = start_time.elapsed();
-    info!(
-        "Geospatial matching complete: created {} new entity groups and added {} entities to existing groups in {:.2?}",
-        overall_result.groups_created, overall_result.entities_added, elapsed
-    );
+// Create method stats
+let method_stats = MatchMethodStats {
+    method_type: MatchMethodType::Custom("geospatial_with_service_similarity".to_string()),
+    groups_created: overall_result.groups_created,
+    entities_matched: total_entities_matched,
+    avg_confidence,
+    avg_group_size,
+};
 
-    Ok(GeospatialMatchResult {
-        groups_created: overall_result.groups_created,
-        stats: method_stats,
-    })
+let elapsed = start_time.elapsed();
+info!(
+    "Geospatial matching with service similarity complete: created {} new entity groups and added {} entities to existing groups in {:.2?}",
+    overall_result.groups_created, overall_result.entities_added, elapsed
+);
+
+info!(
+    "Service similarity statistics: {} potential matches rejected, average similarity score: {:.4}",
+    rejected_by_service_similarity, avg_service_similarity
+);
+
+Ok(EnhancedGeospatialMatchResult {
+    groups_created: overall_result.groups_created,
+    stats: method_stats,
+    rejected_by_service_similarity,
+    avg_service_similarity,
+    service_similarity_threshold: SERVICE_SIMILARITY_THRESHOLD,
+})
 }
 
 /// Collect statistics for a batch of entities added to existing groups
@@ -405,4 +439,58 @@ async fn collect_new_groups_stats(
         avg_group_size,
         batch_result.entities_added,
     )))
+}
+
+
+/// Collect service similarity statistics for a batch
+/// Returns (rejected_count, similarity_scores)
+async fn collect_service_similarity_stats(
+    tx: &tokio_postgres::Transaction<'_>,
+    batch_result: &MatchResult,
+) -> Result<(usize, Vec<f64>)> {
+    // Query for recorded service similarity scores
+    // This assumes we've logged them in the database during matching
+    let query = "
+        SELECT 
+            value
+        FROM 
+            matching_metadata
+        WHERE 
+            type = 'service_similarity'
+            AND created_at >= NOW() - INTERVAL '5 minutes'
+    ";
+    
+    let rows = match tx.query(query, &[]).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("Failed to query service similarity scores: {}", e);
+            return Ok((0, Vec::new()));
+        }
+    };
+    
+    let similarity_scores: Vec<f64> = rows
+        .iter()
+        .filter_map(|row| row.get::<_, Option<f64>>("value"))
+        .collect();
+    
+    // Query for rejected matches
+    let reject_query = "
+        SELECT 
+            COUNT(*)
+        FROM 
+            matching_metadata
+        WHERE 
+            type = 'service_similarity_reject'
+            AND created_at >= NOW() - INTERVAL '5 minutes'
+    ";
+    
+    let rejected_count = match tx.query_one(reject_query, &[]).await {
+        Ok(row) => row.get::<_, i64>(0) as usize,
+        Err(e) => {
+            warn!("Failed to query rejected matches: {}", e);
+            0
+        }
+    };
+    
+    Ok((rejected_count, similarity_scores))
 }

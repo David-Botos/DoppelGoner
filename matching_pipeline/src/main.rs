@@ -161,7 +161,7 @@ async fn run_pipeline(
     let service_match_stats = service_matching::semantic_geospatial::match_services(pool)
         .await
         .context("failed to match services")?;
-    stats.total_service_matches = service_match_stats.groups_created; 
+    stats.total_service_matches = service_match_stats.groups_created;
     stats.method_stats.push(service_match_stats.stats);
 
     let phase4_duration = phase4_start.elapsed();
@@ -298,27 +298,24 @@ async fn run_matching_pipeline(pool: &PgPool) -> Result<(usize, Vec<MatchMethodS
         (completed_methods as f32 / matching_methods as f32) * 100.0
     );
 
-    // Geospatial matching
+    // Geospatial matching with service similarity checks
     info!(
-        "Running geospatial matching [{}/{}]",
+        "Running enhanced geospatial matching with service similarity [{}/{}]",
         completed_methods + 1,
         matching_methods
     );
     let start = Instant::now();
-    // Since we haven't implemented the enhanced geospatial matching yet, we'll use the old version
-    // and create a placeholder stats object
     let geospatial_match_result = matching::geospatial::find_matches(pool)
         .await
         .context("Failed during geospatial matching")?;
     total_groups += geospatial_match_result.groups_created;
     completed_methods += 1;
 
-    // Add placeholder geospatial stats
-    // In a complete implementation, geospatial matching would return GeospatialMatchResult
+    // Add the geospatial stats
     method_stats.push(geospatial_match_result.stats);
 
     info!(
-        "Geospatial matching created {} groups in {:.2?} [{}/{}] ({:.0}%)",
+        "Enhanced geospatial matching created {} groups in {:.2?} [{}/{}] ({:.0}%)",
         geospatial_match_result.groups_created,
         start.elapsed(),
         completed_methods,

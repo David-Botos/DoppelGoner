@@ -107,11 +107,19 @@ pub struct AddressMatchResult {
 }
 
 /// Result struct for geospatial matching process
-pub struct GeospatialMatchResult {
-    /// Number of new groups created
+// pub struct GeospatialMatchResult {
+//     /// Number of new groups created
+//     pub groups_created: usize,
+//     /// Detailed statistics for geospatial matching
+//     pub stats: MatchMethodStats,
+// }
+
+pub struct EnhancedGeospatialMatchResult {
     pub groups_created: usize,
-    /// Detailed statistics for geospatial matching
     pub stats: MatchMethodStats,
+    pub rejected_by_service_similarity: usize,
+    pub avg_service_similarity: f64,
+    pub service_similarity_threshold: f64,
 }
 
 /// Collect matching method statistics from the database

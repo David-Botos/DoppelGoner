@@ -269,9 +269,92 @@ pub async fn match_to_existing_groups(
                         "Entity {} matched to group {} with distance {}m (threshold: {}m, confidence: {})",
                         new_entity_id.0, group_id, min_distance, threshold, confidence
                     );
-                    matched_group =
-                        Some((group_id.clone(), method_id.clone(), threshold, confidence));
-                    break;
+
+                    // Get sample of entities from the group to compare services
+                    let group_entity_ids =
+                        if let Some(group_entities) = group_results.group_entities.get(group_id) {
+                            group_entities
+                                .iter()
+                                .map(|(entity_id, _, _)| entity_id.clone())
+                                .collect::<Vec<_>>()
+                        } else {
+                            vec![]
+                        };
+
+                    // Sample a few entities from the group for comparison (max 3 to keep performance reasonable)
+                    let entity_sample =
+                        super::service_utils::sample_group_entities(&group_entity_ids, 3);
+
+                    if entity_sample.is_empty() {
+                        debug!(
+                            "No entities found in group {} for service comparison, proceeding with match based on distance only",
+                            group_id
+                        );
+                        matched_group =
+                            Some((group_id.clone(), method_id.clone(), threshold, confidence));
+                        break;
+                    }
+
+                    // Check if services are semantically similar
+                    let mut total_similarity = 0.0;
+                    let mut valid_comparisons = 0;
+
+                    for group_entity_id in &entity_sample {
+                        match super::service_utils::compare_entity_services(
+                            tx,
+                            new_entity_id,
+                            group_entity_id,
+                        )
+                        .await
+                        {
+                            Ok(similarity) => {
+                                debug!(
+                                    "Service similarity between entity {} and group entity {}: {:.4}",
+                                    new_entity_id.0, group_entity_id.0, similarity
+                                );
+                                total_similarity += similarity;
+                                valid_comparisons += 1;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to compare services for entities {} and {}: {}",
+                                    new_entity_id.0, group_entity_id.0, e
+                                );
+                            }
+                        }
+                    }
+
+                    // Calculate average similarity if any valid comparisons were made
+                    if valid_comparisons > 0 {
+                        let avg_similarity = total_similarity / valid_comparisons as f64;
+
+                        // Only match if services are similar enough
+                        if avg_similarity >= super::service_utils::SERVICE_SIMILARITY_THRESHOLD {
+                            debug!(
+                                "Services of entity {} are similar to those in group {} (score: {:.4}), proceeding with match",
+                                new_entity_id.0, group_id, avg_similarity
+                            );
+                            matched_group =
+                                Some((group_id.clone(), method_id.clone(), threshold, confidence));
+                            break;
+                        } else {
+                            debug!(
+                                "Services of entity {} are not similar enough to those in group {} (score: {:.4}), skipping despite geographic proximity",
+                                new_entity_id.0, group_id, avg_similarity
+                            );
+                            // Continue to next group, as this one doesn't have similar services
+                            continue;
+                        }
+                    } else {
+                        // If no valid service comparisons, proceed with match based on distance only
+                        debug!(
+                            "No valid service comparisons made between entity {} and group {}, proceeding with match based on distance only",
+                            new_entity_id.0, group_id
+                        );
+                        matched_group =
+                            Some((group_id.clone(), method_id.clone(), threshold, confidence));
+                        break;
+                    }
                 }
             }
 
@@ -688,13 +771,83 @@ async fn create_groups_with_postgis(
                 cluster.centroid.latitude,
                 cluster.centroid.longitude
             );
+            
+            // Verify that entities in the cluster have semantically similar services
+            debug!("Verifying service similarity among {} entities in cluster", cluster.entity_ids.len());
+            
+            // Convert string IDs to EntityId structs for the filtering
+            let entity_ids: Vec<EntityId> = cluster.entity_ids.iter()
+                .map(|id| EntityId(id.clone()))
+                .collect();
+            
+            // Create a new filtered list based on service similarity
+            let mut filtered_entity_ids = Vec::new();
+            let mut entity_similarity_matrix = HashMap::new();
+            
+            // Only process up to 5 entities for performance reasons
+            let sample_size = 5.min(entity_ids.len());
+            
+            // First entity is our reference point
+            if !entity_ids.is_empty() {
+                filtered_entity_ids.push(entity_ids[0].clone());
+                
+                // Compare other entities to the first one
+                for i in 1..sample_size {
+                    let entity_id = &entity_ids[i];
+                    let similarity = match super::service_utils::compare_entity_services(tx, &entity_ids[0], entity_id).await {
+                        Ok(sim) => {
+                            debug!(
+                                "Service similarity between entities {} and {}: {:.4}",
+                                entity_ids[0].0, entity_id.0, sim
+                            );
+                            sim
+                        },
+                        Err(e) => {
+                            warn!(
+                                "Failed to compare services for entities {} and {}: {}. Defaulting to neutral similarity.",
+                                entity_ids[0].0, entity_id.0, e
+                            );
+                            0.5 // Default if comparison fails
+                        }
+                    };
+                    
+                    entity_similarity_matrix.insert(entity_id.clone(), similarity);
+                    
+                    // Only add entities with similar enough services
+                    if similarity >= super::service_utils::SERVICE_SIMILARITY_THRESHOLD {
+                        filtered_entity_ids.push(entity_id.clone());
+                    } else {
+                        debug!(
+                            "Entity {} excluded from cluster due to low service similarity ({:.4})",
+                            entity_id.0, similarity
+                        );
+                    }
+                }
+                
+                // If we have too few entities after filtering, skip creating this group
+                if filtered_entity_ids.len() < 2 {
+                    debug!(
+                        "Cluster {}/{} has insufficient entities with similar services after filtering, skipping",
+                        cluster_idx + 1, clusters.len()
+                    );
+                    continue;
+                }
+                
+                debug!(
+                    "Cluster {}/{} has {} entities with similar services after filtering",
+                    cluster_idx + 1, clusters.len(), filtered_entity_ids.len()
+                );
+            } else {
+                debug!("Cluster {}/{} has no entities, skipping", cluster_idx + 1, clusters.len());
+                continue;
+            }
 
             let group_id = EntityGroupId(postgis::generate_id());
             debug!("Creating new group with ID: {}", group_id.0);
 
             // Insert the group
             debug!(
-                "Inserting group {} with description 'Geospatial match within {}m'",
+                "Inserting group {} with description 'Geospatial match within {}m with similar services'",
                 group_id.0, threshold
             );
 
@@ -702,11 +855,11 @@ async fn create_groups_with_postgis(
                 &db_stmts.group_stmt,
                 &[
                     &group_id.0,
-                    &format!("Geospatial match within {}m", threshold),
+                    &format!("Geospatial match within {}m with similar services", threshold),
                     &now,
                     &now,
                     &confidence,
-                    &(cluster.entity_count as i32),
+                    &(filtered_entity_ids.len() as i32),
                 ],
             )
             .await
@@ -741,7 +894,7 @@ async fn create_groups_with_postgis(
 
                 if let Some(&(_, lat, lon)) = candidate_locations
                     .iter()
-                    .find(|(e, _, _)| e.0 == *entity_id_str)
+                    .find(|(e, _, _)| e == &entity_id)
                 {
                     let distance = calculate_haversine_distance(
                         lat,
@@ -1025,8 +1178,43 @@ async fn create_groups_with_haversine(
                         "Found nearby entity {} within {}m (actual: {}m)",
                         entity_id2.0, threshold, distance
                     );
-                    nearby_entities_map.insert(entity_id2.clone(), (*lat2, *lon2, distance));
-                    total_matches_found += 1;
+
+                    // Check if services are semantically similar
+                    let service_similarity = match super::service_utils::compare_entity_services(
+                        tx, entity_id1, entity_id2,
+                    )
+                    .await
+                    {
+                        Ok(similarity) => {
+                            debug!(
+                                "Service similarity between entities {} and {}: {:.4}",
+                                entity_id1.0, entity_id2.0, similarity
+                            );
+                            similarity
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to compare services for entities {} and {}: {}. Defaulting to neutral similarity.",
+                                entity_id1.0, entity_id2.0, e
+                            );
+                            0.5 // Default to moderate similarity if comparison fails
+                        }
+                    };
+
+                    // Only group entities if their services are similar enough
+                    if service_similarity >= super::service_utils::SERVICE_SIMILARITY_THRESHOLD {
+                        debug!(
+                            "Services of entities {} and {} are similar (score: {:.4}), adding to potential group",
+                            entity_id1.0, entity_id2.0, service_similarity
+                        );
+                        nearby_entities_map.insert(entity_id2.clone(), (*lat2, *lon2, distance));
+                        total_matches_found += 1;
+                    } else {
+                        debug!(
+                            "Services of entities {} and {} are not similar enough (score: {:.4}), not grouping despite geographic proximity",
+                            entity_id1.0, entity_id2.0, service_similarity
+                        );
+                    }
                 }
             }
 
