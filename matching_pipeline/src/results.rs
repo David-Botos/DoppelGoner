@@ -68,6 +68,12 @@ pub struct PipelineStats {
     pub service_stats: Option<ServiceMatchStats>,
 }
 
+// Result struct for service matching process
+pub struct ServiceMatchResult {
+    pub groups_created: usize,
+    pub stats: MatchMethodStats,
+}
+
 /// Result struct for email matching process
 pub struct EmailMatchResult {
     /// Number of new groups created

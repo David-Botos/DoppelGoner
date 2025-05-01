@@ -17,7 +17,7 @@ mod entity_organizations;
 mod matching;
 mod models;
 mod results;
-mod services;
+mod service_matching;
 
 use db::PgPool;
 
@@ -155,25 +155,18 @@ async fn run_pipeline(
     );
     info!("Pipeline progress: [3/4] phases (75%)");
 
-    // Phase 4: Generate embeddings
-    info!("Phase 4: Embed services");
+    // Phase 4: Service matching
+    info!("Phase 4: Service matching");
     let phase4_start = Instant::now();
-    services::embed_services::embed_services_m2_optimized(pool)
+    let service_match_stats = service_matching::semantic_geospatial::match_services(pool)
         .await
-        .context("Failed to embed services")?;
-    let phase4_duration = phase4_start.elapsed();
-    phase_times.insert("embed_services".to_string(), phase4_duration);
-    info!("Embedded services in {:.2?}", phase4_duration);
+        .context("failed to match services")?;
+    stats.total_service_matches = service_match_stats.groups_created; 
+    stats.method_stats.push(service_match_stats.stats);
 
-    // Phase 5: Service matching
-    info!("Phase 5: Service matching");
-    let phase5_start = Instant::now();
-    stats.total_service_matches = services::match_services::find_service_matches(pool)
-        .await
-        .context("Failed to find service matches")?;
-    let phase5_duration = phase5_start.elapsed();
-    phase_times.insert("service_matching".to_string(), phase5_duration);
-    stats.service_matching_time = phase5_duration.as_secs_f64();
+    let phase4_duration = phase4_start.elapsed();
+    phase_times.insert("service_matching".to_string(), phase4_duration);
+    stats.service_matching_time = phase4_duration.as_secs_f64();
 
     // Calculate total processing time
     stats.total_processing_time = stats.entity_processing_time

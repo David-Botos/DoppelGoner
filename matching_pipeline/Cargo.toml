@@ -72,18 +72,6 @@ half = "2.6.0"
 name = "dedupe"
 path = "src/main.rs"
 
-[[bin]]
-name = "run_service_embeddings"
-path = "src/bin/run_service_embeddings.rs"
-
-[[bin]]
-name = "simple_embedding_test"
-path = "src/bin/simple_embedding_test.rs"
-
-[[bin]]
-name = "debug_db_status"
-path = "src/bin/debug_db_status.rs"
-
 [lib]
 name = "dedupe_lib"
 path = "src/lib.rs"
