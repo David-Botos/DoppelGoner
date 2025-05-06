@@ -150,6 +150,9 @@ pub enum MatchMethodType {
 
     /// Matching based on geographic proximity
     Geospatial,
+    
+    /// Matching based on organization name similarity
+    Name,
 
     /// Custom matcher type (for extensibility)
     Custom(String),
@@ -164,6 +167,7 @@ impl MatchMethodType {
             Self::Email => "email",
             Self::Address => "address",
             Self::Geospatial => "geospatial",
+            Self::Name => "name",
             Self::Custom(s) => s.as_str(),
         }
     }
@@ -176,6 +180,7 @@ impl MatchMethodType {
             "email" => Self::Email,
             "address" => Self::Address,
             "geospatial" => Self::Geospatial,
+            "name" => Self::Name,
             _ => Self::Custom(s.to_string()),
         }
     }
@@ -315,6 +320,7 @@ pub struct ServiceMatch {
 ///
 /// This is a strongly-typed representation of the JSONB data
 /// stored in the group_method.match_values column
+/// Union type for different kinds of match values
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "values")]
 pub enum MatchValues {
@@ -332,6 +338,9 @@ pub enum MatchValues {
 
     /// Geospatial matching values
     Geospatial(Vec<GeospatialMatchValue>),
+    
+    /// Name matching values
+    Name(Vec<NameMatchValue>),
 
     /// Generic string matching values (for extensibility)
     Generic(Vec<String>),
@@ -412,6 +421,28 @@ pub struct GeospatialMatchValue {
 
     /// Source entity ID this location belongs to
     pub entity_id: EntityId,
+}
+
+/// Represents a matched organization name
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NameMatchValue {
+    /// Original name as found in the data
+    pub original: String,
+    
+    /// Normalized name (the basis for matching)
+    pub normalized: String,
+    
+    /// Match score (fuzzy or semantic similarity)
+    pub similarity_score: f32,
+    
+    /// Type of matching used (fuzzy, semantic, or combined)
+    pub match_type: String,
+    
+    /// Source entity ID this name belongs to
+    pub entity_id: EntityId,
+    
+    /// The entity ID that this entity matched with
+    pub matched_entity_id: Option<EntityId>,
 }
 
 /// Struct to hold location information for unprocessed entities

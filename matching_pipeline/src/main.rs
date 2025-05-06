@@ -203,7 +203,7 @@ async fn identify_entities(pool: &PgPool) -> Result<usize> {
 async fn run_matching_pipeline(pool: &PgPool) -> Result<(usize, Vec<MatchMethodStats>)> {
     let mut total_groups = 0;
     let mut method_stats = Vec::new();
-    let matching_methods = 5; // Total number of matching methods
+    let matching_methods = 6; // Total number of matching methods
     let mut completed_methods = 0;
 
     // Email matching (highest precision)
@@ -292,6 +292,31 @@ async fn run_matching_pipeline(pool: &PgPool) -> Result<(usize, Vec<MatchMethodS
     info!(
         "Address matching created {} groups in {:.2?} [{}/{}] ({:.0}%)",
         address_result.groups_created,
+        start.elapsed(),
+        completed_methods,
+        matching_methods,
+        (completed_methods as f32 / matching_methods as f32) * 100.0
+    );
+
+    // Name matching (using both fuzzy and semantic similarity)
+    info!(
+        "Running name-based matching with hybrid approach [{}/{}]",
+        completed_methods + 1,
+        matching_methods
+    );
+    let start = Instant::now();
+    let name_match_result = matching::name::find_matches(pool)
+        .await
+        .context("Failed during name matching")?;
+    total_groups += name_match_result.groups_created;
+    completed_methods += 1;
+
+    // Add the name matching stats
+    method_stats.push(name_match_result.stats);
+
+    info!(
+        "Name matching created {} groups in {:.2?} [{}/{}] ({:.0}%)",
+        name_match_result.groups_created,
         start.elapsed(),
         completed_methods,
         matching_methods,

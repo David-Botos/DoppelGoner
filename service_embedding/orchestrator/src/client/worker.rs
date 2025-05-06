@@ -374,21 +374,23 @@ impl WorkerRegistry {
     async fn get_next_round_robin(&self, workers: &[Worker]) -> Result<Worker> {
         let mut index = self.current_index.lock().await;
         let order = self.worker_order.lock().await;
-
-        // Find the next available worker in our order
+    
         let worker_ids: HashSet<String> = workers.iter().map(|w| w.id.clone()).collect();
         let valid_ordered_ids: Vec<&String> =
             order.iter().filter(|id| worker_ids.contains(*id)).collect();
-
+    
         if valid_ordered_ids.is_empty() {
             return Err(anyhow!("No workers available in round-robin sequence"));
         }
-
-        // Increment index and wrap around
-        *index = (*index + 1) % valid_ordered_ids.len();
-
-        // Find the worker in our original list
-        let selected_id = valid_ordered_ids[*index];
+    
+        // Ensure the index is within bounds before using it
+        *index = *index % valid_ordered_ids.len();
+        
+        // Select first, THEN increment
+        let selected_index = *index;
+        *index = (selected_index + 1) % valid_ordered_ids.len();
+    
+        let selected_id = valid_ordered_ids[selected_index];
         workers
             .iter()
             .find(|w| w.id == *selected_id)

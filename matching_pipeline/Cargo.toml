@@ -67,6 +67,12 @@ petgraph = "0.6.5"
 # Override half crate with specific version
 half = "2.6.0"
 
+# For string similarity calculations
+strsim = "0.10.0"
+
+# For regular expressions in name normalization
+regex = "1.7.0"
+
 # Define multiple binary targets
 [[bin]]
 name = "dedupe"

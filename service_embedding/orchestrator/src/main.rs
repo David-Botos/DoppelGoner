@@ -84,7 +84,14 @@ async fn main() -> anyhow::Result<()> {
         .connect(&db_url)
         .await?;
 
-    let load_balance_strategy = match std::env::var("LOAD_BALANCE_STRATEGY")
+    let load_strategy_env = std::env::var("LOAD_BALANCE_STRATEGY");
+
+    info!(
+        "Load balance strategy: {}",
+        load_strategy_env.clone().unwrap()
+    );
+
+    let load_balance_strategy = match load_strategy_env
         .unwrap_or_else(|_| "LeastLoaded".to_string())
         .as_str()
     {

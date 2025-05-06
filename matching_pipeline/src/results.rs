@@ -122,6 +122,14 @@ pub struct EnhancedGeospatialMatchResult {
     pub service_similarity_threshold: f64,
 }
 
+/// Result struct for name matching process
+pub struct NameMatchResult {
+    /// Number of new groups created
+    pub groups_created: usize,
+    /// Detailed statistics for name matching
+    pub stats: MatchMethodStats,
+}
+
 /// Collect matching method statistics from the database
 pub async fn collect_method_stats(pool: &PgPool) -> Result<Vec<MatchMethodStats>> {
     let conn = pool.get().await.context("Failed to get DB connection")?;
