@@ -1,19 +1,31 @@
 // src/matching/address.rs
 use anyhow::{Context, Result};
 use chrono::Utc;
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::db::PgPool;
 use crate::models::{
     AddressMatchValue, EntityGroup, EntityGroupId, EntityId, MatchMethodType, MatchValues,
 };
+use crate::reinforcement;
 use crate::results::{AddressMatchResult, MatchMethodStats};
 
-pub async fn find_matches(pool: &PgPool) -> Result<AddressMatchResult> {
-    info!("Starting address matching...");
+pub async fn find_matches(
+    pool: &PgPool,
+    reinforcement_orchestrator: Option<&Mutex<reinforcement::MatchingOrchestrator>>,
+) -> Result<AddressMatchResult> {
+    info!(
+        "Starting address matching{}...",
+        if reinforcement_orchestrator.is_some() {
+            " with ML guidance"
+        } else {
+            ""
+        }
+    );
     let start_time = Instant::now();
 
     let mut conn = pool
@@ -276,6 +288,10 @@ pub async fn find_matches(pool: &PgPool) -> Result<AddressMatchResult> {
                 Vec::new()
             };
 
+            // Track which entities we've actually added and entity pairs for ML logging
+            let mut entities_added = 0;
+            let mut entity_pairs = Vec::new();
+
             // Add the new entities to the group
             for (entity_id, original) in entity_map {
                 // Add entity to group
@@ -296,11 +312,22 @@ pub async fn find_matches(pool: &PgPool) -> Result<AddressMatchResult> {
                     original,
                     normalized: normalized_address.clone(),
                     match_score: Some(1.0),
-                    entity_id,
+                    entity_id: entity_id.clone(),
                 });
 
-                total_entities_added += 1;
-                total_entities_matched += 1;
+                // Track entity pairs for ML feedback
+                if reinforcement_orchestrator.is_some() {
+                    // Store this entity with each existing entity in the group
+                    // for ML feedback
+                    for existing_value in &address_values {
+                        if existing_value.entity_id != entity_id {
+                            entity_pairs
+                                .push((entity_id.clone(), existing_value.entity_id.clone()));
+                        }
+                    }
+                }
+
+                entities_added += 1;
             }
 
             // Update the match values
@@ -311,6 +338,46 @@ pub async fn find_matches(pool: &PgPool) -> Result<AddressMatchResult> {
             tx.execute(&update_method_stmt, &[&updated_json, &method_id])
                 .await
                 .context("Failed to update match values")?;
+
+            // Log ML feedback for newly formed entity pairs
+            if reinforcement_orchestrator.is_some() {
+                // Get the group confidence score
+                let query = "SELECT confidence_score FROM entity_group WHERE id = $1";
+                let group_confidence: f64 = match tx.query_one(query, &[&group_id]).await {
+                    Ok(row) => row.get("confidence_score"),
+                    Err(e) => {
+                        warn!(
+                            "Failed to get confidence score for group {}: {}",
+                            group_id, e
+                        );
+                        0.95 // Default to 0.95 for address groups if query fails
+                    }
+                };
+
+                // Lock the orchestrator for each call
+                if let Some(orchestrator_ref) = reinforcement_orchestrator {
+                    let mut orchestrator = orchestrator_ref.lock().await;
+
+                    for (entity1, entity2) in entity_pairs {
+                        match orchestrator
+                            .log_match_result(
+                                &MatchMethodType::Address,
+                                group_confidence,
+                                true,
+                                &entity1,
+                                &entity2,
+                            )
+                            .await
+                        {
+                            Ok(_) => (),
+                            Err(e) => warn!("Failed to log match result to ML system: {}", e),
+                        }
+                    }
+                }
+            }
+
+            total_entities_added += entities_added;
+            total_entities_matched += entities_added;
 
             // Query for updated group size to track statistics
             let group_size_row = tx
@@ -338,6 +405,63 @@ pub async fn find_matches(pool: &PgPool) -> Result<AddressMatchResult> {
             let entities: Vec<(EntityId, String)> = entity_map.into_iter().collect();
             let entity_count = entities.len() as i32;
 
+            // Initialize default confidence score - high for address matches
+            let mut confidence_score = 0.95;
+
+            // If the orchestrator is available, use it to get a ML-guided confidence
+            if reinforcement_orchestrator.is_some() {
+                let mut ml_confidence_scores = Vec::new();
+
+                // Sample entity pairs to get confidence scores
+                let max_pairs = 5;
+                let pair_count = std::cmp::min(max_pairs, (entity_count * (entity_count - 1)) / 2);
+                let mut pairs_checked = 0;
+
+                // Check a sample of entity pairs
+                'outer: for i in 0..entities.len() {
+                    for j in (i + 1)..entities.len() {
+                        if pairs_checked >= pair_count {
+                            break 'outer;
+                        }
+
+                        // Get ML recommendation for this pair
+                        if let Some(orchestrator_ref) = reinforcement_orchestrator {
+                            // Lock for each method call
+                            let mut orchestrator = orchestrator_ref.lock().await;
+                            match orchestrator
+                                .select_matching_method(pool, &entities[i].0, &entities[j].0)
+                                .await
+                            {
+                                Ok((method, conf)) => {
+                                    // If address is recommended method, use its confidence
+                                    if matches!(method, MatchMethodType::Address) {
+                                        ml_confidence_scores.push(conf);
+                                    }
+                                }
+                                Err(e) => {
+                                    // Log error but continue
+                                    warn!("Error getting ML confidence: {}", e);
+                                }
+                            }
+                        }
+
+                        pairs_checked += 1;
+                    }
+                }
+
+                // If we got any ML confidence scores, use their average
+                if !ml_confidence_scores.is_empty() {
+                    confidence_score = ml_confidence_scores.iter().sum::<f64>()
+                        / ml_confidence_scores.len() as f64;
+                    info!(
+                        "Using ML-guided confidence {:.4} for address group",
+                        confidence_score
+                    );
+                } else {
+                    info!("Using default confidence 0.95 for address group (no ML guidance)");
+                }
+            }
+
             // Create a new entity group
             let group_id = EntityGroupId(Uuid::new_v4().to_string());
 
@@ -347,7 +471,7 @@ pub async fn find_matches(pool: &PgPool) -> Result<AddressMatchResult> {
                 group_cluster_id: None,
                 created_at: now,
                 updated_at: now,
-                confidence_score: 0.95, // High confidence for exact address matches
+                confidence_score,
                 entity_count,
             };
 
@@ -402,21 +526,57 @@ pub async fn find_matches(pool: &PgPool) -> Result<AddressMatchResult> {
                     &MatchMethodType::Address.as_str(),
                     &format!("Matched on normalized address"),
                     &match_values_json,
-                    &0.95f64,
+                    &confidence_score,
                     &now,
                 ],
             )
             .await
             .context("Failed to insert group method")?;
 
+            // Log ML feedback for the newly created group
+            if reinforcement_orchestrator.is_some() {
+                // For a new group, log feedback for a sample of entity pairs
+                let max_feedback_pairs = 10;
+                let mut pairs_logged = 0;
+
+                if let Some(orchestrator_ref) = reinforcement_orchestrator {
+                    for i in 0..entities.len() {
+                        for j in (i + 1)..entities.len() {
+                            if pairs_logged >= max_feedback_pairs {
+                                break;
+                            }
+
+                            let mut orchestrator = orchestrator_ref.lock().await;
+                            // Address matches are considered correct (true)
+                            match orchestrator
+                                .log_match_result(
+                                    &MatchMethodType::Address,
+                                    confidence_score,
+                                    true,
+                                    &entities[i].0,
+                                    &entities[j].0,
+                                )
+                                .await
+                            {
+                                Ok(_) => pairs_logged += 1,
+                                Err(e) => warn!("Failed to log match result to ML system: {}", e),
+                            }
+                        }
+                    }
+                }
+            }
+
             total_groups_created += 1;
             total_entities_matched += entity_count as usize;
 
             // Address matches have high confidence
-            confidence_scores.push(0.95);
+            confidence_scores.push(confidence_score);
             group_sizes.push(entity_count as f32);
 
-            info!("Created new address group with {} entities", entity_count);
+            info!(
+                "Created new address group with {} entities (confidence: {:.4})",
+                entity_count, confidence_score
+            );
         }
     }
 
@@ -431,7 +591,7 @@ pub async fn find_matches(pool: &PgPool) -> Result<AddressMatchResult> {
     };
 
     let avg_confidence: f64 = if !confidence_scores.is_empty() {
-        (confidence_scores.iter().sum::<f32>() / confidence_scores.len() as f32).into()
+        confidence_scores.iter().sum::<f64>() / confidence_scores.len() as f64
     } else {
         0.0
     };

@@ -1,9 +1,10 @@
 // src/matching/url.rs
 use anyhow::{Context, Result};
 use chrono::Utc;
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
+use tokio::sync::Mutex;
 use url::Url;
 use uuid::Uuid;
 
@@ -11,6 +12,7 @@ use crate::db::PgPool;
 use crate::models::{
     EntityGroup, EntityGroupId, EntityId, MatchMethodType, MatchValues, UrlMatchValue,
 };
+use crate::reinforcement;
 use crate::results::{MatchMethodStats, UrlMatchResult};
 
 /// List of common social media and URL shortening domains to ignore
@@ -56,8 +58,18 @@ fn is_ignored_domain(domain: &str) -> bool {
         .any(|&ignored| domain == ignored || domain.ends_with(&format!(".{}", ignored)))
 }
 
-pub async fn find_matches(pool: &PgPool) -> Result<UrlMatchResult> {
-    info!("Starting URL matching...");
+pub async fn find_matches(
+    pool: &PgPool,
+    reinforcement_orchestrator: Option<&Mutex<reinforcement::MatchingOrchestrator>>,
+) -> Result<UrlMatchResult> {
+    info!(
+        "Starting URL matching{}...",
+        if reinforcement_orchestrator.is_some() {
+            " with ML guidance"
+        } else {
+            ""
+        }
+    );
     let start_time = Instant::now();
 
     let mut conn = pool
@@ -328,6 +340,7 @@ pub async fn find_matches(pool: &PgPool) -> Result<UrlMatchResult> {
 
             // Track which entities we've actually added
             let mut entities_added = 0;
+            let mut entity_pairs = Vec::new();
 
             // Add the new entities to the group
             for (entity_id, (original, domain)) in entity_map {
@@ -348,8 +361,20 @@ pub async fn find_matches(pool: &PgPool) -> Result<UrlMatchResult> {
                 url_values.push(UrlMatchValue {
                     original,
                     domain,
-                    entity_id,
+                    entity_id: entity_id.clone(),
                 });
+
+                // Track entity pairs for ML feedback
+                if reinforcement_orchestrator.is_some() {
+                    // Store this entity with each existing entity in the group
+                    // for ML feedback
+                    for existing_value in &url_values {
+                        if existing_value.entity_id != entity_id {
+                            entity_pairs
+                                .push((entity_id.clone(), existing_value.entity_id.clone()));
+                        }
+                    }
+                }
 
                 entities_added += 1;
             }
@@ -362,6 +387,43 @@ pub async fn find_matches(pool: &PgPool) -> Result<UrlMatchResult> {
             tx.execute(&update_method_stmt, &[&updated_json, &method_id])
                 .await
                 .context("Failed to update match values")?;
+
+            // Log ML feedback for newly formed entity pairs
+            if reinforcement_orchestrator.is_some() {
+                // Get the group confidence score
+                let query = "SELECT confidence_score FROM entity_group WHERE id = $1";
+                let group_confidence: f64 = match tx.query_one(query, &[&group_id]).await {
+                    Ok(row) => row.get("confidence_score"),
+                    Err(e) => {
+                        warn!(
+                            "Failed to get confidence score for group {}: {}",
+                            group_id, e
+                        );
+                        0.9 // Default to 0.9 for URL groups if query fails
+                    }
+                };
+
+                // Lock the orchestrator for each call
+                if let Some(orchestrator_ref) = reinforcement_orchestrator {
+                    let mut orchestrator = orchestrator_ref.lock().await;
+
+                    for (entity1, entity2) in entity_pairs {
+                        match orchestrator
+                            .log_match_result(
+                                &MatchMethodType::Url,
+                                group_confidence,
+                                true,
+                                &entity1,
+                                &entity2,
+                            )
+                            .await
+                        {
+                            Ok(_) => (),
+                            Err(e) => warn!("Failed to log match result to ML system: {}", e),
+                        }
+                    }
+                }
+            }
 
             total_entities_added += entities_added;
             total_entities_matched += entities_added;
@@ -396,6 +458,63 @@ pub async fn find_matches(pool: &PgPool) -> Result<UrlMatchResult> {
 
             let entity_count = entities.len() as i32;
 
+            // Initialize default confidence
+            let mut confidence_score = 0.9; // Default high confidence for domain matches
+
+            // If the orchestrator is available, use it to get a ML-guided confidence
+            if reinforcement_orchestrator.is_some() {
+                let mut ml_confidence_scores = Vec::new();
+
+                // Sample entity pairs to get confidence scores
+                let max_pairs = 5;
+                let pair_count = std::cmp::min(max_pairs, (entity_count * (entity_count - 1)) / 2);
+                let mut pairs_checked = 0;
+
+                // Check a sample of entity pairs
+                'outer: for i in 0..entities.len() {
+                    for j in (i + 1)..entities.len() {
+                        if pairs_checked >= pair_count {
+                            break 'outer;
+                        }
+
+                        // Get ML recommendation for this pair
+                        if let Some(orchestrator_ref) = reinforcement_orchestrator {
+                            // Lock for each method call
+                            let mut orchestrator = orchestrator_ref.lock().await;
+                            match orchestrator
+                                .select_matching_method(pool, &entities[i].0, &entities[j].0)
+                                .await
+                            {
+                                Ok((method, conf)) => {
+                                    // If URL is recommended method, use its confidence
+                                    if matches!(method, MatchMethodType::Url) {
+                                        ml_confidence_scores.push(conf);
+                                    }
+                                }
+                                Err(e) => {
+                                    // Log error but continue
+                                    warn!("Error getting ML confidence: {}", e);
+                                }
+                            }
+                        }
+
+                        pairs_checked += 1;
+                    }
+                }
+
+                // If we got any ML confidence scores, use their average
+                if !ml_confidence_scores.is_empty() {
+                    confidence_score = ml_confidence_scores.iter().sum::<f64>()
+                        / ml_confidence_scores.len() as f64;
+                    info!(
+                        "Using ML-guided confidence {:.4} for URL group",
+                        confidence_score
+                    );
+                } else {
+                    info!("Using default confidence 0.9 for URL group (no ML guidance)");
+                }
+            }
+
             // Create a new entity group
             let group_id = EntityGroupId(Uuid::new_v4().to_string());
 
@@ -405,7 +524,7 @@ pub async fn find_matches(pool: &PgPool) -> Result<UrlMatchResult> {
                 group_cluster_id: None,
                 created_at: now,
                 updated_at: now,
-                confidence_score: 0.9, // High confidence for domain matches
+                confidence_score,
                 entity_count,
             };
 
@@ -459,23 +578,56 @@ pub async fn find_matches(pool: &PgPool) -> Result<UrlMatchResult> {
                     &MatchMethodType::Url.as_str(),
                     &format!("Matched on domain: {}", normalized_domain),
                     &match_values_json,
-                    &0.9f64,
+                    &confidence_score,
                     &now,
                 ],
             )
             .await
             .context("Failed to insert group method")?;
 
+            // Log ML feedback for the newly created group
+            if reinforcement_orchestrator.is_some() {
+                // For a new group, log feedback for a sample of entity pairs
+                let max_feedback_pairs = 10;
+                let mut pairs_logged = 0;
+
+                if let Some(orchestrator_ref) = reinforcement_orchestrator {
+                    for i in 0..entities.len() {
+                        for j in (i + 1)..entities.len() {
+                            if pairs_logged >= max_feedback_pairs {
+                                break;
+                            }
+
+                            let mut orchestrator = orchestrator_ref.lock().await;
+                            // URL matches are considered correct (true)
+                            match orchestrator
+                                .log_match_result(
+                                    &MatchMethodType::Url,
+                                    confidence_score,
+                                    true,
+                                    &entities[i].0,
+                                    &entities[j].0,
+                                )
+                                .await
+                            {
+                                Ok(_) => pairs_logged += 1,
+                                Err(e) => warn!("Failed to log match result to ML system: {}", e),
+                            }
+                        }
+                    }
+                }
+            }
+
             total_groups_created += 1;
             total_entities_matched += entity_count as usize;
 
             // URL matches have good confidence
-            confidence_scores.push(0.9);
+            confidence_scores.push(confidence_score);
             group_sizes.push(entity_count as f32);
 
             info!(
-                "Created new URL group for {} with {} entities",
-                normalized_domain, entity_count
+                "Created new URL group for {} with {} entities (confidence: {:.4})",
+                normalized_domain, entity_count, confidence_score
             );
         }
     }
@@ -485,7 +637,7 @@ pub async fn find_matches(pool: &PgPool) -> Result<UrlMatchResult> {
 
     // Calculate average confidence score and group size
     let avg_confidence: f64 = if !confidence_scores.is_empty() {
-        (confidence_scores.iter().sum::<f32>() / confidence_scores.len() as f32).into()
+        confidence_scores.iter().sum::<f64>() / confidence_scores.len() as f64
     } else {
         0.0
     };

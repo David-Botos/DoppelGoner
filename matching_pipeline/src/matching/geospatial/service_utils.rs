@@ -70,60 +70,67 @@ pub async fn get_services_for_entity(
 
 /// Calculate semantic similarity between services of two entities
 pub async fn compare_entity_services(
-    tx: &Transaction<'_>, 
-    entity1: &EntityId, 
-    entity2: &EntityId
+    tx: &Transaction<'_>,
+    entity1: &EntityId,
+    entity2: &EntityId,
 ) -> Result<f64> {
     let services1 = get_services_for_entity(tx, entity1).await?;
     let services2 = get_services_for_entity(tx, entity2).await?;
-    
+
     if services1.is_empty() && services2.is_empty() {
         debug!("Both entities have no services, defaulting to neutral similarity");
         let similarity = 0.5; // Default to neutral if both have no services
-        
+
         // Log this comparison
         log_service_similarity(
             tx,
             similarity,
             similarity < SERVICE_SIMILARITY_THRESHOLD,
             &entity1.0,
-            &entity2.0
-        ).await?;
-        
+            &entity2.0,
+        )
+        .await?;
+
         return Ok(similarity);
     }
-    
+
     if services1.is_empty() || services2.is_empty() {
         debug!("One entity has no services, defaulting to low similarity");
         let similarity = 0.2; // Low similarity if one has services and the other doesn't
-        
+
         // Log this comparison
         log_service_similarity(
             tx,
             similarity,
             similarity < SERVICE_SIMILARITY_THRESHOLD,
             &entity1.0,
-            &entity2.0
-        ).await?;
-        
+            &entity2.0,
+        )
+        .await?;
+
         return Ok(similarity);
     }
-    
+
     let similarity = calculate_service_similarity(&services1, &services2);
     trace!(
         "Calculated similarity {:.4} between entity {} ({} services) and entity {} ({} services)",
-        similarity, entity1.0, services1.len(), entity2.0, services2.len()
+        similarity,
+        entity1.0,
+        services1.len(),
+        entity2.0,
+        services2.len()
     );
-    
+
     // Log the comparison result
     log_service_similarity(
         tx,
         similarity,
         similarity < SERVICE_SIMILARITY_THRESHOLD,
         &entity1.0,
-        &entity2.0
-    ).await?;
-    
+        &entity2.0,
+    )
+    .await?;
+
     Ok(similarity)
 }
 /// Calculate similarity between two sets of services
@@ -164,36 +171,38 @@ fn collect_service_text(services: &[ServiceDetails]) -> String {
 /// Calculate token-based Jaccard similarity between two texts
 fn calculate_token_similarity(text1: &str, text2: &str) -> f64 {
     // Convert to lowercase and tokenize
-    let tokens1: HashSet<String> = text1.to_lowercase()
+    let tokens1: HashSet<String> = text1
+        .to_lowercase()
         .split_whitespace()
         .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
         .filter(|s| !s.is_empty() && s.len() > 2) // Filter out short tokens and empty strings
         .collect();
-    
-    let tokens2: HashSet<String> = text2.to_lowercase()
+
+    let tokens2: HashSet<String> = text2
+        .to_lowercase()
         .split_whitespace()
         .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
         .filter(|s| !s.is_empty() && s.len() > 2) // Filter out short tokens and empty strings
         .collect();
-    
+
     if tokens1.is_empty() || tokens2.is_empty() {
         return 0.5; // Default to moderate similarity if no meaningful tokens
     }
-    
+
     // Calculate Jaccard similarity
     let intersection_size = tokens1.intersection(&tokens2).count() as f64;
     let union_size = tokens1.union(&tokens2).count() as f64;
-    
+
     intersection_size / union_size
 }
 
 /// Log service similarity scores and rejections to the database for statistics
 pub async fn log_service_similarity(
-    tx: &Transaction<'_>, 
-    similarity: f64, 
+    tx: &Transaction<'_>,
+    similarity: f64,
     is_rejected: bool,
     entity1_id: &str,
-    entity2_id: &str
+    entity2_id: &str,
 ) -> Result<()> {
     // Create a metadata table if it doesn't exist
     let create_table = "
@@ -206,38 +215,44 @@ pub async fn log_service_similarity(
             created_at TIMESTAMP NOT NULL DEFAULT NOW()
         )
     ";
-    
+
     match tx.execute(create_table, &[]).await {
-        Ok(_) => {},
+        Ok(_) => {}
         Err(e) => {
             warn!("Failed to create matching_metadata table: {}", e);
-            return Ok(());  // Continue execution even if logging fails
+            return Ok(()); // Continue execution even if logging fails
         }
     }
-    
+
     // Insert the similarity score
     let insert_stmt = "
         INSERT INTO matching_metadata (type, entity1_id, entity2_id, value, created_at)
         VALUES ($1, $2, $3, $4, NOW())
     ";
-    
+
     let record_type = if is_rejected {
         "service_similarity_reject"
     } else {
         "service_similarity"
     };
-    
-    match tx.execute(insert_stmt, &[&record_type, &entity1_id, &entity2_id, &similarity]).await {
+
+    match tx
+        .execute(
+            insert_stmt,
+            &[&record_type, &entity1_id, &entity2_id, &similarity],
+        )
+        .await
+    {
         Ok(_) => {
             trace!(
                 "Logged service similarity score {:.4} between entities {} and {} (rejected: {})",
                 similarity, entity1_id, entity2_id, is_rejected
             );
             Ok(())
-        },
+        }
         Err(e) => {
             warn!("Failed to log service similarity: {}", e);
-            Ok(())  // Continue execution even if logging fails
+            Ok(()) // Continue execution even if logging fails
         }
     }
 }

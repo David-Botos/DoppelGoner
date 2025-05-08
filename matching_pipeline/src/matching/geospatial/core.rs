@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
 use log::{debug, error, info, trace, warn};
 use std::collections::{HashMap, HashSet};
+use tokio::sync::Mutex;
 use tokio_postgres::Transaction;
 use uuid::Uuid;
 
@@ -16,10 +17,12 @@ use super::utils::{
     calculate_centroid, calculate_centroid_from_full, calculate_haversine_distance,
     distance_to_centroid,
 };
+use crate::db::PgPool;
 use crate::models::{
     EntityGroupId, EntityId, GeospatialMatchValue, GroupResults, MatchMethodType, MatchResult,
     MatchValues,
 };
+use crate::reinforcement;
 
 /// Try to match new entities to existing groups
 pub async fn match_to_existing_groups(
@@ -29,10 +32,17 @@ pub async fn match_to_existing_groups(
     group_results: &GroupResults,
     has_postgis: bool,
     now: &NaiveDateTime,
+    pool: &PgPool, // Added pool parameter for ML calls
+    reinforcement_orchestrator: Option<&Mutex<reinforcement::MatchingOrchestrator>>, // Added ML orchestrator
 ) -> Result<MatchResult> {
     info!(
-        "Starting match_to_existing_groups with {} locations to process",
-        locations.len()
+        "Starting match_to_existing_groups with {} locations to process{}",
+        locations.len(),
+        if reinforcement_orchestrator.is_some() {
+            " using ML guidance"
+        } else {
+            ""
+        }
     );
     debug!("PostGIS available: {}", has_postgis);
 
@@ -334,8 +344,57 @@ pub async fn match_to_existing_groups(
                                 "Services of entity {} are similar to those in group {} (score: {:.4}), proceeding with match",
                                 new_entity_id.0, group_id, avg_similarity
                             );
-                            matched_group =
-                                Some((group_id.clone(), method_id.clone(), threshold, confidence));
+
+                            // Adjust confidence using ML if available
+                            let mut final_confidence = confidence;
+
+                            if let Some(orchestrator_ref) = reinforcement_orchestrator {
+                                // If we have ML guidance, check if this match is recommended
+                                if !entity_sample.is_empty() {
+                                    let orchestrator = orchestrator_ref.lock().await;
+                                    // Use first group entity for method recommendation
+                                    match orchestrator
+                                        .select_matching_method(
+                                            pool,
+                                            new_entity_id,
+                                            &entity_sample[0],
+                                        )
+                                        .await
+                                    {
+                                        Ok((method, conf)) => {
+                                            // If geospatial is recommended method, adjust confidence
+                                            if matches!(method, MatchMethodType::Geospatial) {
+                                                debug!(
+                                                    "ML recommends geospatial matching with confidence {:.4}",
+                                                    conf
+                                                );
+                                                // Blend standard and ML confidence (70% ML, 30% standard)
+                                                final_confidence =
+                                                    (conf * 0.7) + (confidence * 0.3);
+                                                debug!(
+                                                    "Using ML-adjusted confidence {:.4} (was {:.4})",
+                                                    final_confidence, confidence
+                                                );
+                                            } else {
+                                                debug!(
+                                                    "ML recommends {} matching instead of geospatial, keeping standard confidence",
+                                                    method.as_str()
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("Error getting ML confidence: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+
+                            matched_group = Some((
+                                group_id.clone(),
+                                method_id.clone(),
+                                threshold,
+                                final_confidence,
+                            ));
                             break;
                         } else {
                             debug!(
@@ -351,8 +410,45 @@ pub async fn match_to_existing_groups(
                             "No valid service comparisons made between entity {} and group {}, proceeding with match based on distance only",
                             new_entity_id.0, group_id
                         );
-                        matched_group =
-                            Some((group_id.clone(), method_id.clone(), threshold, confidence));
+
+                        // Use default confidence if no ML guidance
+                        let mut final_confidence = confidence;
+
+                        // Try ML confidence if orchestrator is available
+                        if let Some(orchestrator_ref) = reinforcement_orchestrator {
+                            let orchestrator = orchestrator_ref.lock().await;
+                            // Try with first entity in group if available
+                            if let Some(ref entities) = group_results.group_entities.get(group_id) {
+                                if !entities.is_empty() {
+                                    match orchestrator
+                                        .select_matching_method(pool, new_entity_id, &entities[0].0)
+                                        .await
+                                    {
+                                        Ok((method, conf)) => {
+                                            if matches!(method, MatchMethodType::Geospatial) {
+                                                // Blend standard and ML confidence (70% ML, 30% standard)
+                                                final_confidence =
+                                                    (conf * 0.7) + (confidence * 0.3);
+                                                debug!(
+                                                    "Using ML-adjusted confidence {:.4} for distance-only match",
+                                                    final_confidence
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("Error getting ML confidence: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        matched_group = Some((
+                            group_id.clone(),
+                            method_id.clone(),
+                            threshold,
+                            final_confidence,
+                        ));
                         break;
                     }
                 }
@@ -366,7 +462,7 @@ pub async fn match_to_existing_groups(
         // If a matching group was found, add the entity to it
         if let Some((group_id, method_id, threshold, confidence)) = matched_group {
             info!(
-                "Adding entity {} to existing group {} (distance: <={}m, confidence: {})",
+                "Adding entity {} to existing group {} (distance: <={}m, confidence: {:.4})",
                 new_entity_id.0, group_id, threshold, confidence
             );
 
@@ -505,6 +601,49 @@ pub async fn match_to_existing_groups(
                 .await
                 .context("Failed to update match values")?;
 
+            // Log ML feedback for this match
+            if let Some(orchestrator_ref) = reinforcement_orchestrator {
+                let mut orchestrator = orchestrator_ref.lock().await;
+
+                // Get a sample of entities from the group to log feedback
+                let feedback_sample =
+                    if let Some(group_entities) = group_results.group_entities.get(&group_id) {
+                        let entity_ids: Vec<EntityId> =
+                            group_entities.iter().map(|(id, _, _)| id.clone()).collect();
+                        let sample = super::service_utils::sample_group_entities(
+                            &entity_ids,
+                            3, // Sample up to 3 entities for feedback
+                        );
+                        sample
+                    } else {
+                        Vec::new()
+                    };
+
+                // Log feedback with each entity in the sample
+                for sample_entity_id in feedback_sample {
+                    match orchestrator
+                        .log_match_result(
+                            &MatchMethodType::Geospatial,
+                            confidence, // Use the original confidence for feedback
+                            true,       // Assume geospatial match is correct
+                            new_entity_id,
+                            &sample_entity_id,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            debug!(
+                                "Logged ML feedback for geospatial match between entities {} and {}",
+                                new_entity_id.0, sample_entity_id.0
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Failed to log ML feedback: {}", e);
+                        }
+                    }
+                }
+            }
+
             // Add to processed entities
             newly_processed.insert(new_entity_id.clone());
             total_entities_added += 1;
@@ -538,10 +677,17 @@ pub async fn create_new_groups(
     locations: &[(EntityId, f64, f64)],
     has_postgis: bool,
     now: &NaiveDateTime,
+    pool: &PgPool, // Added pool parameter for ML calls
+    reinforcement_orchestrator: Option<&Mutex<reinforcement::MatchingOrchestrator>>, // Added ML orchestrator
 ) -> Result<MatchResult> {
     info!(
-        "Starting create_new_groups for {} remaining unprocessed entities",
-        locations.len()
+        "Starting create_new_groups for {} remaining unprocessed entities{}",
+        locations.len(),
+        if reinforcement_orchestrator.is_some() {
+            " with ML guidance"
+        } else {
+            ""
+        }
     );
     debug!("PostGIS available: {}", has_postgis);
 
@@ -560,8 +706,16 @@ pub async fn create_new_groups(
             locations.len()
         );
 
-        let result =
-            create_groups_with_postgis(tx, db_stmts, locations, &mut newly_processed, now).await?;
+        let result = create_groups_with_postgis(
+            tx,
+            db_stmts,
+            locations,
+            &mut newly_processed,
+            now,
+            pool,
+            reinforcement_orchestrator,
+        )
+        .await?;
 
         total_groups_created = result.groups_created;
         total_entities_added = result.entities_added;
@@ -589,9 +743,16 @@ pub async fn create_new_groups(
             locations.len()
         );
 
-        let result =
-            create_groups_with_haversine(tx, db_stmts, locations, &mut newly_processed, now)
-                .await?;
+        let result = create_groups_with_haversine(
+            tx,
+            db_stmts,
+            locations,
+            &mut newly_processed,
+            now,
+            pool,
+            reinforcement_orchestrator,
+        )
+        .await?;
 
         total_groups_created = result.groups_created;
         total_entities_added = result.entities_added;
@@ -634,17 +795,23 @@ pub async fn create_new_groups(
 }
 
 /// Create new groups using PostGIS clustering
-/// Create new groups using PostGIS clustering
 async fn create_groups_with_postgis(
     tx: &Transaction<'_>,
     db_stmts: &DbStatements,
     locations: &[(EntityId, f64, f64)],
     processed_entities: &mut HashSet<EntityId>,
     now: &NaiveDateTime,
+    pool: &PgPool, // Added for ML calls
+    reinforcement_orchestrator: Option<&Mutex<reinforcement::MatchingOrchestrator>>, // Added for ML integration
 ) -> Result<MatchResult> {
     info!(
-        "Starting PostGIS clustering with {} total locations",
-        locations.len()
+        "Starting PostGIS clustering with {} total locations{}",
+        locations.len(),
+        if reinforcement_orchestrator.is_some() {
+            " with ML guidance"
+        } else {
+            ""
+        }
     );
     let start_time = std::time::Instant::now();
 
@@ -771,37 +938,48 @@ async fn create_groups_with_postgis(
                 cluster.centroid.latitude,
                 cluster.centroid.longitude
             );
-            
+
             // Verify that entities in the cluster have semantically similar services
-            debug!("Verifying service similarity among {} entities in cluster", cluster.entity_ids.len());
-            
+            debug!(
+                "Verifying service similarity among {} entities in cluster",
+                cluster.entity_ids.len()
+            );
+
             // Convert string IDs to EntityId structs for the filtering
-            let entity_ids: Vec<EntityId> = cluster.entity_ids.iter()
+            let entity_ids: Vec<EntityId> = cluster
+                .entity_ids
+                .iter()
                 .map(|id| EntityId(id.clone()))
                 .collect();
-            
+
             // Create a new filtered list based on service similarity
             let mut filtered_entity_ids = Vec::new();
             let mut entity_similarity_matrix = HashMap::new();
-            
+
             // Only process up to 5 entities for performance reasons
             let sample_size = 5.min(entity_ids.len());
-            
+
             // First entity is our reference point
             if !entity_ids.is_empty() {
                 filtered_entity_ids.push(entity_ids[0].clone());
-                
+
                 // Compare other entities to the first one
                 for i in 1..sample_size {
                     let entity_id = &entity_ids[i];
-                    let similarity = match super::service_utils::compare_entity_services(tx, &entity_ids[0], entity_id).await {
+                    let similarity = match super::service_utils::compare_entity_services(
+                        tx,
+                        &entity_ids[0],
+                        entity_id,
+                    )
+                    .await
+                    {
                         Ok(sim) => {
                             debug!(
                                 "Service similarity between entities {} and {}: {:.4}",
                                 entity_ids[0].0, entity_id.0, sim
                             );
                             sim
-                        },
+                        }
                         Err(e) => {
                             warn!(
                                 "Failed to compare services for entities {} and {}: {}. Defaulting to neutral similarity.",
@@ -810,9 +988,9 @@ async fn create_groups_with_postgis(
                             0.5 // Default if comparison fails
                         }
                     };
-                    
+
                     entity_similarity_matrix.insert(entity_id.clone(), similarity);
-                    
+
                     // Only add entities with similar enough services
                     if similarity >= super::service_utils::SERVICE_SIMILARITY_THRESHOLD {
                         filtered_entity_ids.push(entity_id.clone());
@@ -823,27 +1001,71 @@ async fn create_groups_with_postgis(
                         );
                     }
                 }
-                
+
                 // If we have too few entities after filtering, skip creating this group
                 if filtered_entity_ids.len() < 2 {
                     debug!(
                         "Cluster {}/{} has insufficient entities with similar services after filtering, skipping",
-                        cluster_idx + 1, clusters.len()
+                        cluster_idx + 1,
+                        clusters.len()
                     );
                     continue;
                 }
-                
+
                 debug!(
                     "Cluster {}/{} has {} entities with similar services after filtering",
-                    cluster_idx + 1, clusters.len(), filtered_entity_ids.len()
+                    cluster_idx + 1,
+                    clusters.len(),
+                    filtered_entity_ids.len()
                 );
             } else {
-                debug!("Cluster {}/{} has no entities, skipping", cluster_idx + 1, clusters.len());
+                debug!(
+                    "Cluster {}/{} has no entities, skipping",
+                    cluster_idx + 1,
+                    clusters.len()
+                );
                 continue;
             }
 
             let group_id = EntityGroupId(postgis::generate_id());
             debug!("Creating new group with ID: {}", group_id.0);
+
+            // Use ML to get confidence if available
+            let mut final_confidence = *confidence;
+            if let Some(orchestrator_ref) = reinforcement_orchestrator {
+                if filtered_entity_ids.len() >= 2 {
+                    // Use first two entities in the cluster to get ML confidence
+                    let orchestrator = orchestrator_ref.lock().await;
+                    match orchestrator
+                        .select_matching_method(
+                            pool,
+                            &filtered_entity_ids[0],
+                            &filtered_entity_ids[1],
+                        )
+                        .await
+                    {
+                        Ok((method, conf)) => {
+                            if matches!(method, MatchMethodType::Geospatial) {
+                                // Blend ML confidence with standard confidence (70% ML, 30% standard)
+                                final_confidence = (conf * 0.7) + (*confidence * 0.3);
+                                debug!(
+                                    "Using ML-guided confidence {:.4} for new cluster (standard: {})",
+                                    final_confidence, confidence
+                                );
+                            } else {
+                                debug!(
+                                    "ML suggests {} method (conf: {:.4}) instead of geospatial, keeping standard confidence",
+                                    method.as_str(),
+                                    conf
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to get ML confidence: {}", e);
+                        }
+                    }
+                }
+            }
 
             // Insert the group
             debug!(
@@ -855,10 +1077,13 @@ async fn create_groups_with_postgis(
                 &db_stmts.group_stmt,
                 &[
                     &group_id.0,
-                    &format!("Geospatial match within {}m with similar services", threshold),
+                    &format!(
+                        "Geospatial match within {}m with similar services",
+                        threshold
+                    ),
                     &now,
                     &now,
-                    &confidence,
+                    &final_confidence,
                     &(filtered_entity_ids.len() as i32),
                 ],
             )
@@ -892,9 +1117,8 @@ async fn create_groups_with_postgis(
                     cluster_idx + 1
                 );
 
-                if let Some(&(_, lat, lon)) = candidate_locations
-                    .iter()
-                    .find(|(e, _, _)| e == &entity_id)
+                if let Some(&(_, lat, lon)) =
+                    candidate_locations.iter().find(|(e, _, _)| e == &entity_id)
                 {
                     let distance = calculate_haversine_distance(
                         lat,
@@ -937,7 +1161,7 @@ async fn create_groups_with_postgis(
                                 "Successfully inserted entity {} into group {}",
                                 entity_id.0, group_id.0
                             );
-                            processed_entities.insert(entity_id);
+                            processed_entities.insert(entity_id.clone());
                             total_entities_added += 1;
                             threshold_entities_added += 1;
                             cluster_entities_added += 1;
@@ -991,19 +1215,60 @@ async fn create_groups_with_postgis(
                     &MatchMethodType::Geospatial.as_str(),
                     &format!("Matched on geospatial proximity within {}m", threshold),
                     &match_values_json,
-                    &confidence,
+                    &final_confidence,
                     &now,
                 ],
             )
             .await
             .context("Failed to insert group method")?;
 
+            // Log ML feedback for the newly created group
+            if let Some(orchestrator_ref) = reinforcement_orchestrator {
+                if filtered_entity_ids.len() >= 2 {
+                    // Log feedback for a sample of pairs in this new group
+                    let max_feedback_pairs = 5;
+                    let mut pairs_logged = 0;
+
+                    let mut orchestrator = orchestrator_ref.lock().await;
+
+                    for i in 0..filtered_entity_ids.len() {
+                        for j in (i + 1)..filtered_entity_ids.len() {
+                            if pairs_logged >= max_feedback_pairs {
+                                break;
+                            }
+
+                            match orchestrator
+                                .log_match_result(
+                                    &MatchMethodType::Geospatial,
+                                    final_confidence,
+                                    true, // Assume match is correct
+                                    &filtered_entity_ids[i],
+                                    &filtered_entity_ids[j],
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    debug!(
+                                        "Logged ML feedback for new geospatial group between entities {} and {}",
+                                        filtered_entity_ids[i].0, filtered_entity_ids[j].0
+                                    );
+                                    pairs_logged += 1;
+                                }
+                                Err(e) => {
+                                    warn!("Failed to log ML feedback: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             total_groups_created += 1;
             threshold_groups_created += 1;
 
             info!(
-                "Created group {} with {} entities within {}m threshold",
-                group_id.0, cluster_entities_added, threshold
+                "Created group {} with {} entities within {}m threshold (confidence: {:.4})",
+                group_id.0, cluster_entities_added, threshold, final_confidence
             );
         }
 
@@ -1062,10 +1327,17 @@ async fn create_groups_with_haversine(
     locations: &[(EntityId, f64, f64)],
     processed_entities: &mut HashSet<EntityId>,
     now: &NaiveDateTime,
+    pool: &PgPool, // Added for ML calls
+    reinforcement_orchestrator: Option<&Mutex<reinforcement::MatchingOrchestrator>>, // Added for ML integration
 ) -> Result<MatchResult> {
     info!(
-        "Starting Haversine-based clustering with {} total locations",
-        locations.len()
+        "Starting Haversine-based clustering with {} total locations{}",
+        locations.len(),
+        if reinforcement_orchestrator.is_some() {
+            " with ML guidance"
+        } else {
+            ""
+        }
     );
     let start_time = std::time::Instant::now();
 
@@ -1323,6 +1595,39 @@ async fn create_groups_with_haversine(
                 group_id.0, centroid_lat, centroid_lon
             );
 
+            // Use ML to get confidence if available
+            let mut final_confidence = *confidence;
+            if let Some(orchestrator_ref) = reinforcement_orchestrator {
+                if nearby_entities.len() >= 2 {
+                    // Use first two entities to get ML confidence
+                    let mut orchestrator = orchestrator_ref.lock().await;
+                    match orchestrator
+                        .select_matching_method(pool, &nearby_entities[0].0, &nearby_entities[1].0)
+                        .await
+                    {
+                        Ok((method, conf)) => {
+                            if matches!(method, MatchMethodType::Geospatial) {
+                                // Blend ML confidence with standard confidence (70% ML, 30% standard)
+                                final_confidence = (conf * 0.7) + (*confidence * 0.3);
+                                debug!(
+                                    "Using ML-guided confidence {:.4} for new Haversine group (standard: {})",
+                                    final_confidence, confidence
+                                );
+                            } else {
+                                debug!(
+                                    "ML suggests {} method (conf: {:.4}) instead of geospatial, keeping standard confidence",
+                                    method.as_str(),
+                                    conf
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to get ML confidence: {}", e);
+                        }
+                    }
+                }
+            }
+
             // Insert the group with initial version = 1
             trace!("Inserting group {} record into database", group_id.0);
             tx.execute(
@@ -1332,7 +1637,7 @@ async fn create_groups_with_haversine(
                     &format!("Geospatial match within {}m", threshold),
                     &now,
                     &now,
-                    &confidence,
+                    &final_confidence,
                     &entity_count,
                 ],
             )
@@ -1426,19 +1731,60 @@ async fn create_groups_with_haversine(
                     &MatchMethodType::Geospatial.as_str(),
                     &format!("Matched on geospatial proximity within {}m", threshold),
                     &match_values_json,
-                    &confidence,
+                    &final_confidence,
                     &now,
                 ],
             )
             .await
             .context("Failed to insert group method")?;
 
+            // Log ML feedback for the newly created group
+            if let Some(orchestrator_ref) = reinforcement_orchestrator {
+                if nearby_entities.len() >= 2 {
+                    // Log feedback for a sample of pairs in this new group
+                    let max_feedback_pairs = 5;
+                    let mut pairs_logged = 0;
+
+                    let mut orchestrator = orchestrator_ref.lock().await;
+
+                    for i in 0..nearby_entities.len() {
+                        for j in (i + 1)..nearby_entities.len() {
+                            if pairs_logged >= max_feedback_pairs {
+                                break;
+                            }
+
+                            match orchestrator
+                                .log_match_result(
+                                    &MatchMethodType::Geospatial,
+                                    final_confidence,
+                                    true, // Assume match is correct
+                                    &nearby_entities[i].0,
+                                    &nearby_entities[j].0,
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    debug!(
+                                        "Logged ML feedback for new Haversine group between entities {} and {}",
+                                        nearby_entities[i].0.0, nearby_entities[j].0.0
+                                    );
+                                    pairs_logged += 1;
+                                }
+                                Err(e) => {
+                                    warn!("Failed to log ML feedback: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             total_groups_created += 1;
             threshold_groups_created += 1;
 
             debug!(
-                "Successfully created group {} with {} entities within {}m",
-                group_id.0, group_entities_added, threshold
+                "Successfully created group {} with {} entities within {}m (confidence: {:.4})",
+                group_id.0, group_entities_added, threshold, final_confidence
             );
         }
 

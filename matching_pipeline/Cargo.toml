@@ -5,20 +5,6 @@ edition = "2024"
 authors = ["David Botos"]
 description = "A deduplication system for HSDS"
 
-# Force specific versions of rand-related dependencies
-[dependencies.rand]
-version = "=0.8.5"
-features = ["std", "std_rng"]
-# Pin version exactly with =
-
-[dependencies.rand_core]
-version = "=0.6.4"
-# Pin version exactly with =
-
-[dependencies.rand_chacha]
-version = "=0.3.1"
-# Pin version exactly with =
-
 [dependencies]
 # Error handling
 anyhow = "1.0.98"
@@ -33,6 +19,9 @@ chrono = { version = "0.4.40", features = ["serde"] }
 # UUID generation
 uuid = { version = "1.16.0", features = ["v4", "serde"] }
 
+# Random number generation
+rand = { version = "0.8", features = ["std", "std_rng"] }
+
 # Async runtime
 tokio = { version = "1.44.2", features = ["full"] }
 
@@ -41,9 +30,11 @@ tokio-postgres = { version = "0.7.13", features = ["with-serde_json-1", "with-ch
 bb8 = "0.8.6"
 bb8-postgres = "0.8.1"
 deadpool-postgres = "0.10.5"
+postgres-types = { version = "0.2.9", features = ["derive"] }
 
 # Async utilities
 futures = "0.3.30"
+bytes = "1.10.1"
 
 # URL handling
 url = "2.5.4"
@@ -52,20 +43,16 @@ url = "2.5.4"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 
-# Machine Learning - Updated to ensure layer-norm is available
-candle-core = { version = "0.8.4", features = ["metal", "accelerate"] }
-candle-nn = { version = "0.8.4", features = ["metal"] }
-candle-transformers = { version = "0.8.4" }
-tokenizers = "0.13.4"
+# Machine Learning
+smartcore = { version = "0.3.2", features = ["serde"] }  # Replaces lightgbm
+ndarray = "0.15.6"   # Array manipulation
+linfa = "0.6.1"      # Potential utility functions
 
 # Reconciling storage types
 pgvector = { version = "0.4", features = ["postgres"] }
 
 # Graph algorithms
 petgraph = "0.6.5"
-
-# Override half crate with specific version
-half = "2.6.0"
 
 # For string similarity calculations
 strsim = "0.10.0"

@@ -1,19 +1,32 @@
 // src/matching/email.rs
 use anyhow::{Context, Result};
 use chrono::Utc;
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::db::PgPool;
 use crate::models::{
     EmailMatchValue, EntityGroup, EntityGroupId, EntityId, MatchMethodType, MatchValues,
 };
+use crate::reinforcement::MatchingOrchestrator;
 use crate::results::{EmailMatchResult, MatchMethodStats};
 
-pub async fn find_matches(pool: &PgPool) -> Result<EmailMatchResult> {
-    info!("Starting email matching process...");
-    let start_time = std::time::Instant::now();
+pub async fn find_matches(
+    pool: &PgPool,
+    reinforcement_orchestrator: Option<&Mutex<MatchingOrchestrator>>,
+) -> Result<EmailMatchResult> {
+    info!(
+        "Starting email matching process{}...",
+        if reinforcement_orchestrator.is_some() {
+            " with ML guidance"
+        } else {
+            ""
+        }
+    );
+    let start_time = Instant::now();
 
     let mut conn = pool
         .get()
@@ -21,7 +34,6 @@ pub async fn find_matches(pool: &PgPool) -> Result<EmailMatchResult> {
         .context("Failed to get DB connection for email matching")?;
 
     // First, get all entities that are already part of an email match group
-    // These entities have already been checked and don't need to be processed again
     debug!("Finding entities already processed by email matching");
     let processed_query = "
         SELECT DISTINCT ge.entity_id
@@ -264,13 +276,20 @@ pub async fn find_matches(pool: &PgPool) -> Result<EmailMatchResult> {
 
             // Extract the email values
             let mut email_values = if let MatchValues::Email(values) = current_match_values {
+                debug!(
+                    "Retrieved {} existing email match values for group {}",
+                    values.len(),
+                    group_id
+                );
                 values
             } else {
+                warn!("Unexpected match values type for email group {}", group_id);
                 Vec::new()
             };
 
             // Track which entities we've actually added
             let mut entities_added = 0;
+            let mut entity_pairs = Vec::new();
 
             // Add the new entities to the group
             for (entity_id, original) in entity_map {
@@ -293,8 +312,20 @@ pub async fn find_matches(pool: &PgPool) -> Result<EmailMatchResult> {
                     original,
                     normalized: normalized_email.clone(),
                     domain,
-                    entity_id,
+                    entity_id: entity_id.clone(),
                 });
+
+                // Track entity pairs for ML logging
+                if reinforcement_orchestrator.is_some() {
+                    // Store this entity with each existing entity in the group
+                    // for ML feedback
+                    for existing_entity in &email_values {
+                        if existing_entity.entity_id != entity_id {
+                            entity_pairs
+                                .push((entity_id.clone(), existing_entity.entity_id.clone()));
+                        }
+                    }
+                }
 
                 entities_added += 1;
             }
@@ -307,6 +338,43 @@ pub async fn find_matches(pool: &PgPool) -> Result<EmailMatchResult> {
             tx.execute(&update_method_stmt, &[&updated_json, &method_id])
                 .await
                 .context("Failed to update match values")?;
+
+            // Log ML feedback for newly formed entity pairs
+            if reinforcement_orchestrator.is_some() {
+                // Get the group confidence score
+                let query = "SELECT confidence_score FROM entity_group WHERE id = $1";
+                let group_confidence: f64 = match tx.query_one(query, &[&group_id]).await {
+                    Ok(row) => row.get("confidence_score"),
+                    Err(e) => {
+                        warn!(
+                            "Failed to get confidence score for group {}: {}",
+                            group_id, e
+                        );
+                        1.0 // Default to 1.0 for email groups if query fails
+                    }
+                };
+
+                // Lock the orchestrator for each call
+                let mut orchestrator = reinforcement_orchestrator.unwrap().lock().await;
+
+                for (i, entity1) in entity_pairs.iter().enumerate() {
+                    for entity2 in entity_pairs.iter().skip(i + 1) {
+                        match orchestrator
+                            .log_match_result(
+                                &MatchMethodType::Email,
+                                group_confidence,
+                                true,
+                                &entity1.0,
+                                &entity2.0,
+                            )
+                            .await
+                        {
+                            Ok(_) => (),
+                            Err(e) => warn!("Failed to log match result to ML system: {}", e),
+                        }
+                    }
+                }
+            }
 
             total_entities_added += entities_added;
             total_entities_matched += entities_added;
@@ -323,7 +391,7 @@ pub async fn find_matches(pool: &PgPool) -> Result<EmailMatchResult> {
             let updated_group_size: i32 = group_size_row.get("entity_count");
             group_sizes.push(updated_group_size as f32);
 
-            // Email matches have high confidence
+            // Email matches have high confidence by default
             confidence_scores.push(1.0);
 
             info!(
@@ -337,6 +405,61 @@ pub async fn find_matches(pool: &PgPool) -> Result<EmailMatchResult> {
             let entities: Vec<(EntityId, String)> = entity_map.into_iter().collect();
             let entity_count = entities.len() as i32;
 
+            // Determine confidence score - default is high for email matching
+            let mut confidence_score = 1.0;
+
+            // If the orchestrator is available, use it to get a ML-guided confidence
+            if reinforcement_orchestrator.is_some() {
+                let mut ml_confidence_scores = Vec::new();
+
+                // Sample entity pairs to get confidence scores
+                let max_pairs = 5;
+                let pair_count = std::cmp::min(max_pairs, (entity_count * (entity_count - 1)) / 2);
+                let mut pairs_checked = 0;
+
+                // Check a sample of entity pairs
+                'outer: for i in 0..entities.len() {
+                    for j in (i + 1)..entities.len() {
+                        if pairs_checked >= pair_count {
+                            break 'outer;
+                        }
+
+                        // Get ML recommendation for this pair
+                        // Lock for each method call
+                        let mut orchestrator = reinforcement_orchestrator.unwrap().lock().await;
+                        match orchestrator
+                            .select_matching_method(pool, &entities[i].0, &entities[j].0)
+                            .await
+                        {
+                            Ok((method, conf)) => {
+                                // If email is recommended method, use its confidence
+                                if matches!(method, MatchMethodType::Email) {
+                                    ml_confidence_scores.push(conf);
+                                }
+                            }
+                            Err(e) => {
+                                // Log error but continue
+                                warn!("Error getting ML confidence: {}", e);
+                            }
+                        }
+
+                        pairs_checked += 1;
+                    }
+                }
+
+                // If we got any ML confidence scores, use their average
+                if !ml_confidence_scores.is_empty() {
+                    confidence_score = ml_confidence_scores.iter().sum::<f64>()
+                        / ml_confidence_scores.len() as f64;
+                    info!(
+                        "Using ML-guided confidence {:.4} for email group",
+                        confidence_score
+                    );
+                } else {
+                    info!("Using default confidence 1.0 for email group (no ML guidance)");
+                }
+            }
+
             // Create a new entity group
             let group_id = EntityGroupId(Uuid::new_v4().to_string());
 
@@ -346,7 +469,7 @@ pub async fn find_matches(pool: &PgPool) -> Result<EmailMatchResult> {
                 group_cluster_id: None,
                 created_at: now,
                 updated_at: now,
-                confidence_score: 1.0,
+                confidence_score,
                 entity_count,
             };
 
@@ -402,24 +525,55 @@ pub async fn find_matches(pool: &PgPool) -> Result<EmailMatchResult> {
                     &MatchMethodType::Email.as_str(),
                     &format!("Matched on email: {}", normalized_email),
                     &match_values_json,
-                    &1.0f64,
+                    &confidence_score,
                     &now,
                 ],
             )
             .await
             .context("Failed to insert group method")?;
 
+            // Log ML feedback for the newly created group
+            if reinforcement_orchestrator.is_some() {
+                // For a new group, log feedback for a sample of entity pairs
+                let max_feedback_pairs = 10;
+                let mut pairs_logged = 0;
+
+                for i in 0..entities.len() {
+                    for j in (i + 1)..entities.len() {
+                        if pairs_logged >= max_feedback_pairs {
+                            break;
+                        }
+
+                        let mut orchestrator = reinforcement_orchestrator.unwrap().lock().await;
+                        // Email matches are considered correct (true)
+                        match orchestrator
+                            .log_match_result(
+                                &MatchMethodType::Email,
+                                confidence_score,
+                                true,           // Assume email matches are correct
+                                &entities[i].0, // First entity ID
+                                &entities[j].0, // Second entity ID
+                            )
+                            .await
+                        {
+                            Ok(_) => pairs_logged += 1,
+                            Err(e) => warn!("Failed to log match result to ML system: {}", e),
+                        }
+                    }
+                }
+            }
+
             total_groups_created += 1;
             total_entities_matched += entity_count as usize;
             total_entities_added += entity_count as usize;
 
             // Email matches have high confidence
-            confidence_scores.push(1.0);
+            confidence_scores.push(confidence_score);
             group_sizes.push(entity_count as f32);
 
             info!(
-                "Created new email group for {} with {} entities",
-                normalized_email, entity_count
+                "Created new email group for {} with {} entities (confidence: {:.4})",
+                normalized_email, entity_count, confidence_score
             );
         }
     }
@@ -435,9 +589,9 @@ pub async fn find_matches(pool: &PgPool) -> Result<EmailMatchResult> {
     };
 
     let avg_confidence: f64 = if !confidence_scores.is_empty() {
-        (confidence_scores.iter().sum::<f32>() / confidence_scores.len() as f32).into()
+        (confidence_scores.iter().sum::<f64>() / confidence_scores.len() as f64)
     } else {
-        0.0
+        1.0 // Default confidence for email matching
     };
 
     // Create method stats
@@ -460,6 +614,7 @@ pub async fn find_matches(pool: &PgPool) -> Result<EmailMatchResult> {
         stats: method_stats,
     })
 }
+
 /// Normalize an email address by:
 /// - Converting to lowercase
 /// - Trimming whitespace

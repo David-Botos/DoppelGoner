@@ -1,19 +1,31 @@
 // src/matching/phone.rs
 use anyhow::{Context, Result};
 use chrono::Utc;
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::db::PgPool;
 use crate::models::{
     EntityGroup, EntityGroupId, EntityId, MatchMethodType, MatchValues, PhoneMatchValue,
 };
+use crate::reinforcement;
 use crate::results::{MatchMethodStats, PhoneMatchResult};
 
-pub async fn find_matches(pool: &PgPool) -> Result<PhoneMatchResult> {
-    info!("Starting phone matching...");
+pub async fn find_matches(
+    pool: &PgPool,
+    reinforcement_orchestrator: Option<&Mutex<reinforcement::MatchingOrchestrator>>,
+) -> Result<PhoneMatchResult> {
+    info!(
+        "Starting phone matching{}...",
+        if reinforcement_orchestrator.is_some() {
+            " with ML guidance"
+        } else {
+            ""
+        }
+    );
     let start_time = Instant::now();
 
     let mut conn = pool
@@ -286,6 +298,7 @@ pub async fn find_matches(pool: &PgPool) -> Result<PhoneMatchResult> {
 
             // Track which entities we've actually added
             let mut entities_added = 0;
+            let mut entity_pairs = Vec::new();
 
             // Add the new entities to the group
             for (entity_id, (original, extension)) in entity_map {
@@ -307,8 +320,20 @@ pub async fn find_matches(pool: &PgPool) -> Result<PhoneMatchResult> {
                     original,
                     normalized: normalized_phone.clone(),
                     extension,
-                    entity_id,
+                    entity_id: entity_id.clone(),
                 });
+
+                // Track entity pairs for ML feedback
+                if reinforcement_orchestrator.is_some() {
+                    // Store this entity with each existing entity in the group
+                    // for ML feedback
+                    for existing_value in &phone_values {
+                        if existing_value.entity_id != entity_id {
+                            entity_pairs
+                                .push((entity_id.clone(), existing_value.entity_id.clone()));
+                        }
+                    }
+                }
 
                 entities_added += 1;
             }
@@ -321,6 +346,43 @@ pub async fn find_matches(pool: &PgPool) -> Result<PhoneMatchResult> {
             tx.execute(&update_method_stmt, &[&updated_json, &method_id])
                 .await
                 .context("Failed to update match values")?;
+
+            // Log ML feedback for newly formed entity pairs
+            if reinforcement_orchestrator.is_some() {
+                // Get the group confidence score
+                let query = "SELECT confidence_score FROM entity_group WHERE id = $1";
+                let group_confidence: f64 = match tx.query_one(query, &[&group_id]).await {
+                    Ok(row) => row.get("confidence_score"),
+                    Err(e) => {
+                        warn!(
+                            "Failed to get confidence score for group {}: {}",
+                            group_id, e
+                        );
+                        confidence_score // Use calculated confidence if query fails
+                    }
+                };
+
+                // Lock the orchestrator for each call
+                if let Some(orchestrator_ref) = reinforcement_orchestrator {
+                    let mut orchestrator = orchestrator_ref.lock().await;
+
+                    for (entity1, entity2) in entity_pairs {
+                        match orchestrator
+                            .log_match_result(
+                                &MatchMethodType::Phone,
+                                group_confidence,
+                                true,
+                                &entity1,
+                                &entity2,
+                            )
+                            .await
+                        {
+                            Ok(_) => (),
+                            Err(e) => warn!("Failed to log match result to ML system: {}", e),
+                        }
+                    }
+                }
+            }
 
             total_entities_added += entities_added;
             total_entities_matched += entities_added;
@@ -362,7 +424,63 @@ pub async fn find_matches(pool: &PgPool) -> Result<PhoneMatchResult> {
                 .windows(2)
                 .all(|w| w[0] == w[1]);
 
-            let confidence_score = if all_same_extension { 0.95 } else { 0.85 };
+            // Initialize default confidence score
+            let mut confidence_score = if all_same_extension { 0.95 } else { 0.85 };
+
+            // If the orchestrator is available, use it to get a ML-guided confidence
+            if reinforcement_orchestrator.is_some() {
+                let mut ml_confidence_scores = Vec::new();
+
+                // Sample entity pairs to get confidence scores
+                let max_pairs = 5;
+                let pair_count = std::cmp::min(max_pairs, (entity_count * (entity_count - 1)) / 2);
+                let mut pairs_checked = 0;
+
+                // Check a sample of entity pairs
+                'outer: for i in 0..entities.len() {
+                    for j in (i + 1)..entities.len() {
+                        if pairs_checked >= pair_count {
+                            break 'outer;
+                        }
+
+                        // Get ML recommendation for this pair
+                        if let Some(orchestrator_ref) = reinforcement_orchestrator {
+                            // Lock for each method call
+                            let mut orchestrator = orchestrator_ref.lock().await;
+                            match orchestrator
+                                .select_matching_method(pool, &entities[i].0, &entities[j].0)
+                                .await
+                            {
+                                Ok((method, conf)) => {
+                                    // If phone is recommended method, use its confidence
+                                    if matches!(method, MatchMethodType::Phone) {
+                                        ml_confidence_scores.push(conf);
+                                    }
+                                }
+                                Err(e) => {
+                                    // Log error but continue
+                                    warn!("Error getting ML confidence: {}", e);
+                                }
+                            }
+                        }
+
+                        pairs_checked += 1;
+                    }
+                }
+
+                // If we got any ML confidence scores, use their average
+                if !ml_confidence_scores.is_empty() {
+                    confidence_score = ml_confidence_scores.iter().sum::<f64>()
+                        / ml_confidence_scores.len() as f64;
+                    info!(
+                        "Using ML-guided confidence {:.4} for phone group",
+                        confidence_score
+                    );
+                } else {
+                    info!("Using default confidence for phone group (no ML guidance)");
+                }
+            }
+
             confidence_scores.push(confidence_score);
 
             // Create a new entity group
@@ -374,7 +492,7 @@ pub async fn find_matches(pool: &PgPool) -> Result<PhoneMatchResult> {
                 group_cluster_id: None,
                 created_at: now,
                 updated_at: now,
-                confidence_score: confidence_score,
+                confidence_score,
                 entity_count,
             };
 
@@ -446,6 +564,39 @@ pub async fn find_matches(pool: &PgPool) -> Result<PhoneMatchResult> {
             .await
             .context("Failed to insert group method")?;
 
+            // Log ML feedback for the newly created group
+            if reinforcement_orchestrator.is_some() {
+                // For a new group, log feedback for a sample of entity pairs
+                let max_feedback_pairs = 10;
+                let mut pairs_logged = 0;
+
+                if let Some(orchestrator_ref) = reinforcement_orchestrator {
+                    for i in 0..entities.len() {
+                        for j in (i + 1)..entities.len() {
+                            if pairs_logged >= max_feedback_pairs {
+                                break;
+                            }
+
+                            let mut orchestrator = orchestrator_ref.lock().await;
+                            // Phone matches are considered correct (true)
+                            match orchestrator
+                                .log_match_result(
+                                    &MatchMethodType::Phone,
+                                    confidence_score,
+                                    true,
+                                    &entities[i].0,
+                                    &entities[j].0,
+                                )
+                                .await
+                            {
+                                Ok(_) => pairs_logged += 1,
+                                Err(e) => warn!("Failed to log match result to ML system: {}", e),
+                            }
+                        }
+                    }
+                }
+            }
+
             total_groups_created += 1;
             total_entities_matched += entity_count as usize;
             total_entities_added += entity_count as usize;
@@ -453,8 +604,8 @@ pub async fn find_matches(pool: &PgPool) -> Result<PhoneMatchResult> {
             group_sizes.push(entity_count as f32);
 
             info!(
-                "Created new phone group for {} with {} entities",
-                normalized_phone, entity_count
+                "Created new phone group for {} with {} entities (confidence: {:.4})",
+                normalized_phone, entity_count, confidence_score
             );
         }
     }
@@ -464,7 +615,7 @@ pub async fn find_matches(pool: &PgPool) -> Result<PhoneMatchResult> {
 
     // Calculate average confidence score and group size
     let avg_confidence: f64 = if !confidence_scores.is_empty() {
-        (confidence_scores.iter().sum::<f64>() / confidence_scores.len() as f64).into()
+        confidence_scores.iter().sum::<f64>() / confidence_scores.len() as f64
     } else {
         0.0
     };

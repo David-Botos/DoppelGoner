@@ -1,40 +1,20 @@
-// src/consolidate_clusters/consolidate_clusters.rs
-// 1. Build a graph representation of entity groups:
-//    - Nodes are entity_group records
-//    - Edges exist between groups that share at least one entity
-//    - Can use petgraph crate to build and analyze the graph
-
-// 2. Find connected components in this graph:
-//    - Each connected component represents a cluster of related groups
-//    - Use depth-first search or petgraph's connected_components algorithm
-
-// 3. For each connected component:
-//    - Create a new group_cluster record
-//    - Set name (could be derived from the largest group's name)
-//    - Set entity_count to the unique count of entities across all groups
-//    - Set group_count to the number of groups in this component
-
-// 4. Update the entity_group records:
-//    - For each group in a connected component, set group_cluster_id
-//    - This links the group to its parent cluster
-
-// 5. Performance considerations:
-//    - Use batch operations for database updates
-//    - For very large datasets, consider processing in chunks
-//    - Ensure proper transaction handling for atomicity
-
+// src/consolidate_clusters.rs
 use anyhow::{Context, Result};
 use chrono::Utc;
-use log::{debug, info};
+use log::{debug, info, warn};
 use petgraph::algo::kosaraju_scc;
 use petgraph::prelude::*;
+use tokio::sync::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use tokio_postgres::Transaction;
 use uuid::Uuid;
 
+// Use consistent crate-relative paths
 use crate::db::PgPool;
 use crate::models::{EntityGroupId, EntityId, GroupClusterId};
+// Import the specific type instead of the whole module
+use crate::reinforcement::MatchingOrchestrator;
 
 /// Builds an undirected graph where:
 /// - Nodes are entity groups
@@ -200,13 +180,17 @@ async fn update_groups(
     Ok(())
 }
 
-/// Processes entity groups to form clusters
+/// Processes entity groups to form clusters with optional ML verification
 ///
 /// This function:
 /// 1. Builds a graph of entity groups connected by shared entities
 /// 2. Finds connected components (clusters) in this graph
 /// 3. Creates cluster records and updates groups to reference their clusters
-pub async fn process_clusters(pool: &PgPool) -> Result<usize> {
+/// 4. Optionally verifies clusters using ML if an orchestrator is provided
+pub async fn process_clusters(
+    pool: &PgPool,
+    reinforcement_orchestrator: Option<&Mutex<MatchingOrchestrator>>,
+) -> Result<usize> {
     // Start by building the graph
     info!("Building entity group graph...");
     let start_time = Instant::now();
@@ -245,6 +229,8 @@ pub async fn process_clusters(pool: &PgPool) -> Result<usize> {
 
     let mut clusters_created = 0;
     let total_components = valid_components.len();
+    // Track newly created cluster IDs for ML verification
+    let mut new_cluster_ids = Vec::new();
 
     // Log progress at regular intervals
     let log_interval = std::cmp::max(1, total_components / 20); // Log approximately 20 times
@@ -278,6 +264,9 @@ pub async fn process_clusters(pool: &PgPool) -> Result<usize> {
 
         update_groups(&transaction, &cluster_id, &group_id_strings).await?;
 
+        // Track this new cluster for verification
+        new_cluster_ids.push(cluster_id);
+
         clusters_created += 1;
 
         // Log progress at regular intervals
@@ -289,6 +278,22 @@ pub async fn process_clusters(pool: &PgPool) -> Result<usize> {
                 (idx + 1) as f32 / total_components as f32 * 100.0,
                 clusters_created
             );
+        }
+    }
+
+    // Verify clusters using ML if orchestrator is provided
+    if let Some(orchestrator_ref) = reinforcement_orchestrator {
+        let mut orchestrator= orchestrator_ref.lock().await;
+        info!(
+            "Performing ML-based verification on {} new clusters",
+            new_cluster_ids.len()
+        );
+        match verify_clusters(&transaction, &new_cluster_ids, pool, &mut *orchestrator).await {
+            Ok(_) => info!("ML verification completed successfully"),
+            Err(e) => warn!(
+                "ML verification encountered errors but will continue: {}",
+                e
+            ),
         }
     }
 
@@ -307,4 +312,81 @@ pub async fn process_clusters(pool: &PgPool) -> Result<usize> {
     info!("Created {} clusters in total", clusters_created);
 
     Ok(clusters_created)
+}
+
+// Add this function to consolidate_clusters.rs
+async fn verify_clusters(
+    transaction: &Transaction<'_>,
+    new_cluster_ids: &[GroupClusterId],
+    pool: &PgPool,
+    reinforcement_orchestrator: &mut MatchingOrchestrator,
+) -> Result<()> {
+    info!(
+        "Verifying quality of {} newly formed clusters",
+        new_cluster_ids.len()
+    );
+
+    for cluster_id in new_cluster_ids {
+        // Fetch a sample of entities from this cluster (limit to 5 for performance)
+        let entity_query = "
+            SELECT DISTINCT e.id 
+            FROM entity e
+            JOIN group_entity ge ON e.id = ge.entity_id
+            JOIN entity_group eg ON ge.entity_group_id = eg.id
+            WHERE eg.group_cluster_id = $1
+            LIMIT 5
+        ";
+
+        let entity_rows = transaction.query(entity_query, &[&cluster_id.0]).await?;
+        let entities: Vec<EntityId> = entity_rows.iter().map(|row| EntityId(row.get(0))).collect();
+
+        if entities.len() >= 2 {
+            let mut verification_scores = Vec::new();
+
+            // Check pairs of entities to verify cluster quality
+            for i in 0..entities.len() {
+                for j in (i + 1)..entities.len() {
+                    match reinforcement_orchestrator
+                        .select_matching_method(pool, &entities[i], &entities[j])
+                        .await
+                    {
+                        Ok((_, confidence)) => {
+                            verification_scores.push(confidence);
+                        }
+                        Err(e) => {
+                            // Log error but continue verification
+                            warn!("Error during cluster verification: {}", e);
+                        }
+                    }
+                }
+            }
+
+            // Calculate average verification score
+            if !verification_scores.is_empty() {
+                let avg_score =
+                    verification_scores.iter().sum::<f64>() / verification_scores.len() as f64;
+
+                // Flag low-quality clusters for review
+                if avg_score < 0.7 {
+                    info!(
+                        "Flagging cluster {} for review (confidence score: {:.2})",
+                        cluster_id.0, avg_score
+                    );
+
+                    // Add metadata for this low-confidence cluster
+                    let metadata_query = "
+                        INSERT INTO clustering_metadata.cluster_verification (
+                            cluster_id, confidence_score, verified_at, needs_review
+                        ) VALUES ($1, $2, NOW(), TRUE)
+                    ";
+
+                    transaction
+                        .execute(metadata_query, &[&cluster_id.0, &avg_score])
+                        .await?;
+                }
+            }
+        }
+    }
+
+    Ok(())
 }

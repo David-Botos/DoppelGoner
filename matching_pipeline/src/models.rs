@@ -2,8 +2,11 @@
 
 use std::collections::{HashMap, HashSet};
 
+use bytes::BytesMut;
 use chrono::NaiveDateTime;
+use postgres_types::{FromSql, IsNull, ToSql, Type};
 use serde::{Deserialize, Serialize};
+use std::error::Error;
 
 //------------------------------------------------------------------------------
 // IDENTIFIER TYPES
@@ -13,6 +16,45 @@ use serde::{Deserialize, Serialize};
 /// Strongly typed identifier for Entity records
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EntityId(pub String);
+
+// Implement ToSql for EntityId
+impl ToSql for EntityId {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        // Delegate to the implementation for String
+        self.0.to_sql(ty, out)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        // EntityId can be used anywhere a String can be used
+        <String as ToSql>::accepts(ty)
+    }
+
+    fn to_sql_checked(
+        &self,
+        ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        self.0.to_sql_checked(ty, out)
+    }
+}
+
+// Implement FromSql for EntityId
+impl<'a> FromSql<'a> for EntityId {
+    fn from_sql(ty: &Type, raw: &[u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        // Convert raw bytes to String, then wrap in EntityId
+        let s = String::from_sql(ty, raw)?;
+        Ok(EntityId(s))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        // EntityId can be created from any type that String accepts
+        <String as FromSql>::accepts(ty)
+    }
+}
 
 /// Strongly typed identifier for Organization records from HSDS
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -150,7 +192,7 @@ pub enum MatchMethodType {
 
     /// Matching based on geographic proximity
     Geospatial,
-    
+
     /// Matching based on organization name similarity
     Name,
 
@@ -338,7 +380,7 @@ pub enum MatchValues {
 
     /// Geospatial matching values
     Geospatial(Vec<GeospatialMatchValue>),
-    
+
     /// Name matching values
     Name(Vec<NameMatchValue>),
 
@@ -428,19 +470,19 @@ pub struct GeospatialMatchValue {
 pub struct NameMatchValue {
     /// Original name as found in the data
     pub original: String,
-    
+
     /// Normalized name (the basis for matching)
     pub normalized: String,
-    
+
     /// Match score (fuzzy or semantic similarity)
     pub similarity_score: f32,
-    
+
     /// Type of matching used (fuzzy, semantic, or combined)
     pub match_type: String,
-    
+
     /// Source entity ID this name belongs to
     pub entity_id: EntityId,
-    
+
     /// The entity ID that this entity matched with
     pub matched_entity_id: Option<EntityId>,
 }
