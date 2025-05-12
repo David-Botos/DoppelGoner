@@ -54,10 +54,30 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
   // Refs for D3 elements and simulation
   const svgRef = useRef<SVGSVGElement>(null); // Ref for the SVG DOM element
   const simulationRef = useRef<d3.Simulation<D3Node, D3Link> | null>(null); // Ref for the D3 force simulation
-  const linksRef = useRef<d3.Selection<SVGLineElement, D3Link, SVGGElement, unknown> | null>(null); // Ref for D3 selection of link lines
-  const nodesRef = useRef<d3.Selection<SVGCircleElement, D3Node, SVGGElement, unknown> | null>(null); // Ref for D3 selection of node circles
-  const labelsRef = useRef<d3.Selection<SVGTextElement, D3Node, SVGGElement, unknown> | null>(null); // Ref for D3 selection of node labels
-  const graphContainerRef = useRef<d3.Selection<SVGGElement, unknown, null, undefined> | null>(null);
+  const linksRef = useRef<d3.Selection<
+    SVGLineElement,
+    D3Link,
+    SVGGElement,
+    unknown
+  > | null>(null); // Ref for D3 selection of link lines
+  const nodesRef = useRef<d3.Selection<
+    SVGCircleElement,
+    D3Node,
+    SVGGElement,
+    unknown
+  > | null>(null); // Ref for D3 selection of node circles
+  const labelsRef = useRef<d3.Selection<
+    SVGTextElement,
+    D3Node,
+    SVGGElement,
+    unknown
+  > | null>(null); // Ref for D3 selection of node labels
+  const graphContainerRef = useRef<d3.Selection<
+    SVGGElement,
+    unknown,
+    null,
+    undefined
+  > | null>(null);
   const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null); // Ref to store the D3 zoom behavior instance
 
   // State for tooltips
@@ -84,37 +104,53 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
     return 1;
   }, []);
 
-  const getLinkColor = useCallback((link: D3Link): string => {
-    if (currentTask && link.id === currentTask.id) {
-      return "#000000"; // Current task link is black
-    } else if (link.confirmed) {
-      return "#4caf50"; // Confirmed links are green
-    } else {
-      return getColorByConfidence(link.confidence_score);
-    }
-  }, [currentTask, getColorByConfidence]);
+  const getLinkColor = useCallback(
+    (link: D3Link): string => {
+      if (currentTask && link.id === currentTask.id) {
+        return "#000000"; // Current task link is black
+      } else if (link.confirmed) {
+        return "#4caf50"; // Confirmed links are green
+      } else {
+        return getColorByConfidence(link.confidence_score);
+      }
+    },
+    [currentTask, getColorByConfidence]
+  );
 
-  const getLinkThickness = useCallback((link: D3Link): number => {
-    if (currentTask && link.id === currentTask.id) {
-      return 4; // Current task link is thicker
-    } else if (link.confirmed) {
-      return 3; // Confirmed links
-    } else {
-      return getThicknessByConfidence(link.confidence_score);
-    }
-  }, [currentTask, getThicknessByConfidence]);
+  const getLinkThickness = useCallback(
+    (link: D3Link): number => {
+      if (currentTask && link.id === currentTask.id) {
+        return 4; // Current task link is thicker
+      } else if (link.confirmed) {
+        return 3; // Confirmed links
+      } else {
+        return getThicknessByConfidence(link.confidence_score);
+      }
+    },
+    [currentTask, getThicknessByConfidence]
+  );
 
-  const getNodeRadius = useCallback((node: D3Node): number => {
-    return currentTask && (node.id === (currentTask.source as unknown) || node.id === (currentTask.target as unknown))
-      ? 10 // Nodes in current task are larger
-      : 8; // Default node size
-  }, [currentTask]);
+  const getNodeRadius = useCallback(
+    (node: D3Node): number => {
+      return currentTask &&
+        (node.id === (currentTask.source as unknown) ||
+          node.id === (currentTask.target as unknown))
+        ? 10 // Nodes in current task are larger
+        : 8; // Default node size
+    },
+    [currentTask]
+  );
 
-  const getNodeColor = useCallback((node: D3Node): string => {
-    return currentTask && (node.id === (currentTask.source as unknown) || node.id === (currentTask.target as unknown))
-      ? "#3949ab" // Indigo for highlighted nodes in current task
-      : "#69b3a2"; // Default node color
-  }, [currentTask]);
+  const getNodeColor = useCallback(
+    (node: D3Node): string => {
+      return currentTask &&
+        (node.id === (currentTask.source as unknown) ||
+          node.id === (currentTask.target as unknown))
+        ? "#3949ab" // Indigo for highlighted nodes in current task
+        : "#69b3a2"; // Default node color
+    },
+    [currentTask]
+  );
 
   // --- useEffect Hooks ---
 
@@ -123,7 +159,12 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
   useEffect(() => {
     // If the main graph structure is still loading, or if graphData is not yet available,
     // or if there are no nodes, then data is not considered settled.
-    if (isLoadingGraphStructure || !graphData || !graphData.nodes || graphData.nodes.length === 0) {
+    if (
+      isLoadingGraphStructure ||
+      !graphData ||
+      !graphData.nodes ||
+      graphData.nodes.length === 0
+    ) {
       setIsDataSettled(false);
       return;
     }
@@ -141,7 +182,6 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
     // Set isDataSettled based on whether critical entity details are still loading.
     setIsDataSettled(!detailsStillLoadingForVisibleNodes);
   }, [graphData, detailsLoading, isLoadingGraphStructure]);
-
 
   // Effect 2: Main D3 graph rendering and re-rendering logic.
   // This effect runs when data is settled, or when graphData/currentTask or other visual properties change.
@@ -177,37 +217,43 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
       // console.warn("GraphVisualization: SVG dimensions are 0. Deferring D3 setup.");
       // Clear previous D3 elements if any existed and dimensions became zero (e.g. due to parent resize/hide)
       if (simulationRef.current) {
-         d3.select(svgElement).selectAll("*").remove();
-         simulationRef.current.stop();
-         simulationRef.current = null;
-         graphSignatureRef.current = null;
-         linksRef.current = null;
-         nodesRef.current = null;
-         labelsRef.current = null;
-         graphContainerRef.current = null;
+        d3.select(svgElement).selectAll("*").remove();
+        simulationRef.current.stop();
+        simulationRef.current = null;
+        graphSignatureRef.current = null;
+        linksRef.current = null;
+        nodesRef.current = null;
+        labelsRef.current = null;
+        graphContainerRef.current = null;
       }
       return;
     }
 
     // Ensure graphData and its nodes/links are valid (should be due to isDataSettled, but good for safety).
     if (!graphData || !graphData.nodes || !graphData.links) {
-        // This state should ideally not be reached if isDataSettled is true and handled graphData correctly.
-        // However, as a safeguard:
-        d3.select(svgElement).selectAll("*").remove();
-        if (simulationRef.current) {
-            simulationRef.current.stop();
-            simulationRef.current = null;
-        }
-        graphSignatureRef.current = null;
-        return;
+      // This state should ideally not be reached if isDataSettled is true and handled graphData correctly.
+      // However, as a safeguard:
+      d3.select(svgElement).selectAll("*").remove();
+      if (simulationRef.current) {
+        simulationRef.current.stop();
+        simulationRef.current = null;
+      }
+      graphSignatureRef.current = null;
+      return;
     }
 
-
     // Generate a signature for the current graph data to detect structural changes.
-    const currentGraphSignature = `${graphData.nodes.length}-${graphData.links.length}-${graphData.links.map(l => l.id).sort().join('_')}`;
+    const currentGraphSignature = `${graphData.nodes.length}-${
+      graphData.links.length
+    }-${graphData.links
+      .map((l) => l.id)
+      .sort()
+      .join("_")}`;
 
     // Determine if a full redraw is needed (e.g., first render, or graph structure changed).
-    const shouldRedrawGraph = !simulationRef.current || currentGraphSignature !== graphSignatureRef.current;
+    const shouldRedrawGraph =
+      !simulationRef.current ||
+      currentGraphSignature !== graphSignatureRef.current;
 
     if (shouldRedrawGraph) {
       // Store current node positions if a simulation already exists, to try and maintain layout.
@@ -223,7 +269,7 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
 
       graphSignatureRef.current = currentGraphSignature; // Update the signature reference.
       d3.select(svgElement).selectAll("*").remove(); // Clear SVG for a full redraw.
-      
+
       // Call the function to create and render the D3 graph.
       createGraph(nodePositions, width, height);
     }
@@ -235,12 +281,12 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
         // It's generally good practice to stop the simulation.
         // If createGraph runs again, it will re-initialize or update the simulation.
         // simulationRef.current.stop(); // This might be too aggressive if only styles change later.
-                                     // The stop is handled before redraw if shouldRedrawGraph is true.
+        // The stop is handled before redraw if shouldRedrawGraph is true.
       }
     };
   }, [
     isDataSettled, // Key dependency to ensure data readiness.
-    graphData,     // Primary data source.
+    graphData, // Primary data source.
     // Callbacks for styling and interaction are dependencies as they might change if currentTask changes.
     onNodeHover,
     getLinkColor,
@@ -255,7 +301,13 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
   // and avoids a full D3 recreation for mere style updates.
   useEffect(() => {
     // Guard: Only proceed if graph is rendered and references to D3 selections are available.
-    if (!isDataSettled || !linksRef.current || !nodesRef.current || !labelsRef.current || !simulationRef.current) {
+    if (
+      !isDataSettled ||
+      !linksRef.current ||
+      !nodesRef.current ||
+      !labelsRef.current ||
+      !simulationRef.current
+    ) {
       return;
     }
 
@@ -275,9 +327,14 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
 
     // Potentially update label visibility or style if needed, e.g., for highlighted nodes.
     // For this example, we assume labels don't change style based on currentTask beyond initial creation.
-
-  }, [isDataSettled, currentTask, getLinkColor, getLinkThickness, getNodeRadius, getNodeColor]);
-
+  }, [
+    isDataSettled,
+    currentTask,
+    getLinkColor,
+    getLinkThickness,
+    getNodeRadius,
+    getNodeColor,
+  ]);
 
   // --- D3 Graph Creation Function ---
   function createGraph(
@@ -295,59 +352,75 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
     const resolvedHeight = svgHeight > 0 ? svgHeight : 400;
 
     // Prepare nodes and links in D3-compatible format.
-    // Important: Create new arrays for D3 to ensure it picks up changes correctly.
-    const d3Nodes: D3Node[] = graphData.nodes.map(node => ({
+    const d3Nodes: D3Node[] = graphData.nodes.map((node) => ({
       ...node, // Spread original node data
       x: initialPositions[node.id]?.x, // Apply previous x position if available
       y: initialPositions[node.id]?.y, // Apply previous y position if available
     }));
 
-    const d3Links: D3Link[] = graphData.links.map(link => ({
+    const d3Links: D3Link[] = graphData.links.map((link) => ({
       ...link, // Spread original link data
-      // D3 will resolve string IDs to node objects:
       source: link.source,
       target: link.target,
     }));
 
-    // Initialize the D3 force simulation.
-    const simulation = d3.forceSimulation<D3Node, D3Link>(d3Nodes)
-      .force("link", d3.forceLink<D3Node, D3Link>(d3Links)
-        .id((d: D3Node) => d.id) // Specify how to get node ID for linking
-        .distance(100) // Desired link distance
-      )
-      .force("charge", d3.forceManyBody().strength(-300)) // Node repulsion strength
-      .force("center", d3.forceCenter(resolvedWidth / 2, resolvedHeight / 2)); // Center graph in SVG
-    simulationRef.current = simulation; // Store the simulation instance.
+    // console.log("d3Nodes: ", d3Nodes); // Kept for your debugging
+    // console.log("d3Links: ", d3Links); // Kept for your debugging
 
-    // Create a main <g> container for all graph elements (for zooming/panning).
-    graphContainerRef.current = svg.append("g").attr("class", "graph-container");
+    // Initialize the D3 force simulation.
+    const simulation = d3
+      .forceSimulation<D3Node, D3Link>(d3Nodes)
+      .force(
+        "link",
+        d3
+          .forceLink<D3Node, D3Link>(d3Links)
+          .id((d: D3Node) => d.id)
+          .distance(100)
+      )
+      .force("charge", d3.forceManyBody().strength(-300))
+      .force("center", d3.forceCenter(resolvedWidth / 2, resolvedHeight / 2));
+    simulationRef.current = simulation;
+
+    graphContainerRef.current = svg
+      .append("g")
+      .attr("class", "graph-container");
     const g = graphContainerRef.current;
 
     // --- Create Links ---
-    linksRef.current = g.append("g")
+    linksRef.current = g
+      .append("g")
       .attr("class", "links")
       .selectAll<SVGLineElement, D3Link>("line")
-      .data(d3Links, (d: D3Link) => d.id) // Use data key for object constancy
+      .data(d3Links, (d: D3Link) => d.id)
       .join(
-        enter => enter.append("line")
-          .attr("stroke", getLinkColor)
-          .attr("stroke-width", getLinkThickness)
-          .attr("opacity", 0) // Start transparent for fade-in
-          .call(selection => selection.transition().duration(300).attr("opacity", 1)), // Fade-in
-        update => update // Handle updates if needed, though full redraw is common here
-          .attr("stroke", getLinkColor)
-          .attr("stroke-width", getLinkThickness),
-        exit => exit // Handle exits if needed
-          .call(selection => selection.transition().duration(300).attr("opacity", 0).remove()) // Fade-out and remove
+        (enter) =>
+          enter
+            .append("line")
+            .attr("stroke", getLinkColor)
+            .attr("stroke-width", getLinkThickness)
+            .attr("opacity", 0) // Start transparent
+            .call((selection) =>
+              selection
+                .transition("fade-in-opacity") // Named transition
+                .duration(300)
+                .attr("opacity", 1)
+            ), // Fade-in to opacity 1
+        (update) =>
+          update
+            .attr("stroke", getLinkColor)
+            .attr("stroke-width", getLinkThickness),
+        (exit) =>
+          exit.call((selection) =>
+            selection.transition().duration(300).attr("opacity", 0).remove()
+          )
       )
       .on("mouseover", (event: MouseEvent, d: D3Link) => {
-        // Ensure source/target are correctly accessed as D3 might have populated them as objects
-        const sourceNode = d.source as D3Node; // Or string, handle appropriately
-        const targetNode = d.target as D3Node; // Or string
+        const sourceNode = d.source as D3Node;
+        const targetNode = d.target as D3Node;
         const entityGroupData: EntityGroup = {
           id: d.id,
-          source: typeof sourceNode === 'string' ? sourceNode : sourceNode.id,
-          target: typeof targetNode === 'string' ? targetNode : targetNode.id,
+          source: typeof sourceNode === "string" ? sourceNode : sourceNode.id,
+          target: typeof targetNode === "string" ? targetNode : targetNode.id,
           method_type: d.method_type,
           confidence_score: d.confidence_score,
           match_values: d.match_values,
@@ -361,30 +434,48 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
       });
 
     // --- Create Nodes ---
-    nodesRef.current = g.append("g")
+    nodesRef.current = g
+      .append("g")
       .attr("class", "nodes")
       .selectAll<SVGCircleElement, D3Node>("circle")
-      .data(d3Nodes, (d: D3Node) => d.id) // Use data key for object constancy
+      .data(d3Nodes, (d: D3Node) => d.id)
       .join(
-        enter => enter.append("circle")
-          .attr("r", getNodeRadius)
-          .attr("fill", getNodeColor)
-          .attr("opacity", 0) // Start transparent for fade-in
-          .call(d3.drag<SVGCircleElement, D3Node>() // Attach drag behavior
-            .on("start", (event, draggedNode) => dragstarted(event, draggedNode))
-            .on("drag", (event, draggedNode) => dragged(event, draggedNode))
-            .on("end", (event, draggedNode) => dragended(event, draggedNode))
+        (enter) =>
+          enter
+            .append("circle")
+            .attr("r", getNodeRadius)
+            .attr("fill", getNodeColor)
+            .attr("opacity", 0) // Start transparent
+            .call(
+              d3
+                .drag<SVGCircleElement, D3Node>()
+                .on("start", (event, draggedNode) =>
+                  dragstarted(event, draggedNode)
+                )
+                .on("drag", (event, draggedNode) => dragged(event, draggedNode))
+                .on("end", (event, draggedNode) =>
+                  dragended(event, draggedNode)
+                )
+            )
+            .call((selection) =>
+              selection
+                .transition("fade-in-opacity") // Named transition
+                .duration(300)
+                .attr("opacity", 1)
+            ), // Fade-in to opacity 1
+        (update) => update.attr("r", getNodeRadius).attr("fill", getNodeColor),
+        (exit) =>
+          exit.call((selection) =>
+            selection.transition().duration(300).attr("opacity", 0).remove()
           )
-          .call(selection => selection.transition().duration(300).attr("opacity", 1)), // Fade-in
-        update => update // Handle updates for existing nodes (e.g., color/radius change)
-          .attr("r", getNodeRadius)
-          .attr("fill", getNodeColor),
-        exit => exit // Handle nodes that are removed
-          .call(selection => selection.transition().duration(300).attr("opacity", 0).remove()) // Fade-out and remove
       )
       .on("mouseover", (event: MouseEvent, d: D3Node) => {
-        const entityData: Entity = { id: d.id, name: d.name, organization_id: d.organization_id };
-        onNodeHover(entityData.id); // Call prop function for side effects (e.g., fetch details)
+        const entityData: Entity = {
+          id: d.id,
+          name: d.name,
+          organization_id: d.organization_id,
+        };
+        onNodeHover(entityData.id);
         setTooltipNode(entityData);
         setTooltipPosition({ x: event.pageX, y: event.pageY });
       })
@@ -393,115 +484,130 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
       });
 
     // --- Create Labels ---
-    labelsRef.current = g.append("g")
+    labelsRef.current = g
+      .append("g")
       .attr("class", "labels")
       .selectAll<SVGTextElement, D3Node>("text")
-      .data(d3Nodes, (d: D3Node) => d.id) // Use data key
+      .data(d3Nodes, (d: D3Node) => d.id)
       .join(
-        enter => enter.append("text")
-          .text(d => d.name)
-          .attr("font-size", "10px")
-          .attr("dx", 12) // Offset from node center
-          .attr("dy", 4)  // Offset from node center
-          .attr("opacity", 0)
-          .call(selection => selection.transition().duration(300).attr("opacity", 1)),
-        update => update
-          .text(d => d.name), // Update text if name changes
-        exit => exit
-          .call(selection => selection.transition().duration(300).attr("opacity", 0).remove())
+        (enter) =>
+          enter
+            .append("text")
+            .text((d) => d.name)
+            .attr("font-size", "10px")
+            .attr("dx", 12)
+            .attr("dy", 4)
+            .attr("opacity", 0) // Start transparent
+            .call((selection) =>
+              selection
+                .transition("fade-in-opacity") // Named transition for consistency
+                .duration(300)
+                .attr("opacity", 1)
+            ), // Fade-in to opacity 1
+        (update) => update.text((d) => d.name),
+        (exit) =>
+          exit.call((selection) =>
+            selection.transition().duration(300).attr("opacity", 0).remove()
+          )
       );
 
-
     // --- Initialize Zoom ---
-    // Create zoom behavior instance if it doesn't exist, or update its extent.
     if (!zoomRef.current) {
-      zoomRef.current = d3.zoom<SVGSVGElement, unknown>()
-        .scaleExtent([0.1, 8]) // Min/max zoom scale
+      zoomRef.current = d3
+        .zoom<SVGSVGElement, unknown>()
+        .scaleExtent([0.1, 8])
         .on("zoom", (event: d3.D3ZoomEvent<SVGSVGElement, unknown>) => {
-          // Apply the zoom transform to the main graph container <g>
           if (graphContainerRef.current) {
-            graphContainerRef.current.attr("transform", event.transform.toString());
+            graphContainerRef.current.attr(
+              "transform",
+              event.transform.toString()
+            );
           }
         });
     }
-    // Always update the extent, in case the SVG size changes.
-    zoomRef.current.extent([[0, 0], [resolvedWidth, resolvedHeight]]);
-    // Apply the zoom behavior to the SVG element.
+    zoomRef.current.extent([
+      [0, 0],
+      [resolvedWidth, resolvedHeight],
+    ]);
     svg.call(zoomRef.current);
 
-
     // --- Simulation Tick Function ---
-    // This function is called by D3 at each step of the simulation to update positions.
     simulation.on("tick", () => {
       linksRef.current
-        ?.attr("x1", d => (d.source as D3Node).x ?? 0)
-        .attr("y1", d => (d.source as D3Node).y ?? 0)
-        .attr("x2", d => (d.target as D3Node).x ?? 0)
-        .attr("y2", d => (d.target as D3Node).y ?? 0);
+        ?.attr("x1", (d) => (d.source as D3Node).x ?? 0)
+        .attr("y1", (d) => (d.source as D3Node).y ?? 0)
+        .attr("x2", (d) => (d.target as D3Node).x ?? 0)
+        .attr("y2", (d) => (d.target as D3Node).y ?? 0);
 
-      nodesRef.current
-        ?.attr("cx", d => d.x ?? 0)
-        .attr("cy", d => d.y ?? 0);
+      nodesRef.current?.attr("cx", (d) => d.x ?? 0).attr("cy", (d) => d.y ?? 0);
 
-      labelsRef.current
-        ?.attr("x", d => d.x ?? 0)
-        .attr("y", d => d.y ?? 0);
+      labelsRef.current?.attr("x", (d) => d.x ?? 0).attr("y", (d) => d.y ?? 0);
     });
 
     // --- Optional: Center on Current Task ---
     if (currentTask && zoomRef.current) {
-      const zoomBehavior = zoomRef.current; // For closure in setTimeout
+      const zoomBehavior = zoomRef.current;
       setTimeout(() => {
-        // Find the D3 nodes corresponding to the current task's source and target.
-        const sourceNode = d3Nodes.find(n => n.id === currentTask.source);
-        const targetNode = d3Nodes.find(n => n.id === currentTask.target);
+        const sourceNode = d3Nodes.find((n) => n.id === currentTask.source);
+        const targetNode = d3Nodes.find((n) => n.id === currentTask.target);
 
-        if (sourceNode?.x != null && sourceNode?.y != null && targetNode?.x != null && targetNode?.y != null) {
+        if (
+          sourceNode?.x != null &&
+          sourceNode?.y != null &&
+          targetNode?.x != null &&
+          targetNode?.y != null
+        ) {
           const centerX = (sourceNode.x + targetNode.x) / 2;
           const centerY = (sourceNode.y + targetNode.y) / 2;
-          const scale = 1; // Or calculate a desired scale
+          const scale = 1;
 
-          // Programmatically apply a zoom transform to center the view.
-          svg.transition().duration(750)
+          svg
+            .transition()
+            .duration(750)
             .call(
               zoomBehavior.transform,
               d3.zoomIdentity
-                .translate(resolvedWidth / 2, resolvedHeight / 2) // Translate origin to SVG center
-                .scale(scale) // Apply desired scale
-                .translate(-centerX, -centerY) // Translate so (centerX, centerY) is at the origin
+                .translate(resolvedWidth / 2, resolvedHeight / 2)
+                .scale(scale)
+                .translate(-centerX, -centerY)
             );
         }
-      }, 500); // Delay to allow initial simulation to settle slightly.
+      }, 500);
     }
 
     // --- Drag Handler Functions ---
-    function dragstarted(event: d3.D3DragEvent<SVGCircleElement, D3Node, D3Node>, d: D3Node) {
+    function dragstarted(
+      event: d3.D3DragEvent<SVGCircleElement, D3Node, D3Node>,
+      d: D3Node
+    ) {
       if (!event.active && simulationRef.current) {
-        simulationRef.current.alphaTarget(0.3).restart(); // Reheat simulation during drag.
+        simulationRef.current.alphaTarget(0.3).restart();
       }
-      d.fx = d.x; // Fix node's x position.
-      d.fy = d.y; // Fix node's y position.
+      d.fx = d.x;
+      d.fy = d.y;
     }
 
-    function dragged(event: d3.D3DragEvent<SVGCircleElement, D3Node, D3Node>, d: D3Node) {
-      d.fx = event.x; // Update fixed x to mouse position.
-      d.fy = event.y; // Update fixed y to mouse position.
+    function dragged(
+      event: d3.D3DragEvent<SVGCircleElement, D3Node, D3Node>,
+      d: D3Node
+    ) {
+      d.fx = event.x;
+      d.fy = event.y;
     }
 
-    function dragended(event: d3.D3DragEvent<SVGCircleElement, D3Node, D3Node>, d: D3Node) {
+    function dragended(
+      event: d3.D3DragEvent<SVGCircleElement, D3Node, D3Node>,
+      d: D3Node
+    ) {
       if (!event.active && simulationRef.current) {
-        simulationRef.current.alphaTarget(0); // Cool down simulation.
+        simulationRef.current.alphaTarget(0);
       }
-      // Only unfix position if this is the primary subject of the drag end.
-      // D3's event.active can be complex with multiple concurrent drags if not handled.
-      // A simpler approach for single drags:
-      if (event.subject === d) { // Check if this node was the one being dragged directly.
-         d.fx = null; // Unfix node's x position.
-         d.fy = null; // Unfix node's y position.
+      if (event.subject === d) {
+        d.fx = null;
+        d.fy = null;
       }
     }
   }
-
 
   // --- JSX Rendering ---
 
@@ -515,12 +621,15 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
       </div>
     );
   }
-  
+
   // If data is not settled for other reasons (e.g. isLoadingGraphStructure is true, or graphData is null),
   // page.tsx's loading/empty states will be shown. This component will render its SVG container
   // once isDataSettled is true (which implies graphData is present and details are loaded).
   return (
-    <div className="relative w-full h-full" data-testid="graph-visualization-container">
+    <div
+      className="relative w-full h-full"
+      data-testid="graph-visualization-container"
+    >
       {/* SVG element where D3 will render the graph. It's always in the DOM if this return path is reached,
           but D3 content is only added if isDataSettled and dimensions are valid. */}
       <svg ref={svgRef} className="w-full h-full"></svg>
