@@ -1,511 +1,425 @@
-# HSDS Entity Grouping and Clustering System
+# **HSDS Entity Grouping and Clustering System (RL Enhanced)**
 
-## System Overview
+## **System Overview**
 
-The entity grouping system identifies and links related organizations across a federated database. The process works in five phases:
+The entity grouping system identifies and links related organizations across a federated database. This process is now significantly enhanced by an **intelligent Reinforcement Learning (RL) system**. This RL system plays a crucial role in determining the confidence of matches and continuously learns from human feedback to improve its accuracy and decision-making over time. The pipeline operates in the following key phases:
 
-1. **Entity Identification**: Extract entities from the `organization` table and their related records
-2. **Group Formation**: Match entities based on various criteria (URL, phone, email, address, etc.)
-3. **Cluster Consolidation**: Combine overlapping groups into unified clusters
-4. **Service Embedding**: Generate vector embeddings for service names and descriptions
-5. **Service Matching**: Identify potentially identical services within clusters using semantic similarity
+1. **Entity Identification**: Extracts entities (organizations) from the organization table and links them to their related records (services, phones, locations, etc.).  
+2. **Context Feature Extraction**: Gathers a comprehensive set of characteristics (features) for each entity. These features are vital for the RL system's ContextModel to understand the nuances of each entity and the context of potential matches.  
+3. **Incremental Group Formation (with RL-Guided Confidence)**: Matches entities based on various criteria (URL, phone, email, address, name, geospatial proximity). Each potential match is now a **pairwise link** between two entities. The confidence\_score for these pairwise links is dynamically determined and refined by the RL system's MatchingOrchestrator.  
+4. **Cluster Consolidation (with RL-Assisted Verification)**: Combines overlapping pairwise entity groups into unified clusters. This phase also leverages the RL system to verify the internal coherence and quality of newly formed clusters.  
+5. **Service Embedding Generation**: Creates vector embeddings (numerical representations) for service names and descriptions, enabling semantic understanding and comparison.  
+6. **Service Matching**: Identifies potentially identical services within the consolidated entity clusters by considering semantic similarity (using embeddings) and geospatial proximity.
 
-## Database Schema Extension
+*(For a detailed, narrative explanation of how the Reinforcement Learning system determines confidence, learns from feedback, and interacts with different matching methods, please see the "Understanding Our Intelligent Matching System" document.)*
 
-The system uses the following tables to track entities, groups, and matches:
+## **Database Schema for Intelligent Matching and Pairwise Grouping**
 
-- `entity`: Represents organization metadata
-- `entity_feature`: Links entities to records in other HSDS tables
-- `entity_group`: Represents a collection of matched entities
-- `group_entity`: Maps which entities belong to which groups
-- `group_method`: Records how entities in a group were matched
-- `group_cluster`: Represents a consolidated set of overlapping groups
-- `service_cluster`: Maps services to their corresponding clusters
-- `service_match`: Records potential matches between services
+The system relies on an extended database schema, primarily within the public and clustering\_metadata schemas, to manage entities, pairwise groups, consolidated clusters, matching details, and the operational data for the RL system.  
+**Key Tables in public schema:**
 
-## Processing Flow
+* organization: Core table for organization data. Contains embedding for organization name/description.  
+* service: Core table for service data. Contains embedding\_v2 for service name/description.  
+* location: Stores location data, including geom for geospatial calculations.  
+* entity: Represents an organization extracted for the entity resolution process. Linked to organization.id.  
+  * id: Primary key.  
+  * organization\_id: Foreign key to public.organization.  
+  * name: Name of the organization.  
+* entity\_feature: Links entities to their associated records in other HSDS tables (e.g., service, phone, location).  
+  * entity\_id: Foreign key to public.entity.  
+  * table\_name: Name of the HSDS table (e.g., 'service', 'phone').  
+  * table\_id: ID of the record in the specified table\_name.  
+* entity\_group: **Crucially, this table now represents a pairwise link between two entities.**  
+  * id: Primary key.  
+  * entity\_id\_1: Foreign key to public.entity.  
+  * entity\_id\_2: Foreign key to public.entity. (Constraint: entity\_id\_1 \< entity\_id\_2 to ensure unique pairs).  
+  * method\_type: The primary matching method that established this link (e.g., 'email', 'name').  
+  * confidence\_score: The **RL-guided confidence score** for this specific pairwise match.  
+  * match\_values: A JSONB field storing the specific values that led to the match (e.g., the shared email, normalized names, similarity scores pre-RL).  
+  * group\_cluster\_id: Foreign key to public.group\_cluster, indicating which consolidated cluster this pair belongs to (populated during cluster consolidation).  
+  * version: Version number for the match record.  
+* group\_cluster: Represents a consolidated set of (pairwise) entity\_group records that, through shared entities, form a larger cluster.  
+  * id: Primary key.  
+  * name, description: Optional metadata for the cluster.  
+  * entity\_count: Number of unique entities in this cluster.  
+  * group\_count: Number of pairwise entity\_group links in this cluster.  
+* service\_match: Records potential matches between two services within the same group\_cluster.  
+  * id: Primary key.  
+  * group\_cluster\_id: The cluster in which these services were compared.  
+  * service\_id\_1, service\_id\_2: Foreign keys to public.service.  
+  * similarity\_score: The calculated similarity (e.g., cosine similarity of embeddings).  
+  * match\_reasons: Textual description of why the match was made.  
+  * status: e.g., 'potential', 'confirmed', 'rejected'.  
+* service\_cluster & clustered\_service: (If implementing service-level clustering based on confirmed service\_match records)  
+  * service\_cluster (formerly): This seems to have been refactored. The provided DDL shows service\_cluster with service\_id and cluster\_id as a PK, acting more like a junction table (renamed from the original doc's clustered\_service). Let's assume public.service\_cluster now directly links a service to a conceptual service cluster ID. If a separate table for service cluster metadata is needed, it would be a new addition. For now, we'll describe public.service\_cluster as per the DDL.  
+  * public.service\_cluster: Links a service\_id to a cluster\_id (this cluster\_id would be a conceptual grouping ID for services, distinct from public.group\_cluster.id which is for entities).
 
-### 1. Entity Identification
+**Key Tables in clustering\_metadata schema (Supporting RL and Pipeline Operations):**
 
-First, the system creates an entity for each organization and links it to related records:
+* pipeline\_run: Logs each execution of the entity resolution pipeline.  
+  * Stores run timestamps, processing times for different stages (entity processing, matching, clustering, service matching), and overall statistics (total entities, groups, clusters, service matches).  
+* matching\_method\_stats: Records statistics for each matching method per pipeline run.  
+  * pipeline\_run\_id: Foreign key to pipeline\_run.  
+  * method\_type: The matching method (e.g., 'email', 'name').  
+  * groups\_created: Number of **new pairwise entity\_group links** created by this method.  
+  * entities\_matched: Number of unique entities participating in these new pairwise links.  
+  * avg\_confidence: Average RL-derived confidence\_score for the new links.  
+  * avg\_group\_size: This will consistently be **2.0** due to the pairwise structure.  
+* cluster\_stats: Records statistics about the consolidated clusters per pipeline run.  
+  * pipeline\_run\_id: Foreign key to pipeline\_run.  
+  * total\_clusters: Total number of group\_cluster records.  
+  * avg\_entities\_per\_cluster: Average number of unique entities per group\_cluster.  
+  * avg\_groups\_per\_cluster: Average number of pairwise entity\_group links per group\_cluster.  
+  * largest\_cluster\_size: Number of unique entities in the largest cluster.  
+* service\_match\_stats: Records statistics for the service matching phase per pipeline run.  
+  * pipeline\_run\_id: Foreign key to pipeline\_run.  
+  * total\_matches: Total number of service\_match records created.  
+  * avg\_similarity: Average similarity score of these matches.  
+* ml\_models: Stores the serialized state of the RL models (ContextModel and ConfidenceTuner).  
+  * model\_type: e.g., 'ContextModel', 'ConfidenceTuner'.  
+  * parameters: JSONB storing model data (e.g., serialized Random Forest, bandit arm statistics).  
+  * version: Version of the model.  
+  * metrics: JSONB for performance metrics of the model.  
+* entity\_context\_features: Stores the detailed characteristics (features) extracted for each entity.  
+  * entity\_id: Foreign key to public.entity.  
+  * feature\_name: Name of the extracted feature (e.g., 'name\_complexity', 'service\_semantic\_coherence').  
+  * feature\_value: Numerical value of the feature.  
+* entity\_match\_pairs: Logs data related to each RL-guided decision for an entity pair.  
+  * decision\_id: Foreign key to human\_review\_decisions (if reviewed).  
+  * entity1\_id, entity2\_id: The pair of entities.  
+  * method\_type: The matching method considered.  
+  * prediction\_confidence: The confidence score assigned by the RL system.  
+  * snapshotted\_features: JSONB of the entity context features used for this decision.  
+  * context\_model\_version, confidence\_tuner\_version: Versions of the RL models used.  
+* human\_review\_decisions: Stores decisions made by human data managers during review.  
+  * id: Primary key.  
+  * reviewer\_id: Identifier for the human reviewer.  
+  * decision\_type: Type of decision (e.g., 'confirm\_match', 'split\_cluster').  
+  * cluster\_id, entity\_id, correct\_cluster\_id: Relevant IDs for the review.  
+  * confidence: Human-assigned confidence, if applicable.  
+* human\_review\_method\_feedback: Stores specific feedback from human reviewers about the appropriateness of a matching method and its outcome for a pair.  
+  * decision\_id: Foreign key to human\_review\_decisions.  
+  * method\_type: The method being reviewed.  
+  * was\_correct: Boolean indicating if the system's application of the method was correct.  
+  * confidence\_adjustment: Suggested adjustment to confidence.  
+* suggested\_actions: Lists matches or clusters flagged by the system (often due to RL-derived low confidence or verification failures) for human review.  
+  * action\_type: e.g., 'REVIEW\_ENTITY\_IN\_GROUP', 'SUGGEST\_SPLIT\_CLUSTER'.  
+  * entity\_id, group\_id\_1 (for pairwise entity\_group), cluster\_id: Relevant IDs.  
+  * triggering\_confidence: The confidence score that triggered the suggestion.  
+  * priority, status: For managing the review workflow.  
+* cluster\_formation\_edges: (If used for diagnostics/analysis of cluster building) Stores information about edges considered during graph-based cluster consolidation.  
+  * source\_group\_id, target\_group\_id: IDs of pairwise entity\_group records.  
+  * calculated\_edge\_weight: Weight of the edge between these pairs (based on shared entities and confidences).
 
-```
-┌─────────────┐          ┌─────────┐          ┌────────────────┐
-│ Organization│─────────▶│ Entity  │◀─────────│ Entity Feature │
+*(Refer to ddl\_introspection\_report.md and specific schema definition files for detailed column descriptions, types, and constraints.)*
+
+## **Processing Flow**
+
+### **1\. Entity Identification**
+
+(This phase remains largely the same: an entity record is created for each organization, and entity\_feature links are established to connect organizations to their related data like services, phones, locations, etc.)  
+┌─────────────┐          ┌─────────┐          ┌────────────────┐  
+│ Organization│─────────▶│ Entity  │◀─────────│ Entity Feature │  
 └─────────────┘          └─────────┘          └────────────────┘
-```
 
-1. Create an `entity` record for each `organization` in the HSDS data
-2. Find all related records (services, phones, locations, etc.)
-3. Create `entity_feature` links between entities and related records
+1. Create a public.entity record for each public.organization.  
+2. Find all related records (services, phones, locations, etc.) for each organization.  
+3. Create public.entity\_feature links between entities and these related records.  
+   The system checks for existing entities first to avoid duplicates.
 
-The system checks for existing entities first to avoid creating duplicates.
+### **2\. Context Feature Extraction (Crucial for RL)**
 
-### 2. Incremental Group Formation
+Before any matching occurs, the system extracts a rich set of contextual features for each entity. This is a distinct and critical phase for the RL system.
 
-For each matching method (URL, phone, email, address, geospatial), the system:
+* **Purpose**: These features provide the ContextModel (part of the RL system) with the necessary information to understand the characteristics and nuances of each entity. This detailed understanding is vital for making context-aware matching decisions.  
+* **Process (feature\_extraction.rs \-\> entity\_organizations::extract\_and\_store\_all\_entity\_context\_features()):**  
+  * For each entity in public.entity:  
+    * Various characteristics are computed or queried. Examples include:  
+      * Complexity of the organization's name.  
+      * Completeness of its data profile (e.g., presence of email, phone, URL, address).  
+      * Number of services, locations.  
+      * Semantic properties derived from its name and service description embeddings (e.g., embedding\_centroid\_distance if applicable, service\_semantic\_coherence).  
+  * These extracted features are stored in the clustering\_metadata.entity\_context\_features table, linking them to the respective entity\_id.  
+* **Importance**: This ensures that when the MatchingOrchestrator evaluates a potential pair of entities, it has a comprehensive understanding of each entity individually, leading to more informed and nuanced matching predictions by the ContextModel and ConfidenceTuner.
 
-```
-                 [GROUP METHOD]
-        ┌─────────┐           ┌─────────┐
-        │ ENTITY  │           │ ENTITY  │
-        └─────────┘           └─────────┘
-                      │
-                      ▼
-                ┌─────────────┐
-                │   ENTITY    │
-                │   GROUP     │
-                └─────────────┘
-```
+### **3\. Incremental Group Formation (Pairwise with RL-Guided Confidence)**
 
-1. **Identifies unprocessed entities**:
-   - Queries the database to find entities that have not been processed by this specific matching method
-   - Skips entities that have already been checked in previous runs
+For each matching method (URL, phone, email, address, name, geospatial), the system identifies **pairwise links** between entities.  
+        ┌─────────┐           ┌─────────┐  
+        │ Entity A│           │ Entity B│  
+        └─────────┘           └─────────┘  
+             │                     │  
+             └───────RL-GUIDED─────┘  
+                       MATCH  
+                         │  
+                         ▼  
+        ┌──────────────────────────────────┐  
+        │  Pairwise entity\_group           │  
+        │ (Entity A, Entity B, method, RL\_confidence)│  
+        └──────────────────────────────────┘
 
-2. **First checks against existing groups**:
-   - For each unprocessed entity, checks if it matches the criteria of any existing group
-   - If a match is found, adds the entity to that existing group
-   - Updates the group's entity count and match values
+1. **Identify Candidate Pairs**: Each matching module (e.g., email.rs, name.rs) uses its specific logic to find potential pairs of entities that share a common attribute (e.g., same normalized email, similar names).  
+2. **Check for Existing Pairwise Matches**: The system queries public.entity\_group to see if a specific pair has already been matched by the current method in a previous run to avoid redundant processing.  
+3. **RL-Guided Scoring for New Pairs**:  
+   * For each new candidate pair (Entity1, Entity2):  
+     * The MatchingOrchestrator is invoked.  
+     * Contextual features for Entity1 and Entity2 are retrieved from clustering\_metadata.entity\_context\_features (or extracted if not already present).  
+     * The ContextModel analyzes these features to predict the most appropriate matching method and provides a contextual signal.  
+     * The ConfidenceTuner selects an optimal confidence\_score for this specific pair and method, considering the ContextModel's advice and historical performance.  
+4. **Record Pairwise Link with RL Confidence**:  
+   * A new record is inserted into public.entity\_group.  
+     * entity\_id\_1 and entity\_id\_2 store the IDs of the matched entities.  
+     * method\_type stores the method that established the link (e.g., 'email').  
+     * confidence\_score stores the **RL-derived confidence** from the ConfidenceTuner.  
+     * match\_values (JSONB) stores the actual data points that caused the match (e.g., the shared normalized email, original names, pre-RL similarity scores for name matching).  
+   * The MatchingOrchestrator logs details of this decision (features, model versions, outcome) into clustering\_metadata.entity\_match\_pairs for future retraining and analysis.  
+   * If the confidence\_score is below predefined thresholds (see config.rs), an action may be logged in clustering\_metadata.suggested\_actions for human review.  
+5. **Incremental Processing**: This approach is incremental. On subsequent runs, already processed and scored pairs for a given method can be skipped, improving efficiency.
 
-3. **Processes remaining entities**:
-   - For entities that don't match existing groups, compares them against each other
-   - Forms new groups for sets of matching entities (when 2+ entities match)
+This pairwise structure, with each link having an RL-derived confidence, provides a granular and nuanced foundation for the subsequent clustering phase.
 
-4. **Records all relationships**:
-   - Creates `group_entity` records to link entities to their groups
-   - Creates or updates `group_method` records with match details
-   - Assigns confidence scores based on match quality
+### **4\. Cluster Consolidation (with RL-Assisted Verification)**
 
-This incremental approach significantly improves efficiency for subsequent pipeline runs.
+Overlapping pairwise entity\_group links are consolidated into larger, unified clusters.  
+(E\_A, E\_B, conf\_AB)──┐  
+                    ├─► Shared Entity E\_B  
+(E\_B, E\_C, conf\_BC)──┘  
+      │  
+      ▼  
+┌─────────────────────────┐  
+│  Consolidated Cluster   │  
+│  (E\_A, E\_B, E\_C)        │  
+│  RL Verified            │  
+└─────────────────────────┘
 
-### 3. Cluster Consolidation
+1. **Graph Building (consolidate\_clusters.rs \-\> build\_weighted\_xgraph):**  
+   * A graph is constructed where **nodes are the pairwise entity\_group records** (representing a direct, RL-scored link between two entities).  
+   * **Edges** are defined between two such entity\_group nodes if they **share a common entity**.  
+     * Example: If entity\_group\_1 links (EntityA, EntityB) and entity\_group\_2 links (EntityB, EntityC), an edge is formed between entity\_group\_1 and entity\_group\_2 because they share EntityB.  
+   * The **weight of this edge** is calculated based on the confidence\_score of the participating pairwise entity\_group links. A Noisy-Or aggregation can be used to combine these confidences.  
+   * Information about these connections can be stored in clustering\_metadata.cluster\_formation\_edges for diagnostics.  
+2. **Community Detection:**  
+   * The system applies an advanced community detection algorithm (e.g., **Leiden algorithm**) to this graph of pairwise links.  
+   * The algorithm identifies communities, which are sets of interconnected pairwise links. These communities form the basis of the consolidated clusters.  
+3. **Cluster Record Creation and Updates:**  
+   * For each community detected:  
+     * A new public.group\_cluster record is created.  
+     * All the pairwise public.entity\_group records that belong to this community are updated with the group\_cluster\_id of the newly formed cluster.  
+     * The entity\_count (unique entities) and group\_count (number of pairwise links) for the group\_cluster are calculated and stored.  
+4. **RL-Assisted Verification (consolidate\_clusters.rs \-\> verify\_clusters function):**  
+   * After new group\_cluster records are formed, the MatchingOrchestrator (RL system) is invoked to assess their internal coherence.  
+   * **Process**:  
+     1. For a given group\_cluster, all unique entity IDs are collected from the entity\_id\_1 and entity\_id\_2 columns of the associated pairwise entity\_group records.  
+     2. The system samples pairs of these unique entities from within the new cluster.  
+     3. For each sampled pair, context features are extracted, and the ContextModel is used to predict how well they should belong together (i.e., predict a confidence score for their linkage *within the context of this cluster*).  
+   * **Outcome**:  
+     * If the average confidence for these internal pairs is low (below VERIFICATION\_THRESHOLD from config.rs), a SUGGEST\_SPLIT\_CLUSTER action is logged in clustering\_metadata.suggested\_actions. This indicates the cluster might be too broad or contain unrelated entities, flagging it for human review.
 
-After all matching methods have run, the system consolidates overlapping groups:
+### **5\. Service Embedding Generation**
 
-```
-┌─────────────┐
-│  ENTITY A   │──┐
-└─────────────┘  │
-┌─────────────┐  ├──► GROUP ───┐
-│  ENTITY B   │──┘             │
-└─────────────┘                │
-                               ├──► CLUSTER
-┌─────────────┐                │
-│  ENTITY C   │──┐             │
-└─────────────┘  ├──► GROUP ───┘
-┌─────────────┐  │
-│  ENTITY A   │──┘
-└─────────────┘
-```
-
-1. Builds a graph where groups are nodes and shared entities create edges
-2. Finds connected components in this graph (each component becomes a cluster)
-3. Creates `group_cluster` records and updates groups with their cluster ID
-
-The `petgraph` crate provides efficient graph operations for this purpose. This clustering step allows for transitive relationships - groups that don't directly share entities can still be connected through intermediate shared relationships.
-
-### 4. Service Embedding Generation
-
-Before services can be compared semantically, the system generates vector embeddings:
-
-```
-┌───────────────┐     ┌────────────────┐     ┌─────────────────┐
-│    SERVICE    │     │   EMBEDDING    │     │ [1, 2, 3, ... ] │
-│ NAME + DESC.  │────▶│     MODEL      │────▶│ [5, 6, 7, ... ] │
+(This phase remains largely the same as described in the original document: a pre-trained transformer model like BGE-small-en-v1.5 is used to convert service names and descriptions into dense vector embeddings, which are stored in service.embedding\_v2.)  
+┌───────────────┐     ┌────────────────┐     ┌─────────────────┐  
+│    SERVICE    │     │   EMBEDDING    │     │ \[0.1, 0.8, ... \]│  
+│ NAME \+ DESC.  │────▶│     MODEL      │────▶│ \[0.5, 0.2, ... \]│  
 └───────────────┘     └────────────────┘     └─────────────────┘
-```
 
-1. **Model Loading**:
-   - Loads a pre-trained transformer model (BGE-small-en-v1.5)
-   - Initializes a tokenizer and sets up the embedding pipeline
-
-2. **Batch Processing**:
-   - Identifies services without embeddings
-   - Processes services in parallel batches to maximize throughput
-   - Uses GPU acceleration when available (Metal on Mac)
-
-3. **Text Preparation**:
-   - Combines service name and description into a unified text representation
-   - Tokenizes the text according to the model's requirements
-
-4. **Vector Generation**:
-   - Processes text through the transformer model
-   - Applies mean pooling to token embeddings to create a fixed-size document vector
-   - Normalizes vectors for cosine similarity calculations
-
-5. **Storage**:
-   - Stores the resulting embeddings in the `service.embedding` column as a `vector(384)` type
-   - Uses PostgreSQL's pgvector extension for efficient vector operations
-
-This step enables semantic comparison between services based on their textual content, allowing the system to identify similar services even when they use different terminology.
-
-### 5. Service Matching
-
-Finally, the system identifies potentially identical services within each cluster:
-
-
-┌───────────┐           ┌─────────────────────────────┐
-│  CLUSTER  │────GROUP──│ Service - SHELTER SERVICES  │
-└───────────┘ │         └─────────────────────────────┘
-              │                      │
-              │       ┌─────────────────────────────┐
-              │       │ Service - BEDS FOR THOSE IN NEED
-              └──────▶│                             │
-                GROUP │                             │
-                      └─────────────────────────────┘
-                                    │
-                                    ▼
-                             SERVICE_MATCH
-```
-
-1. **Cluster-Based Processing**:
-   - Processes one cluster at a time to limit comparison scope
-   - Only compares services within the same organizational cluster
-
-2. **Vector Similarity**:
-   - Uses vector cosine similarity to find semantically similar services
-   - Identifies nearest neighbors using PostgreSQL's vector operators
-   - Applies a similarity threshold (0.85) to filter potential matches
-
-3. **Match Recording**:
-   - Creates `service_match` records for service pairs above the similarity threshold
-   - Stores similarity scores and match reasons for later review
-   - Prevents duplicate matches through ordered ID comparison
-
-4. **Incremental Updates**:
-   - Only processes services that have embeddings but haven't been matched
-   - Adds to existing match sets when new services are found
-
-The service matching process allows for identifying potential service duplicates even when they have different names or descriptions but serve the same purpose.
-
-## Matching Methods
-
-### 1. URL Matching
-
-**Data Source**: `organization.url` and `service.url`
-
-**Algorithm**:
-1. Extract and normalize domains from URLs
-2. Group entities by identical normalized domains
-
-**Incremental Processing**:
-- Maintains a record of entities already processed by URL matching
-- Checks if new entities' domains match existing groups before creating new ones
-- Updates existing groups when matches are found
-
-**Confidence**: 0.9 (high) for exact domain matches
-
-### 2. Phone Matching
-
-**Data Source**: `phone` table linked to entities
-
-**Algorithm**:
-1. Normalize phone numbers by removing formatting and standardizing
-2. Group entities by identical normalized phone numbers
-
-**Incremental Processing**:
-- Skips entities already included in phone matching groups
-- Adds new entities to existing phone groups when numbers match
-- Creates new groups only for previously unmatched numbers with multiple entities
-
-**Confidence**: 0.95 (very high) for exact numbers, 0.85 for matches with different extensions
-
-### 3. Email Matching
-
-**Data Source**: `organization.email` and `service.email`
-
-**Algorithm**:
-1. Normalize email addresses (lowercasing, standardizing Gmail dots, etc.)
-2. Group entities by identical normalized emails
-
-**Incremental Processing**:
-- Tracks processed entities to avoid redundant checks
-- Efficiently updates existing email groups with new matching entities
-- Maintains historical match information when adding to groups
-
-**Confidence**: 1.0 (maximum) for exact email matches
-
-### 4. Address Matching
-
-**Data Source**: `address` table linked via `location` table
-
-**Algorithm**:
-1. Normalize addresses (standardize abbreviations, remove units, etc.)
-2. Group entities by similar addresses
-
-**Incremental Processing**:
-- Identifies entities not yet processed by address matching
-- Checks new addresses against existing normalized address groups
-- Adds to existing groups or creates new ones as appropriate
-
-**Confidence**: 0.95 (high) for exact address matches after normalization
-
-### 5. Geospatial Matching
-
-**Data Source**: `location.latitude` and `location.longitude`
-
-**Algorithm**:
-1. Calculate distances between location points using haversine formula
-2. Group entities with locations within threshold distances
-
-**Incremental Processing**:
-- Converts PostgreSQL numeric types to double precision for compatibility
-- Filters out already processed entities for efficient reprocessing
-- Uses distance thresholds to assign entities to existing proximity groups
-- Creates centroids dynamically as groups grow
-
-**Confidence**: Based on distance - 0.95 (very close, <100m), 0.85 (close, <500m), 0.75 (nearby, <2km)
-
-## Service Embedding and Matching
-
-### Embedding Model
-
-The system uses a pre-trained language model to generate semantic representations:
-
-**Model**: BGE-Small-English-v1.5
-- A lightweight but effective transformer model specialized for embedding generation
-- 384-dimensional output embeddings
-- Optimized for semantic similarity tasks
-
-**Configuration**:
-- Model files stored in `./models/bge-small-en-v1.5/`
-- Tokenizer, configuration, and weights loaded at runtime
-- Hardware acceleration used when available (Metal on Mac, CPU fallback)
-
-### Embedding Process Details
-
-The embedding process is designed for efficiency and scalability:
-
-1. **Parallel Processing**:
-   - Uses concurrent batch processing with configurable batch size (default: 64)
-   - Processes multiple batches in parallel (default: 4 concurrent batches)
-   - Employs tokio for async operations and futures for parallelism
-
-2. **Tensor Operations**:
-   - Uses the Candle library for tensor operations
-   - Handles padding, attention masks, and batching
-   - Performs mean pooling across token embeddings
-
-3. **Performance Optimization**:
-   - Employs connection pooling with bb8 and tokio-postgres
-   - Uses transactions for batch updates
-   - Provides detailed logging with timing information for monitoring
-
-4. **Progress Tracking**:
-   - Maintains real-time statistics on processing progress
-   - Logs batch completion and overall progress percentage
-   - Captures error conditions for later analysis
-
-### Service Matching Algorithm
-
-The service matching algorithm leverages vector similarity to identify potential duplicates:
-
-1. **Cluster-Based Scope**:
-   - Only compares services within the same organizational cluster
-   - Dramatically reduces the comparison space from O(n²) to much smaller subsets
-
-2. **Vector Search**:
-   - Uses PostgreSQL's pgvector extension for ANN (Approximate Nearest Neighbors) search
-   - Employs the cosine distance operator (`<=>`) for similarity calculations
-   - Returns the top 20 most similar services for each service
-
-3. **Filtering**:
-   - Applies a similarity threshold (0.85 by default)
-   - Ensures service pairs are unique (ordered by ID to prevent duplicates)
-   - Labels matches as "potential" for later human review
-
-4. **Result Storage**:
-   - Stores match information in `service_match` table
-   - Records similarity scores and match reasons
-   - Includes timestamp and status information
-
-## Implementation Approach
-
-### Incremental Processing Strategy
-
-The matching pipeline is designed to be rerun efficiently when new data arrives. The system accomplishes this through:
-
-1. **Only Processing New Entities**: 
-   - For each matching method, the system first identifies entities that have already been processed
-   - Only entities that haven't been checked by a particular matching method are processed
-   - This prevents redundant work when the pipeline is run repeatedly
-
-2. **Intelligent Group Assignment**:
-   - When new entities are found, they are checked against existing groups first
-   - If a match is found with an existing group, the entity is added to that group
-   - Match values and entity counts are updated accordingly
-   - Only when a set of new entities matches each other (but doesn't match any existing group) is a new group created
-
-3. **Transaction Safety**:
-   - All database operations are performed within transactions
-   - This ensures consistency even if processing is interrupted
-
-4. **Embedding Efficiency**:
-   - Only processes services without existing embeddings
-   - Uses batching and parallelism for optimal throughput
-   - Provides detailed progress information for monitoring
-
-This approach significantly improves performance for subsequent pipeline runs, especially as the database grows in size. It also preserves existing groupings while incorporating new entities appropriately.
-
-### Group Reconciliation Strategy
-
-When groups overlap (share entities), they are consolidated into clusters:
-
-1. Build an undirected graph where:
-   - Nodes are groups
-   - Edges exist between groups that share at least one entity
-
-2. Find connected components in this graph (each component is a cluster)
-
-3. For each connected component:
-   - Create a `group_cluster` record
-   - Calculate metrics like entity count and group count
-   - Update all groups with their cluster ID
-
-The `petgraph` crate provides efficient graph operations for this purpose.
-
-### Service Matching Strategy
-
-Once clusters are formed and services are embedded, the matching process:
-
-1. For each cluster, collects all services linked to its entities
-2. Compares each service using vector similarity:
-   - Vector cosine similarity for semantic comparison
-   - Nearest neighbor search using pgvector's operators
-
-3. Calculates similarity scores (1 - cosine distance)
-4. Creates `service_match` records for pairs above a threshold (0.85)
-
-## Performance Considerations
-
-The implementation includes several optimizations:
-
-1. **Connection Pooling**: Efficient connection management with `bb8` and `tokio-postgres`
-
-2. **Batch Processing**: Operations are batched to reduce database roundtrips
-
-3. **Type Safety**: Strongly-typed domain models minimize runtime errors
-
-4. **Incremental Processing**:
-   - Only process entities that haven't been processed by a specific matching method
-   - Add new entities to existing groups when appropriate
-   - Create new groups only when necessary
-   - This dramatically reduces processing time for subsequent pipeline runs
-
-5. **Database Type Compatibility**:
-   - Explicit casting between PostgreSQL types (like `numeric` to `double precision`) 
-   - Ensures compatibility with Rust types like `f64`
-
-6. **Parallel Processing**:
-   - Uses async Rust and tokio for concurrency
-   - Service embedding runs in parallel batches
-   - Configurable concurrency levels based on available resources
-
-7. **Vector Operations**:
-   - Uses pgvector for efficient vector storage and search
-   - Leverages ANN (Approximate Nearest Neighbors) for similarity search
-   - Optimized tensor operations with the Candle library
-
-## Business Value
-
-This system provides significant benefits:
-
-1. **Elimination of Duplicates**: Identifies when the same organization appears multiple times
-
-2. **Enhanced Data Quality**: Connects related records across the database
-
-3. **Improved Service Discovery**: Helps clients find all services from an organization
-
-4. **Better Analysis**: Enables more accurate reporting by consolidating duplicate records
-
-5. **Workflow Efficiency**: Reduces manual data cleansing work
-
-6. **Scalability**: The incremental approach allows efficient processing as data grows
-
-7. **Semantic Understanding**: Identifies similar services even when descriptions vary
-
-## Example Walk-through
-
-Let's walk through a complete example:
-
-1. **Initial Run**:
-   - System processes all organizations and creates entities
-   - Matching methods find groups (e.g., two organizations sharing phone number 555-123-4567)
-   - Groups are clustered and service embeddings generated
-   - Service matches identified within clusters
-
-2. **Later Run with New Data**:
-   - New organization "Community Food Bank" is added with phone 555-123-4567
-   - Entity identification creates a new entity
-   - Phone matching checks this entity against existing groups
-   - The entity is added to the existing phone match group
-   - Cluster consolidation updates the affected cluster
-   - Service embedding generates vectors for the new organization's services
-   - Service matching checks for new potential service matches
-
-This incremental approach saves significant processing time compared to re-processing all entities.
-
-## Service Embedding Example
-
-For a service named "Emergency Food Assistance" with description "Provides food boxes to households in crisis":
-
-1. The text "Emergency Food Assistance Provides food boxes to households in crisis" is tokenized
-2. Tokens are processed through the BGE-Small model
-3. The resulting embedding is a 384-dimensional vector
-4. This vector is stored in the `service.embedding` column
-5. During matching, this service might be matched with another service called "Food Pantry" if their embeddings have high similarity
-
-This semantic matching goes beyond simple text comparison, understanding that concepts like "food boxes" and "food pantry" are related even though they use different terminology.
-
-## Deployment and Usage
-
-The system is designed with flexible deployment options to accommodate different operational needs:
-
-### Binary Targets
-
-The project includes multiple binary targets:
-
-1. **Full Pipeline** (`dedupe`): 
-   - Entry point: `src/main.rs`
-   - Runs the complete pipeline (entity identification, matching, clustering, embedding, service matching)
-   - Command: `cargo run --release --bin dedupe`
-
-2. **Service Embeddings Only** (`run_service_embeddings`): 
-   - Entry point: `src/bin/run_service_embeddings.rs`
-   - Only processes service embedding generation
-   - Useful for computationally intensive embedding updates without rerunning the entire pipeline
-   - Command: `cargo run --release --bin run_service_embeddings`
-
-3. **Library** (`dedupe_lib`):
-   - Entry point: `src/lib.rs`
-   - Enables importing the functionality into other Rust applications
-   - Makes components reusable in different contexts
-
-### Configuration
-
-1. **Environment Variables**: Set database connection parameters and other configuration options
-2. **Local Configuration**: The system checks for `.env`, `.env.local`, and `../env` files in that order
-3. **Model Paths**: Embedding models are expected in the `./models/` directory
-
-### Execution Workflow
-
-For a typical deployment:
-
-1. **Initial Setup**:
-   - Ensure PostgreSQL with pgvector and PostGIS extension is available
-   - Download required models to the `./models/` directory
-   - Configure environment variables
-
-2. **Regular Processing**:
-   - Run the full pipeline periodically (e.g., daily or weekly) to process new data
-   - `cargo run --release --bin dedupe`
-
-3. **Embedding Updates**:
-   - Run the embedding generator separately when needed for service embedding updates
-   - `cargo run --release --bin run_service_embeddings`
-
-4. **Monitoring**:
-   - Watch logs for progress and statistics
-   - Check database for updated entity groups, clusters, and service matches
-
-The system is designed to be run periodically as new data arrives, efficiently processing only what's changed since the previous run.
+This step is crucial for enabling semantic similarity comparisons in the Service Matching phase.
+
+### **6\. Service Matching**
+
+This process identifies potentially identical services, but critically, it operates *within* the boundaries of the group\_cluster records formed in the previous step.  
+┌───────────┐          ┌────────────────────────────┐  
+│  CLUSTER  │───Pair───┤ Service \- SHELTER SERVICES │  
+│ (IDs:A,B,C)│ (A,B)    └────────────────────────────┘  
+└───────────┘    │                    │  
+                 │                    │ Semantic \+ Geospatial  
+                 │                    │ Similarity  
+                 │                    ▼  
+                 │     ┌────────────────────────────┐  
+                 └Pair─┤ Service \- BEDS FOR THOSE   │  
+                  (B,C)│ IN NEED                    │  
+                       └────────────────────────────┘  
+                                     │  
+                                     ▼  
+                               SERVICE\_MATCH  
+                               (Shelter, Beds)  
+                                     │  
+                                     ▼  
+                        ┌─────────────────────┐  
+                        │   SERVICE\_CLUSTER   │ (Conceptual)  
+                        └─────────────────────┘  
+                                     │  
+                                     ▼  
+                        ┌─────────────────────┐  
+                        │  CLUSTERED\_SERVICE  │ (Links service to conceptual cluster)  
+                        └─────────────────────┘
+
+**Service Matching Process (service\_matching/semantic\_geospatial.rs):**
+
+1. **Cluster-Based Processing**:  
+   * The system iterates through each group\_cluster identified in the consolidation phase.  
+   * **Fetching Services for a Cluster**: To get all services associated with a given group\_cluster\_id:  
+     1. Select all pairwise entity\_group records with that group\_cluster\_id.  
+     2. Collect all unique entity\_id\_1 and entity\_id\_2 values from these records.  
+     3. Fetch all services (via entity\_feature) linked to these unique entity IDs that have a non-NULL embedding\_v2.  
+   * This dramatically reduces the comparison space, as services are only compared if their parent organizations are already deemed related and part of the same cluster.  
+2. **Two-Pronged Similarity Check (for pairs of services within the cluster)**:  
+   * **Semantic Similarity**:  
+     * Uses vector cosine similarity (pgvector's \<=\> operator on service.embedding\_v2) to find semantically similar service pairs.  
+     * Applies a high similarity threshold (e.g., 0.85 from config.rs) to ensure quality.  
+   * **Geospatial Proximity**:  
+     * If both services in a semantically similar pair have associated locations (via service\_at\_location and location), the system checks if they share at least one pair of nearby locations.  
+     * Uses PostGIS's ST\_DWithin on location.geom (e.g., within a 2km radius).  
+     * If location data is incomplete for one or both services, it may fall back to semantic-only matching, potentially with an adjusted confidence or flagging.  
+3. **Match Recording**:  
+   * For service pairs meeting both semantic and geospatial criteria (or semantic-only where applicable), a public.service\_match record is created.  
+   * group\_cluster\_id (the entity cluster ID), service\_id\_1, service\_id\_2, similarity\_score, and match\_reasons are stored.  
+   * An initial status (e.g., 'potential') is assigned for human review.  
+4. **Statistics Tracking**:  
+   * Comprehensive statistics are logged in clustering\_metadata.service\_match\_stats (e.g., total matches, average similarity, distribution of similarity scores).  
+5. **Incremental Updates**: The process can be run incrementally, typically focusing on services within newly formed or updated clusters, or services that haven't been matched before.
+
+**Service Cluster Formation (Conceptual, based on confirmed matches):**
+
+* After human reviewers confirm service\_match records (updating their status to 'confirmed'), these matches can be used to build conceptual service clusters.  
+* The public.service\_cluster table (as per DDL: PK on service\_id, cluster\_id) would link individual services to these conceptual service cluster IDs.  
+* This allows for managing sets of services that are deemed identical or highly equivalent.
+
+## **Matching Methods and Reinforcement Learning Integration**
+
+The core of the entity resolution pipeline lies in its diverse matching methods, each targeting specific data attributes (URLs, phone numbers, names, etc.) to identify potential links between organization records. The integration of the **Reinforcement Learning (RL) system** is a pivotal enhancement, providing dynamic, context-aware confidence scores for each **pairwise match**, moving beyond static rules or simple similarity thresholds.  
+**General Principle for RL-Guided Confidence Scoring in Matching Methods:**  
+For each matching method detailed below, the interaction with the RL system generally follows these steps:
+
+1. **Candidate Pair Identification:** The method's primary algorithm (e.g., normalization and exact matching for emails; fuzzy, semantic, and hybrid approaches for names) identifies potential **pairs** of entities based on its specific criteria.  
+2. **Consulting the MatchingOrchestrator (RL System Coordinator):**  
+   * Before finalizing a match or when assessing the strength of a potential link between two entities (Entity A, Entity B), the MatchingOrchestrator is invoked.  
+   * **Contextual Feature Retrieval:** Relevant contextual features for Entity A and Entity B are fetched from clustering\_metadata.entity\_context\_features. These features describe the entities and their relationship across various dimensions (name similarity, service similarity, data completeness, geographic proximity, etc.).  
+   * **ContextModel Prediction:** The ContextModel (e.g., a Random Forest classifier stored in clustering\_metadata.ml\_models) analyzes these features. Its primary role is to predict the most *appropriate* matching method or assess the contextual strength for this specific pair.  
+   * **ConfidenceTuner Selection:** The ConfidenceTuner (e.g., a Multi-Armed Bandit system, also stored in clustering\_metadata.ml\_models) then selects an optimal confidence\_score for the match. This selection is influenced by:  
+     * The specific matching method being employed (e.g., 'email', 'name').  
+     * The historical performance (rewards) of different confidence levels for that method.  
+     * The contextual assessment or advice provided by the ContextModel.  
+3. **Storing RL-Guided Pairwise Confidence:**  
+   * This dynamically determined confidence\_score is stored in the public.entity\_group record for the (Entity A, Entity B) pair, alongside the method\_type and match\_values. This score reflects a nuanced, learned understanding of the match's reliability in the given context.  
+4. **Logging for Learning and Transparency:**  
+   * The MatchingOrchestrator logs its decision, including a snapshot of the features used, model versions, predicted method (if applicable), and the final confidence, into the clustering\_metadata.entity\_match\_pairs table. This is vital for retraining the RL models and for auditing/understanding system behavior.  
+5. **Learning from Human Feedback:**  
+   * Human data manager reviews of suggested actions or specific matches (stored in clustering\_metadata.human\_review\_decisions and clustering\_metadata.human\_review\_method\_feedback) are processed by a FeedbackProcessor.  
+   * This feedback is used to retrain and fine-tune both the ContextModel and the ConfidenceTuner, allowing the system to continuously improve its decision-making and confidence calibration.  
+6. **Suggesting Human Review:** If the final RL-guided confidence\_score for a pair falls below configurable thresholds (defined in src/config.rs), a suggestion for human review (e.g., REVIEW\_ENTITY\_IN\_GROUP) may be logged in clustering\_metadata.suggested\_actions.
+
+*(For a more detailed narrative on the RL components and their interaction, please refer to the "Understanding Our Intelligent Matching System" document.)*
+
+### **1\. URL Matching**
+
+* **Data Source**: organization.url and service.url (linked via entity\_feature).  
+* **Algorithm**:  
+  1. Extract domains from URLs.  
+  2. Normalize domains (lowercase, remove "www.", etc.).  
+  3. Exclude common, non-identifying domains (e.g., social media, URL shorteners) as defined in matching/url.rs (is\_ignored\_domain function).  
+  4. Identify pairs of entities sharing identical, non-ignored normalized domains.  
+* **Incremental Processing**:  
+  * Checks public.entity\_group for existing 'url' matches for a given entity pair to avoid re-processing.  
+  * For new pairs sharing a domain, proceeds to RL scoring.  
+* **RL-Guided Confidence**:  
+  * While a shared, specific domain is a strong indicator (e.g., base confidence 0.9), the final confidence\_score stored in entity\_group.confidence\_score for the (Entity A, Entity B) pair is determined by the MatchingOrchestrator.  
+  * The RL system considers contextual features. If two entities share mycharity.org but have vastly different names, services, and locations, the ContextModel might flag this as ambiguous, leading the ConfidenceTuner to assign a lower confidence. Conversely, alignment in other features could bolster confidence.  
+* **Match Values Storage**: entity\_group.match\_values would store original\_url1, original\_url2, and normalized\_shared\_domain.  
+* **Implementation Reference**: src/matching/url.rs
+
+### **2\. Phone Matching**
+
+* **Data Source**: phone table (linked via entity\_feature).  
+* **Algorithm**:  
+  1. Normalize phone numbers (remove non-numeric characters, basic US country code handling). (Function: normalize\_phone in matching/phone.rs).  
+  2. Identify pairs of entities sharing identical normalized phone numbers.  
+  3. Phone extensions are considered; matches with consistent extensions (both same or both NULL) are typically stronger base cases.  
+* **Incremental Processing**: Checks public.entity\_group for existing 'phone' matches for an entity pair.  
+* **RL-Guided Confidence**:  
+  * Base confidences (e.g., 0.95 for exact match with consistent extensions, 0.85 if extensions differ) serve as initial signals.  
+  * The MatchingOrchestrator refines this. If entities share a phone but are in disparate locations or have dissimilar names/services, the ContextModel signals higher risk, and the ConfidenceTuner adjusts the final confidence\_score in entity\_group accordingly.  
+* **Match Values Storage**: entity\_group.match\_values would store original\_phone1, original\_phone2, normalized\_shared\_phone, extension1, extension2.  
+* **Implementation Reference**: src/matching/phone.rs
+
+### **3\. Email Matching**
+
+* **Data Source**: organization.email and service.email (linked via entity\_feature).  
+* **Algorithm**:  
+  1. Normalize email addresses (lowercase, trim, Gmail-specific normalizations like removing dots and '+' aliases). (Function: normalize\_email in matching/email.rs).  
+  2. Identify pairs of entities sharing identical normalized email addresses.  
+* **Incremental Processing**: Checks public.entity\_group for existing 'email' matches for an entity pair.  
+* **RL-Guided Confidence**:  
+  * An exact email match often has a high base confidence (e.g., 1.0).  
+  * The MatchingOrchestrator is critical. If contextual features (e.g., highly different names, services, locations despite a shared generic email like info@domain.com) suggest ambiguity, the ContextModel flags this.  
+  * The ConfidenceTuner, informed by this context, assigns a final confidence\_score (potentially much lower than 1.0) to the entity\_group record for the pair, reflecting the learned risk.  
+* **Match Values Storage**: entity\_group.match\_values would store original\_email1, original\_email2, and normalized\_shared\_email.  
+* **Implementation Reference**: src/matching/email.rs
+
+### **4\. Address Matching**
+
+* **Data Source**: address table (linked via location and entity\_feature).  
+* **Algorithm**:  
+  1. Normalize addresses (lowercase, remove punctuation, standardize abbreviations, remove unit details to get a base street address). (Function: normalize\_address in matching/address.rs).  
+  2. Identify pairs of entities sharing identical normalized base addresses.  
+* **Incremental Processing**: Checks public.entity\_group for existing 'address' matches for an entity pair.  
+* **RL-Guided Confidence**:  
+  * A normalized address match has a strong base confidence (e.g., 0.95).  
+  * The MatchingOrchestrator adjusts this. If entities share an address but have very different names and no shared phone/URL (e.g., different businesses in the same large building), the ContextModel might perceive higher risk, leading the ConfidenceTuner to assign a lower confidence\_score to the entity\_group pair.  
+* **Match Values Storage**: entity\_group.match\_values would store original\_address1, original\_address2, and normalized\_shared\_address.  
+* **Implementation Reference**: src/matching/address.rs
+
+### **5\. Name Matching**
+
+* **Data Source**: organization.name (from entity.name). Organization embeddings (organization.embedding) are also used.  
+* **Algorithm (for pairs of entities)**:  
+  1. **Normalization (normalize\_name in matching/name.rs):** Lowercase, remove legal suffixes (Inc, LLC), standardize abbreviations, normalize punctuation.  
+  2. **Hybrid Pairwise Similarity Calculation:**  
+     * **Fuzzy String Similarity:** Jaro-Winkler similarity on normalized names (handles typos). Threshold: MIN\_FUZZY\_SIMILARITY.  
+     * **Semantic Similarity:** Cosine similarity between organization.embedding vectors (handles conceptually similar but textually different names). Threshold: MIN\_SEMANTIC\_SIMILARITY.  
+     * **Combined Scoring:** If semantic is high, a weighted score is used (e.g., 60% semantic, 40% fuzzy). Otherwise, if only fuzzy is high, that's used. This score must exceed COMBINED\_THRESHOLD.  
+  3. Identify pairs of entities whose combined (or individual) similarity score passes the threshold.  
+* **Incremental Processing**: Checks public.entity\_group for existing 'name' matches for an entity pair.  
+* **RL-Guided Confidence**:  
+  * The name matching module might define base confidences for different pre-RL match types (e.g., CONFIDENCE\_SEMANTIC \= 0.90, CONFIDENCE\_FUZZY \= 0.80).  
+  * When a pair (Entity A, Entity B) is identified as a potential name match based on the above algorithm, the MatchingOrchestrator is consulted.  
+  * The RL system determines the final confidence\_score for the entity\_group record. This score might blend the pre-RL similarity score with the ContextModel's output or be primarily driven by the RL system's assessment of the pair's overall context.  
+  * The match\_type (e.g., "fuzzy", "semantic", "combined", "ml\_guided") can be logged in entity\_group.match\_values.  
+* **Match Values Storage**: entity\_group.match\_values would store original\_name1, original\_name2, normalized\_name1, normalized\_name2, the pre-RL similarity\_score, and pre-RL match\_type.  
+* **Implementation Reference**: src/matching/name.rs
+
+### **6\. Geospatial Matching**
+
+* **Data Source**: location.latitude, location.longitude (and location.geom), service.embedding\_v2.  
+* **Algorithm (identifies candidate sets, then evaluates pairs):**  
+  1. **Proximity-Based Candidate Identification:**  
+     * If PostGIS is available: Uses ST\_DWithin or ST\_ClusterDBSCAN with various distance thresholds (e.g., \<100m, \<500m, \<2km from matching/geospatial/config.rs) to find sets of entities that are geographically close.  
+     * If PostGIS is not available: Calculates Haversine distances to find proximate sets.  
+  2. **Pairwise Evaluation within Proximate Sets:**  
+     * For each unique pair of entities (Entity A, Entity B) found within a geographically proximate set:  
+       * **Service Similarity Check (service\_utils::compare\_entity\_services):** Their services are compared using service.embedding\_v2 and cosine similarity. The average service similarity must meet SERVICE\_SIMILARITY\_THRESHOLD. This prevents matching unrelated organizations that are merely co-located (e.g., different shops in a mall).  
+       * If both proximity and service similarity checks pass, the pair becomes a candidate for RL scoring.  
+* **Incremental Processing**: Checks public.entity\_group for existing 'geospatial' matches for an entity pair.  
+* **RL-Guided Confidence**:  
+  * Each distance threshold has a base confidence (e.g., \<100m \-\> 0.95).  
+  * When a pair (Entity A, Entity B) passes the distance and service similarity checks, the MatchingOrchestrator is consulted.  
+  * The ContextModel analyzes all features of the pair. The ConfidenceTuner then determines the final confidence\_score for the entity\_group record, blending the base distance-derived confidence with the RL system's contextual assessment (e.g., (ml\_conf \* 0.7) \+ (base\_confidence \* 0.3)).  
+* **Match Values Storage**: entity\_group.match\_values could store latitudes/longitudes for the entities, the distance between them, and the service similarity score.  
+* **Implementation Reference**: src/matching/geospatial/core.rs
+
+### **7\. Semantic-Geospatial Service Matching (Service-Level, Not Entity Grouping)**
+
+* **Note:** This method is distinct from the six entity grouping methods. It operates *within* already established public.group\_cluster records to find matches between *services*, not to form new entity groups.  
+* **Data Source**: service.embedding\_v2, service\_at\_location, location.geom.  
+* **Algorithm**:  
+  1. **Scope:** Operates on services belonging to entities within the *same public.group\_cluster*.  
+  2. **Semantic Similarity:** Uses vector cosine similarity (pgvector's \<=\> on service.embedding\_v2) to find semantically similar service pairs (e.g., similarity \>= 0.85).  
+  3. **Geospatial Verification:** For semantically similar service pairs, it verifies they share at least one nearby physical location (PostGIS ST\_DWithin on location.geom, e.g., within 2km). If location data is incomplete, may fall back to semantic-only.  
+* **Incremental Processing**:  
+  * Compares services primarily within the same entity cluster.  
+  * Checks for existing public.service\_match records to avoid duplicates.  
+* **Confidence**:  
+  * The confidence for a public.service\_match is primarily based on the semantic similarity score.  
+  * This method does **not** typically use the entity-level RL MatchingOrchestrator for its confidence scores, as it's focused on service-to-service similarity. However, the quality of the entity clusters it operates on *is* influenced by the RL system's earlier work.  
+* **Outcome**: Creates public.service\_match records (status 'potential') for service pairs that are likely duplicates. These are then subject to human review. Confirmed matches can be used to form conceptual service clusters (e.g., by populating public.service\_cluster).  
+* **Implementation Reference**: src/service\_matching/semantic\_geospatial.rs
