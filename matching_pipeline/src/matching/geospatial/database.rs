@@ -1,298 +1,182 @@
 // src/matching/geospatial/database.rs
-//
-// Database interaction functions for geospatial matching
 
 use anyhow::{Context, Result};
 use log::debug;
 use std::collections::{HashMap, HashSet};
-use tokio_postgres::{Client, Statement, Transaction};
+use tokio_postgres::Client; // Removed Statement and Transaction as they are not used directly for prepare here
 
-use crate::models::{EntityId, GroupResults, LocationResults, MatchValues};
+use crate::models::{EntityGroupId, EntityId, GeospatialMatchValue, LocationResults, MatchValues};
 
-/// Struct to hold prepared database statements
+// Type alias for clarity when fetching existing geospatial pairs
+pub type ExistingGeoPairsMap =
+    HashMap<EntityGroupId, (EntityId, EntityId, GeospatialMatchValue, Option<f64>)>;
+
+/// Struct to hold SQL query strings for pairwise geospatial matching.
+/// These are no longer prepared statements but direct query strings.
+#[derive(Debug, Clone)]
 pub struct DbStatements {
-    pub group_stmt: Statement,
-    pub entity_stmt: Statement,
-    pub method_stmt: Statement,
-    pub update_group_count_stmt: Statement,
-    pub update_method_stmt: Statement,
-    pub consistency_check_stmt: Statement,
-    pub distance_stmt: Option<Statement>,
+    /// SQL to insert a new pairwise entity_group for a geospatial match.
+    pub new_geospatial_pair_sql: &'static str,
+
+    /// SQL for consistency check: if an entity is already in ANY geospatial pair.
+    pub consistency_check_sql: &'static str,
+
+    /// PostGIS distance calculation SQL (point-to-point).
+    pub distance_sql: &'static str,
 }
 
-/// Prepare database statements for reuse
-pub async fn prepare_statements(tx: &Transaction<'_>) -> Result<DbStatements> {
-    let group_stmt = tx
-        .prepare(
-            "
-        INSERT INTO entity_group 
-        (id, name, created_at, updated_at, confidence_score, entity_count, version) 
-        VALUES ($1, $2, $3, $4, $5, $6, 1)
-    ",
-        )
-        .await
-        .context("Failed to prepare entity_group statement")?;
-
-    let entity_stmt = tx
-        .prepare(
-            "
-        INSERT INTO group_entity 
-        (id, entity_group_id, entity_id, created_at) 
-        VALUES ($1, $2, $3, $4)
-    ",
-        )
-        .await
-        .context("Failed to prepare group_entity statement")?;
-
-    let method_stmt = tx
-        .prepare(
-            "
-        INSERT INTO group_method 
-        (id, entity_group_id, method_type, description, match_values, confidence_score, created_at) 
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-    ",
-        )
-        .await
-        .context("Failed to prepare group_method statement")?;
-
-    let update_group_count_stmt = tx
-        .prepare(
-            "
-        UPDATE entity_group
-        SET entity_count = entity_count + 1,
-            updated_at = $1,
-            version = version + 1
-        WHERE id = $2
-    ",
-        )
-        .await
-        .context("Failed to prepare update_group_count statement")?;
-
-    let update_method_stmt = tx
-        .prepare(
-            "
-        UPDATE group_method
-        SET match_values = $1
-        WHERE id = $2
-    ",
-        )
-        .await
-        .context("Failed to prepare update_method statement")?;
-
-    let consistency_check_stmt = tx
-        .prepare(
-            "
-        SELECT COUNT(*) 
-        FROM group_entity ge
-        JOIN group_method gm ON ge.entity_group_id = gm.entity_group_id
-        WHERE ge.entity_id = $1
-        AND gm.method_type = 'geospatial'
-    ",
-        )
-        .await
-        .context("Failed to prepare consistency check statement")?;
-
-    // Prepare PostGIS-specific statement if available
-    let distance_stmt = tx
-        .prepare(
-            "
-        SELECT ST_Distance(
-            ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
-            ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography
-        ) AS distance
-    ",
-        )
-        .await
-        .ok();
-
-    Ok(DbStatements {
-        group_stmt,
-        entity_stmt,
-        method_stmt,
-        update_group_count_stmt,
-        update_method_stmt,
-        consistency_check_stmt,
-        distance_stmt,
-    })
-}
-
-/// Get all entities that are already part of a geospatial match group
-pub async fn get_processed_entities(conn: &Client) -> Result<HashSet<EntityId>> {
-    let processed_query = "
-        SELECT DISTINCT ge.entity_id
-        FROM group_entity ge
-        JOIN group_method gm ON ge.entity_group_id = gm.entity_group_id
-        WHERE gm.method_type = 'geospatial'
-    ";
-
-    let processed_rows = conn
-        .query(processed_query, &[])
-        .await
-        .context("Failed to query processed entities")?;
-
-    let mut processed_entities = HashSet::new();
-    for row in &processed_rows {
-        let entity_id: String = row.get("entity_id");
-        processed_entities.insert(EntityId(entity_id));
+/// Returns a struct containing the SQL query strings.
+/// This function no longer prepares statements or requires a transaction.
+pub fn get_statements() -> DbStatements {
+    DbStatements {
+        new_geospatial_pair_sql: "
+            INSERT INTO entity_group 
+            (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, created_at, updated_at, version) 
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
+        ",
+        consistency_check_sql: "
+            SELECT COUNT(*) 
+            FROM entity_group
+            WHERE (entity_id_1 = $1 OR entity_id_2 = $1)
+            AND method_type = 'geospatial'
+        ",
+        distance_sql: "
+            SELECT ST_Distance(
+                ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+                ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography
+            ) AS distance
+        ",
     }
-
-    Ok(processed_entities)
 }
 
-/// Query for unprocessed locations
-pub async fn get_unprocessed_locations(
-    conn: &Client,
-    processed_entities: &HashSet<EntityId>,
-) -> Result<LocationResults> {
-    // Query for unprocessed locations, detecting if geography column exists
-    let location_query = "
+/// Get all entities that are already part of *any* pair in the entity_group table.
+/// Uses a direct connection client.
+pub async fn get_globally_paired_entities(conn: &Client) -> Result<HashSet<EntityId>> {
+    const QUERY: &str = "
+        SELECT entity_id_1 AS entity_id FROM entity_group
+        UNION
+        SELECT entity_id_2 AS entity_id FROM entity_group
+    ";
+    let rows = conn
+        .query(QUERY, &[])
+        .await
+        .context("Failed to query globally paired entities")?;
+    Ok(rows
+        .iter()
+        .map(|row| EntityId(row.get("entity_id")))
+        .collect())
+}
+
+/// Query for locations of entities that are not yet part of *any* pair.
+/// Uses a direct connection client.
+pub async fn get_locations_for_unpaired_entities(conn: &Client) -> Result<LocationResults> {
+    const LOCATION_QUERY: &str = "
         SELECT 
             e.id AS entity_id,
-            l.id AS location_id,
             l.latitude,
             l.longitude,
-            CASE 
-                WHEN l.geom IS NOT NULL THEN TRUE
-                ELSE FALSE
-            END AS has_geom
+            (l.geom IS NOT NULL) AS has_geom 
         FROM 
             entity e
-            JOIN entity_feature ef ON e.id = ef.entity_id
-            JOIN location l ON ef.table_id = l.id AND ef.table_name = 'location'
+            INNER JOIN entity_feature ef ON e.id = ef.entity_id AND ef.table_name = 'location'
+            INNER JOIN location l ON ef.table_id = l.id
         WHERE 
-            l.latitude IS NOT NULL 
-            AND l.longitude IS NOT NULL
-            AND e.id NOT IN (
-                SELECT DISTINCT ge.entity_id
-                FROM group_entity ge
-                JOIN group_method gm ON ge.entity_group_id = gm.entity_group_id
-                WHERE gm.method_type = 'geospatial'
+            l.latitude IS NOT NULL AND l.longitude IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM entity_group eg
+                WHERE eg.entity_id_1 = e.id OR eg.entity_id_2 = e.id
             )
     ";
-
-    debug!("Executing location query for unprocessed entities");
+    debug!("Executing query for locations of unpaired entities.");
     let location_rows = conn
-        .query(location_query, &[])
+        .query(LOCATION_QUERY, &[])
         .await
-        .context("Failed to query locations")?;
+        .context("Failed to query locations for unpaired entities")?;
 
-    // Check if the location table has the geom column by checking the first row
     let has_postgis = if !location_rows.is_empty() {
-        let has_geom: bool = location_rows[0].get("has_geom");
-        has_geom
+        // Check the first row to determine if PostGIS geometries are generally available.
+        // This assumes consistency in the 'has_geom' column for the dataset.
+        location_rows[0].get("has_geom")
     } else {
-        false
+        false // If no rows, assume no PostGIS or no data to infer from.
     };
-
-    // Store all unprocessed locations
-    let mut new_locations: Vec<(EntityId, f64, f64)> = Vec::new();
-
-    for row in &location_rows {
-        let entity_id: String = row.get("entity_id");
-        let entity_id = EntityId(entity_id);
-
-        if processed_entities.contains(&entity_id) {
-            continue; // Skip if already processed
-        }
-
-        let latitude: f64 = row.get("latitude");
-        let longitude: f64 = row.get("longitude");
-
-        // Add to new locations
-        new_locations.push((entity_id, latitude, longitude));
-    }
-
+    let new_locations: Vec<(EntityId, f64, f64)> = location_rows
+        .iter()
+        .map(|row| {
+            (
+                EntityId(row.get("entity_id")),
+                row.get("latitude"),
+                row.get("longitude"),
+            )
+        })
+        .collect();
     Ok(LocationResults {
         locations: new_locations,
         has_postgis,
     })
 }
 
-/// Load existing groups with their centroids
-pub async fn get_existing_groups(conn: &Client, has_postgis: bool) -> Result<GroupResults> {
-    // Load existing groups with their centroids using PostGIS if available
-    let existing_groups_query = if has_postgis {
-        "SELECT 
-            eg.id AS group_id,
-            gm.id AS method_id,
-            gm.match_values,
-            ST_Y(ST_Centroid(ST_Collect(ST_MakePoint(
-                CAST(value->>'longitude' AS FLOAT), 
-                CAST(value->>'latitude' AS FLOAT)
-            )))) AS centroid_lat,
-            ST_X(ST_Centroid(ST_Collect(ST_MakePoint(
-                CAST(value->>'longitude' AS FLOAT), 
-                CAST(value->>'latitude' AS FLOAT)
-            )))) AS centroid_lon,
-            COALESCE(eg.version, 1) as version
+/// Load existing *geospatial pairs* from the entity_group table.
+/// Uses a direct connection client.
+pub async fn get_existing_geospatial_pairs(conn: &Client) -> Result<ExistingGeoPairsMap> {
+    const QUERY: &str = "
+        SELECT 
+            id AS pair_id, 
+            entity_id_1,
+            entity_id_2,
+            match_values, 
+            confidence_score
         FROM 
-            entity_group eg
-            JOIN group_method gm ON eg.id = gm.entity_group_id,
-            jsonb_array_elements(gm.match_values->'values') as value
+            entity_group
         WHERE 
-            gm.method_type = 'geospatial'
-        GROUP BY
-            eg.id, gm.id, gm.match_values, eg.version"
-    } else {
-        "SELECT 
-            eg.id AS group_id,
-            gm.id AS method_id,
-            gm.match_values,
-            (
-                SELECT AVG(CAST(value->>'latitude' AS double precision))
-                FROM jsonb_array_elements(gm.match_values->'values') as value
-            ) AS centroid_lat,
-            (
-                SELECT AVG(CAST(value->>'longitude' AS double precision))
-                FROM jsonb_array_elements(gm.match_values->'values') as value
-            ) AS centroid_lon,
-            COALESCE(eg.version, 1) as version
-        FROM 
-            entity_group eg
-            JOIN group_method gm ON eg.id = gm.entity_group_id
-        WHERE 
-            gm.method_type = 'geospatial'"
-    };
-
-    let existing_groups_rows = conn
-        .query(existing_groups_query, &[])
+            method_type = 'geospatial'
+    ";
+    let rows = conn
+        .query(QUERY, &[])
         .await
-        .context("Failed to query existing groups")?;
+        .context("Failed to query existing geospatial pairs from entity_group")?;
 
-    // Structure to store group info: (group_id, method_id, centroid_lat, centroid_lon, version)
-    let mut existing_groups: HashMap<String, (String, f64, f64, i32)> = HashMap::new();
-
-    // Also store entities for each group to use in consistency checks
-    let mut group_entities: HashMap<String, Vec<(EntityId, f64, f64)>> = HashMap::new();
-
-    for row in &existing_groups_rows {
-        let group_id: String = row.get("group_id");
-        let method_id: String = row.get("method_id");
-        let centroid_lat: f64 = row.get("centroid_lat");
-        let centroid_lon: f64 = row.get("centroid_lon");
-        let version: i32 = row.get("version");
-
-        // Store group info
-        existing_groups.insert(
-            group_id.clone(),
-            (method_id, centroid_lat, centroid_lon, version),
-        );
-
-        // Parse match values to extract entities
+    let mut existing_pairs: ExistingGeoPairsMap = HashMap::new();
+    for row in &rows {
+        let pair_id_str: String = row.get("pair_id");
+        let entity_id_1_str: String = row.get("entity_id_1");
+        let entity_id_2_str: String = row.get("entity_id_2");
+        let confidence_score: Option<f64> = row.get("confidence_score");
         let match_values_json: serde_json::Value = row.get("match_values");
-        if let Ok(match_values) = serde_json::from_value::<MatchValues>(match_values_json.clone()) {
-            if let MatchValues::Geospatial(values) = match_values {
-                let entities = values
-                    .into_iter()
-                    .map(|v| (v.entity_id, v.latitude, v.longitude))
-                    .collect();
-                group_entities.insert(group_id, entities);
+
+        // Deserialize the match_values JSON into the MatchValues enum,
+        // then extract the GeospatialMatchValue variant.
+        match serde_json::from_value::<MatchValues>(match_values_json.clone()) {
+            Ok(MatchValues::Geospatial(geospatial_value)) => {
+                existing_pairs.insert(
+                    EntityGroupId(pair_id_str),
+                    (
+                        EntityId(entity_id_1_str),
+                        EntityId(entity_id_2_str),
+                        geospatial_value, // This is the GeospatialMatchValue struct
+                        confidence_score,
+                    ),
+                );
+            }
+            Ok(other_type) => {
+                // Log if the match_values are not of the expected Geospatial type.
+                log::warn!(
+                    "Parsed match_values for geospatial pair_id {} but was not Geospatial type as expected, found: {:?}",
+                    pair_id_str, other_type
+                );
+            }
+            Err(e) => {
+                // Log if deserialization fails.
+                log::warn!(
+                    "Failed to parse GeospatialMatchValue for entity_group_id {}. Error: {}. JSON: {}",
+                    pair_id_str, e, match_values_json
+                );
             }
         }
     }
-
-    Ok(GroupResults {
-        groups: existing_groups,
-        group_entities,
-    })
+    debug!(
+        "Fetched {} existing geospatial pairs.",
+        existing_pairs.len()
+    );
+    Ok(existing_pairs)
 }

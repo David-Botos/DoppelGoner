@@ -1,25 +1,113 @@
 // src/matching/email.rs
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result}; // Added anyhow for error creation
 use chrono::Utc;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn}; // Added error log level
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::db::PgPool;
+use crate::config;
+use crate::db::{self, PgPool}; // db::connect is available if needed, but PgPool is passed
 use crate::models::{
-    EmailMatchValue, EntityGroup, EntityGroupId, EntityId, MatchMethodType, MatchValues,
+    ActionType,
+    EmailMatchValue, // Specific MatchValue for Email
+    // EntityGroup, // We'll construct the values directly for insertion
+    EntityGroupId,
+    EntityId,
+    MatchMethodType,
+    MatchValues, // Enum holding different MatchValue types
+    NewSuggestedAction,
+    SuggestionStatus,
 };
 use crate::reinforcement::MatchingOrchestrator;
-use crate::results::{EmailMatchResult, MatchMethodStats};
+use crate::results::{AnyMatchResult, EmailMatchResult, MatchMethodStats}; // Removed PairMlResult as it's part of orchestrator logic now
+use serde_json;
+
+// Helper function to insert a single entity group pair in its own transaction
+async fn insert_single_entity_group_pair(
+    pool: &PgPool,
+    entity_id_1: &EntityId,
+    entity_id_2: &EntityId,
+    method_type: &MatchMethodType,
+    match_values: &MatchValues,
+    confidence_score: f64,
+) -> Result<EntityGroupId> {
+    let mut conn = pool
+        .get()
+        .await
+        .context("Failed to get DB connection from pool for single insert")?;
+    let tx = conn
+        .transaction()
+        .await
+        .context("Failed to start transaction for single entity_group insert")?;
+
+    let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
+    let now = Utc::now().naive_utc();
+    let match_values_json = serde_json::to_value(match_values)
+        .context("Failed to serialize match_values for single insert")?;
+
+    let insert_query = "
+        INSERT INTO public.entity_group
+        (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, created_at, updated_at, version)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
+    ";
+
+    match tx
+        .execute(
+            insert_query,
+            &[
+                &new_entity_group_id.0,
+                &entity_id_1.0,
+                &entity_id_2.0,
+                &method_type.as_str(),
+                &match_values_json,
+                &confidence_score,
+                &now, // created_at
+                &now, // updated_at
+            ],
+        )
+        .await
+    {
+        Ok(_) => {
+            tx.commit()
+                .await
+                .context("Failed to commit transaction for single entity_group insert")?;
+            Ok(new_entity_group_id)
+        }
+        Err(e) => {
+            // Attempt to rollback, though it might also fail if connection is broken
+            let r_err = tx.rollback().await;
+            if let Err(rollback_err) = r_err {
+                error!("Failed to rollback transaction after insert error for pair ({}, {}), method {}: {}. Original error: {}",
+                       entity_id_1.0, entity_id_2.0, method_type.as_str(), rollback_err, e);
+            } else {
+                error!(
+                    "Rolled back transaction for pair ({}, {}), method {}. Insert error: {}",
+                    entity_id_1.0,
+                    entity_id_2.0,
+                    method_type.as_str(),
+                    e
+                );
+            }
+            Err(anyhow!(e).context(format!(
+                "DB error inserting entity_group for pair ({}, {}), method {}",
+                entity_id_1.0,
+                entity_id_2.0,
+                method_type.as_str()
+            )))
+        }
+    }
+}
 
 pub async fn find_matches(
-    pool: &PgPool,
+    pool: &PgPool, // Use the passed-in pool
     reinforcement_orchestrator: Option<&Mutex<MatchingOrchestrator>>,
-) -> Result<EmailMatchResult> {
+    pipeline_run_id: &str,
+) -> Result<AnyMatchResult> {
     info!(
-        "Starting email matching process{}...",
+        "Starting pairwise email matching (run ID: {}){}...",
+        pipeline_run_id,
         if reinforcement_orchestrator.is_some() {
             " with ML guidance"
         } else {
@@ -28,650 +116,339 @@ pub async fn find_matches(
     );
     let start_time = Instant::now();
 
-    let mut conn = pool
+    // Get a connection for initial reads (fetching existing pairs, all emails)
+    // This connection is not used for the iterative inserts.
+    let mut initial_read_conn = pool
         .get()
         .await
-        .context("Failed to get DB connection for email matching")?;
+        .context("Failed to get DB connection for initial email matching reads")?;
 
-    // First, get all entities that are already part of an email match group
-    debug!("Finding entities already processed by email matching");
-    let processed_query = "
-        SELECT DISTINCT ge.entity_id
-        FROM group_entity ge
-        JOIN group_method gm ON ge.entity_group_id = gm.entity_group_id
-        WHERE gm.method_type = 'email'
-    ";
+    debug!("Fetching existing email-matched pairs...");
+    let existing_pairs_query = "
+        SELECT entity_id_1, entity_id_2
+        FROM public.entity_group
+        WHERE method_type = $1";
+    let existing_pair_rows =
+        initial_read_conn // Use the dedicated connection for reads
+            .query(existing_pairs_query, &[&MatchMethodType::Email.as_str()])
+            .await
+            .context("Failed to query existing email-matched pairs")?;
 
-    let processed_rows = conn
-        .query(processed_query, &[])
-        .await
-        .context("Failed to query processed entities")?;
-
-    let mut processed_entities = HashSet::new();
-    for row in &processed_rows {
-        let entity_id: String = row.get("entity_id");
-        processed_entities.insert(EntityId(entity_id));
-    }
-
-    info!(
-        "Found {} entities already processed by email matching",
-        processed_entities.len()
-    );
-
-    // Get existing email groups and their normalized emails
-    debug!("Finding existing email groups");
-    let existing_groups_query = "
-        SELECT 
-            eg.id AS group_id,
-            gm.id AS method_id,
-            gm.match_values
-        FROM 
-            entity_group eg
-            JOIN group_method gm ON eg.id = gm.entity_group_id
-        WHERE 
-            gm.method_type = 'email'
-    ";
-
-    let existing_groups_rows = conn
-        .query(existing_groups_query, &[])
-        .await
-        .context("Failed to query existing groups")?;
-
-    // Map of normalized email -> (group_id, method_id)
-    let mut existing_email_groups: HashMap<String, (String, String)> = HashMap::new();
-
-    for row in &existing_groups_rows {
-        let group_id: String = row.get("group_id");
-        let method_id: String = row.get("method_id");
-        let match_values_json: serde_json::Value = row.get("match_values");
-
-        // Extract emails from the match_values JSON
-        if let Ok(match_values) = serde_json::from_value::<MatchValues>(match_values_json.clone()) {
-            if let MatchValues::Email(email_values) = match_values {
-                for email_value in &email_values {
-                    // Store mapping from normalized email to group/method ids
-                    existing_email_groups.insert(
-                        email_value.normalized.clone(),
-                        (group_id.clone(), method_id.clone()),
-                    );
-                }
-            }
+    let mut existing_processed_pairs: HashSet<(EntityId, EntityId)> = HashSet::new();
+    for row in existing_pair_rows {
+        let id1: String = row.get("entity_id_1");
+        let id2: String = row.get("entity_id_2");
+        if id1 < id2 {
+            existing_processed_pairs.insert((EntityId(id1), EntityId(id2)));
+        } else {
+            existing_processed_pairs.insert((EntityId(id2), EntityId(id1)));
         }
     }
-
     info!(
-        "Found {} unique normalized emails in existing groups",
-        existing_email_groups.len()
+        "Found {} existing email-matched pairs.",
+        existing_processed_pairs.len()
     );
 
-    // Modified query to get all email data in a single query
-    // Filter out already processed entities
     let email_query = "
-    SELECT 'organization' as source, e.id as entity_id, o.email 
-    FROM entity e 
-    JOIN organization o ON e.id = o.id 
-    WHERE o.email IS NOT NULL AND o.email != ''
-    AND e.id NOT IN (
-        SELECT ge.entity_id 
-        FROM group_entity ge
-        JOIN group_method gm ON ge.entity_group_id = gm.entity_group_id
-        WHERE gm.method_type = 'email'
-    )
-    
-    UNION ALL
-    
-    SELECT 'service' as source, e.id as entity_id, s.email 
-    FROM entity e 
-    JOIN entity_feature ef ON e.id = ef.entity_id 
-    JOIN service s ON ef.table_id = s.id 
-    WHERE ef.table_name = 'service' 
-    AND s.email IS NOT NULL AND s.email != ''
-    AND e.id NOT IN (
-        SELECT ge.entity_id 
-        FROM group_entity ge
-        JOIN group_method gm ON ge.entity_group_id = gm.entity_group_id
-        WHERE gm.method_type = 'email'
-    )";
-
-    debug!("Executing combined email query");
-    let email_rows = conn
+        SELECT 'organization' as source, e.id as entity_id, o.email, o.name as entity_name
+        FROM entity e
+        JOIN organization o ON e.organization_id = o.id
+        WHERE o.email IS NOT NULL AND o.email != ''
+        UNION ALL
+        SELECT 'service' as source, e.id as entity_id, s.email, s.name as entity_name
+        FROM entity e
+        JOIN entity_feature ef ON e.id = ef.entity_id
+        JOIN service s ON ef.table_id = s.id AND ef.table_name = 'service'
+        WHERE s.email IS NOT NULL AND s.email != ''
+    ";
+    debug!("Executing email query for all entities...");
+    let email_rows = initial_read_conn // Use the dedicated connection for reads
         .query(email_query, &[])
         .await
         .context("Failed to query entities with emails")?;
+    info!(
+        "Found {} email records across all entities.",
+        email_rows.len()
+    );
 
-    info!("Found {} total email records to process", email_rows.len());
+    // Drop the initial_read_conn to return it to the pool before starting loops
+    drop(initial_read_conn);
 
-    // Map to store normalized emails -> list of entities with matching values
-    // Using HashMap<normalized_email, HashMap<entity_id, original_email>> to avoid duplicates
     let mut email_map: HashMap<String, HashMap<EntityId, String>> = HashMap::new();
-    let mut processed_count = 0;
-
-    // Process all emails in a single pass
     for row in &email_rows {
-        let entity_id: String = row.get("entity_id");
-        let entity_id = EntityId(entity_id);
+        let entity_id = EntityId(row.get("entity_id"));
+        let email: String = row.get("email");
+        let normalized = normalize_email(&email);
+        if !normalized.is_empty() {
+            email_map
+                .entry(normalized)
+                .or_default()
+                .insert(entity_id, email);
+        }
+    }
+    info!("Processed {} unique normalized emails.", email_map.len());
 
-        // Skip if this entity has already been processed
-        if processed_entities.contains(&entity_id) {
+    let mut new_pairs_created_count = 0;
+    let mut entities_in_new_pairs: HashSet<EntityId> = HashSet::new();
+    let mut confidence_scores_for_stats: Vec<f64> = Vec::new();
+    let mut individual_transaction_errors = 0;
+
+    for (normalized_shared_email, current_entity_map) in email_map {
+        if current_entity_map.len() < 2 {
             continue;
         }
 
-        let email: String = row.get("email");
-        let normalized = normalize_email(&email);
+        let entities_sharing_email: Vec<_> = current_entity_map.iter().collect();
 
-        if !normalized.is_empty() {
-            // Get or create the inner entity map for this normalized email
-            let entity_map = email_map.entry(normalized).or_default();
+        for i in 0..entities_sharing_email.len() {
+            for j in (i + 1)..entities_sharing_email.len() {
+                let (entity_id1_obj, original_email1) = entities_sharing_email[i];
+                let (entity_id2_obj, original_email2) = entities_sharing_email[j];
 
-            // Only add if this entity isn't already in the map for this email
-            entity_map.entry(entity_id).or_insert(email);
-        }
+                let (e1_id, e1_orig_email, e2_id, e2_orig_email) =
+                    if entity_id1_obj.0 < entity_id2_obj.0 {
+                        (
+                            entity_id1_obj,
+                            original_email1,
+                            entity_id2_obj,
+                            original_email2,
+                        )
+                    } else {
+                        (
+                            entity_id2_obj,
+                            original_email2,
+                            entity_id1_obj,
+                            original_email1,
+                        )
+                    };
 
-        processed_count += 1;
-        if processed_count % 1000 == 0 {
-            debug!("Processed {} email records so far", processed_count);
-        }
-    }
-
-    let unique_emails = email_map.len();
-    info!(
-        "Found {} unique normalized emails from unprocessed records",
-        unique_emails
-    );
-
-    // Begin transaction for all database operations
-    let tx = conn
-        .transaction()
-        .await
-        .context("Failed to start transaction")?;
-
-    // Prepare statements for reuse
-    let group_stmt = tx
-        .prepare(
-            "
-    INSERT INTO entity_group 
-    (id, name, created_at, updated_at, confidence_score, entity_count, version) 
-    VALUES ($1, $2, $3, $4, $5, $6, 1)
-",
-        )
-        .await
-        .context("Failed to prepare entity_group statement")?;
-
-    let entity_stmt = tx
-        .prepare(
-            "
-        INSERT INTO group_entity 
-        (id, entity_group_id, entity_id, created_at) 
-        VALUES ($1, $2, $3, $4)
-    ",
-        )
-        .await
-        .context("Failed to prepare group_entity statement")?;
-
-    let method_stmt = tx
-        .prepare(
-            "
-        INSERT INTO group_method 
-        (id, entity_group_id, method_type, description, match_values, confidence_score, created_at) 
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-    ",
-        )
-        .await
-        .context("Failed to prepare group_method statement")?;
-
-    let update_group_count_stmt = tx
-        .prepare(
-            "
-    UPDATE entity_group
-    SET entity_count = entity_count + 1,
-        updated_at = $1,
-        version = version + 1
-    WHERE id = $2
-",
-        )
-        .await
-        .context("Failed to prepare update_group_count statement")?;
-
-    let update_method_stmt = tx
-        .prepare(
-            "
-        UPDATE group_method
-        SET match_values = $1
-        WHERE id = $2
-    ",
-        )
-        .await
-        .context("Failed to prepare update_method statement")?;
-
-    let now = Utc::now().naive_utc();
-    let mut total_groups_created = 0;
-    let mut total_entities_added = 0;
-    let mut total_entities_matched = 0;
-    let mut confidence_scores = Vec::new();
-    let mut group_sizes = Vec::new();
-
-    // Process emails
-    for (normalized_email, entity_map) in email_map {
-        // Store value for logging
-        let entity_map_length = entity_map.len();
-
-        // Check if this email already has a group
-        if let Some((group_id, method_id)) = existing_email_groups.get(&normalized_email) {
-            // Add these entities to the existing group
-
-            // First get the current match values for this group
-            let match_values_row = tx
-                .query_one(
-                    "SELECT match_values FROM group_method WHERE id = $1",
-                    &[&method_id],
-                )
-                .await
-                .context("Failed to get current match values")?;
-
-            let match_values_json: serde_json::Value = match_values_row.get("match_values");
-
-            // Parse the current match values
-            let current_match_values = serde_json::from_value::<MatchValues>(match_values_json)
-                .context("Failed to parse current match values")?;
-
-            // Extract the email values
-            let mut email_values = if let MatchValues::Email(values) = current_match_values {
-                debug!(
-                    "Retrieved {} existing email match values for group {}",
-                    values.len(),
-                    group_id
-                );
-                values
-            } else {
-                warn!("Unexpected match values type for email group {}", group_id);
-                Vec::new()
-            };
-
-            // Track which entities we've actually added
-            let mut entities_added = 0;
-            let mut entity_pairs = Vec::new();
-
-            // Add the new entities to the group
-            for (entity_id, original) in entity_map {
-                // Add entity to group
-                tx.execute(
-                    &entity_stmt,
-                    &[&Uuid::new_v4().to_string(), &group_id, &entity_id.0, &now],
-                )
-                .await
-                .context("Failed to insert group entity")?;
-
-                // Update entity count for the group
-                tx.execute(&update_group_count_stmt, &[&now, &group_id])
-                    .await
-                    .context("Failed to update group count")?;
-
-                // Add to match values
-                let domain = extract_domain(&original);
-                email_values.push(EmailMatchValue {
-                    original,
-                    normalized: normalized_email.clone(),
-                    domain,
-                    entity_id: entity_id.clone(),
-                });
-
-                // Track entity pairs for ML logging
-                if reinforcement_orchestrator.is_some() {
-                    // Store this entity with each existing entity in the group
-                    // for ML feedback
-                    for existing_entity in &email_values {
-                        if existing_entity.entity_id != entity_id {
-                            entity_pairs
-                                .push((entity_id.clone(), existing_entity.entity_id.clone()));
-                        }
-                    }
+                if existing_processed_pairs.contains(&(e1_id.clone(), e2_id.clone())) {
+                    debug!(
+                        "Pair ({}, {}) already processed by email method. Skipping.",
+                        e1_id.0, e2_id.0
+                    );
+                    continue;
                 }
 
-                entities_added += 1;
-            }
+                let mut final_confidence_score = 1.0;
+                let mut predicted_method_type_from_ml = MatchMethodType::Email;
+                let mut features_for_logging: Option<Vec<f64>> = None;
 
-            // Update the match values
-            let updated_match_values = MatchValues::Email(email_values);
-            let updated_json = serde_json::to_value(updated_match_values)
-                .context("Failed to serialize updated match values")?;
-
-            tx.execute(&update_method_stmt, &[&updated_json, &method_id])
-                .await
-                .context("Failed to update match values")?;
-
-            // Log ML feedback for newly formed entity pairs
-            if reinforcement_orchestrator.is_some() {
-                // Get the group confidence score
-                let query = "SELECT confidence_score FROM entity_group WHERE id = $1";
-                let group_confidence: f64 = match tx.query_one(query, &[&group_id]).await {
-                    Ok(row) => row.get("confidence_score"),
-                    Err(e) => {
-                        warn!(
-                            "Failed to get confidence score for group {}: {}",
-                            group_id, e
-                        );
-                        1.0 // Default to 1.0 for email groups if query fails
-                    }
-                };
-
-                // Lock the orchestrator for each call
-                let mut orchestrator = reinforcement_orchestrator.unwrap().lock().await;
-
-                for (i, entity1) in entity_pairs.iter().enumerate() {
-                    for entity2 in entity_pairs.iter().skip(i + 1) {
-                        match orchestrator
-                            .log_match_result(
-                                &MatchMethodType::Email,
-                                group_confidence,
-                                true,
-                                &entity1.0,
-                                &entity2.0,
-                            )
-                            .await
-                        {
-                            Ok(_) => (),
-                            Err(e) => warn!("Failed to log match result to ML system: {}", e),
-                        }
-                    }
-                }
-            }
-
-            total_entities_added += entities_added;
-            total_entities_matched += entities_added;
-
-            // Query for updated group size to track statistics
-            let group_size_row = tx
-                .query_one(
-                    "SELECT entity_count FROM entity_group WHERE id = $1",
-                    &[&group_id],
-                )
-                .await
-                .context("Failed to get updated group size")?;
-
-            let updated_group_size: i32 = group_size_row.get("entity_count");
-            group_sizes.push(updated_group_size as f32);
-
-            // Email matches have high confidence by default
-            confidence_scores.push(1.0);
-
-            info!(
-                "Added {} entities to existing email group for {}",
-                entities_added, normalized_email
-            );
-        } else if entity_map.len() >= 2 {
-            // Create a new group for this email (only if multiple entities)
-
-            // Convert the entity map to a vector of (EntityId, String) pairs
-            let entities: Vec<(EntityId, String)> = entity_map.into_iter().collect();
-            let entity_count = entities.len() as i32;
-
-            // Determine confidence score - default is high for email matching
-            let mut confidence_score = 1.0;
-
-            // If the orchestrator is available, use it to get a ML-guided confidence
-            if reinforcement_orchestrator.is_some() {
-                let mut ml_confidence_scores = Vec::new();
-
-                // Sample entity pairs to get confidence scores
-                let max_pairs = 5;
-                let pair_count = std::cmp::min(max_pairs, (entity_count * (entity_count - 1)) / 2);
-                let mut pairs_checked = 0;
-
-                // Check a sample of entity pairs
-                'outer: for i in 0..entities.len() {
-                    for j in (i + 1)..entities.len() {
-                        if pairs_checked >= pair_count {
-                            break 'outer;
-                        }
-
-                        // Get ML recommendation for this pair
-                        // Lock for each method call
-                        let mut orchestrator = reinforcement_orchestrator.unwrap().lock().await;
-                        match orchestrator
-                            .select_matching_method(pool, &entities[i].0, &entities[j].0)
-                            .await
-                        {
-                            Ok((method, conf)) => {
-                                // If email is recommended method, use its confidence
-                                if matches!(method, MatchMethodType::Email) {
-                                    ml_confidence_scores.push(conf);
+                if let Some(orchestrator_mutex) = reinforcement_orchestrator {
+                    match MatchingOrchestrator::extract_pair_context(pool, e1_id, e2_id).await {
+                        Ok(features) => {
+                            features_for_logging = Some(features.clone());
+                            let orchestrator_guard = orchestrator_mutex.lock().await;
+                            match orchestrator_guard.predict_method_with_context(&features) {
+                                Ok((predicted_method, rl_conf)) => {
+                                    predicted_method_type_from_ml = predicted_method;
+                                    final_confidence_score = rl_conf;
+                                    info!("ML guidance for pair ({}, {}): Predicted Method: {:?}, Confidence: {:.4}", e1_id.0, e2_id.0, predicted_method_type_from_ml, final_confidence_score);
+                                }
+                                Err(e) => {
+                                    warn!("ML prediction failed for email pair ({}, {}): {}. Using default confidence.", e1_id.0, e2_id.0, e);
                                 }
                             }
-                            Err(e) => {
-                                // Log error but continue
-                                warn!("Error getting ML confidence: {}", e);
+                        }
+                        Err(e) => {
+                            warn!("Context extraction failed for email pair ({}, {}): {}. Using default confidence.", e1_id.0, e2_id.0, e);
+                        }
+                    }
+                }
+
+                let match_values = MatchValues::Email(EmailMatchValue {
+                    original_email1: e1_orig_email.clone(),
+                    original_email2: e2_orig_email.clone(),
+                    normalized_shared_email: normalized_shared_email.clone(),
+                });
+
+                // Perform the insert in its own transaction
+                match insert_single_entity_group_pair(
+                    pool,
+                    e1_id,
+                    e2_id,
+                    &MatchMethodType::Email,
+                    &match_values,
+                    final_confidence_score,
+                )
+                .await
+                {
+                    Ok(new_entity_group_id) => {
+                        new_pairs_created_count += 1;
+                        entities_in_new_pairs.insert(e1_id.clone());
+                        entities_in_new_pairs.insert(e2_id.clone());
+                        confidence_scores_for_stats.push(final_confidence_score);
+                        existing_processed_pairs.insert((e1_id.clone(), e2_id.clone()));
+
+                        info!(
+                            "SUCCESS: Created new email pair group {} for ({}, {}) with shared email '{}', confidence: {:.4}",
+                            new_entity_group_id.0, e1_id.0, e2_id.0, normalized_shared_email, final_confidence_score
+                        );
+
+                        if let Some(orchestrator_mutex) = reinforcement_orchestrator {
+                            let mut orchestrator_guard = orchestrator_mutex.lock().await;
+                            if let Err(e) = orchestrator_guard
+                                .log_match_result(
+                                    pool,
+                                    e1_id,
+                                    e2_id,
+                                    &predicted_method_type_from_ml,
+                                    final_confidence_score,
+                                    true,
+                                    features_for_logging.as_ref(),
+                                    Some(&predicted_method_type_from_ml),
+                                    Some(final_confidence_score),
+                                )
+                                .await
+                            {
+                                warn!("Failed to log email match result to entity_match_pairs for ({},{}): {}", e1_id.0, e2_id.0, e);
                             }
                         }
 
-                        pairs_checked += 1;
+                        if final_confidence_score < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
+                            let priority = if final_confidence_score
+                                < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD
+                            {
+                                2
+                            } else {
+                                1
+                            };
+                            let details_json = serde_json::json!({
+                                "method_type": MatchMethodType::Email.as_str(),
+                                "matched_value": &normalized_shared_email,
+                                "original_email1": e1_orig_email,
+                                "original_email2": e2_orig_email,
+                                "entity_group_id": &new_entity_group_id.0,
+                                "rl_predicted_method": predicted_method_type_from_ml.as_str(),
+                            });
+                            let reason_message = format!(
+                                "Pair ({}, {}) matched by Email with low RL confidence ({:.4}). RL predicted: {:?}.",
+                                e1_id.0, e2_id.0, final_confidence_score, predicted_method_type_from_ml
+                            );
+                            let suggestion = NewSuggestedAction {
+                                pipeline_run_id: Some(pipeline_run_id.to_string()),
+                                action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
+                                entity_id: None,
+                                group_id_1: Some(new_entity_group_id.0.clone()),
+                                group_id_2: None,
+                                cluster_id: None,
+                                triggering_confidence: Some(final_confidence_score),
+                                details: Some(details_json),
+                                reason_code: Some("LOW_RL_CONFIDENCE_PAIR".to_string()),
+                                reason_message: Some(reason_message),
+                                priority,
+                                status: SuggestionStatus::PendingReview.as_str().to_string(),
+                                reviewer_id: None,
+                                reviewed_at: None,
+                                review_notes: None,
+                            };
+                            // For suggestions, we might want to collect them and insert them in a batch
+                            // or handle them outside the critical path of pair insertion if they also fail.
+                            // For now, attempting to insert it directly. This also needs a transaction or separate handling.
+                            // This example will use a temporary connection for simplicity, but batching is better.
+                            let mut temp_conn_for_suggestion = pool
+                                .get()
+                                .await
+                                .context("Failed to get temp conn for suggestion")?;
+                            let suggestion_tx = temp_conn_for_suggestion
+                                .transaction()
+                                .await
+                                .context("Failed to start suggestion tx")?;
+                            if let Err(e) = db::insert_suggestion(&suggestion_tx, &suggestion).await
+                            {
+                                warn!("Failed to log suggestion for low confidence email pair ({}, {}): {}. Suggestion details: {:?}", e1_id.0, e2_id.0, e, suggestion);
+                                // Decide if suggestion failure should stop the pair processing. Probably not.
+                                // Attempt to rollback suggestion_tx but continue.
+                                if let Err(s_rb_err) = suggestion_tx.rollback().await {
+                                    error!("Failed to rollback suggestion_tx: {}", s_rb_err);
+                                }
+                            } else {
+                                if let Err(s_commit_err) = suggestion_tx.commit().await {
+                                    error!("Failed to commit suggestion_tx: {}", s_commit_err);
+                                }
+                            }
+                        }
                     }
-                }
-
-                // If we got any ML confidence scores, use their average
-                if !ml_confidence_scores.is_empty() {
-                    confidence_score = ml_confidence_scores.iter().sum::<f64>()
-                        / ml_confidence_scores.len() as f64;
-                    info!(
-                        "Using ML-guided confidence {:.4} for email group",
-                        confidence_score
-                    );
-                } else {
-                    info!("Using default confidence 1.0 for email group (no ML guidance)");
-                }
-            }
-
-            // Create a new entity group
-            let group_id = EntityGroupId(Uuid::new_v4().to_string());
-
-            let group = EntityGroup {
-                id: group_id.clone(),
-                name: Some(format!("Email match on {}", normalized_email)),
-                group_cluster_id: None,
-                created_at: now,
-                updated_at: now,
-                confidence_score,
-                entity_count,
-            };
-
-            // Insert group
-            tx.execute(
-                &group_stmt,
-                &[
-                    &group.id.0,
-                    &group.name,
-                    &group.created_at,
-                    &group.updated_at,
-                    &group.confidence_score,
-                    &group.entity_count,
-                ],
-            )
-            .await
-            .context("Failed to insert entity group")?;
-
-            // Create match values for the group method
-            let mut match_values = Vec::new();
-
-            // Add all entities to the batch inserts
-            for (entity_id, original) in &entities {
-                // Add to group_entity
-                tx.execute(
-                    &entity_stmt,
-                    &[&Uuid::new_v4().to_string(), &group_id.0, &entity_id.0, &now],
-                )
-                .await
-                .context("Failed to insert group entity")?;
-
-                // Create match value for this entity
-                let domain = extract_domain(original);
-                match_values.push(EmailMatchValue {
-                    original: original.clone(),
-                    normalized: normalized_email.clone(),
-                    domain,
-                    entity_id: entity_id.clone(),
-                });
-            }
-
-            // Serialize match values to JSON
-            let method_values = MatchValues::Email(match_values);
-            let match_values_json =
-                serde_json::to_value(&method_values).context("Failed to serialize match values")?;
-
-            // Insert group method
-            tx.execute(
-                &method_stmt,
-                &[
-                    &Uuid::new_v4().to_string(),
-                    &group_id.0,
-                    &MatchMethodType::Email.as_str(),
-                    &format!("Matched on email: {}", normalized_email),
-                    &match_values_json,
-                    &confidence_score,
-                    &now,
-                ],
-            )
-            .await
-            .context("Failed to insert group method")?;
-
-            // Log ML feedback for the newly created group
-            if reinforcement_orchestrator.is_some() {
-                // For a new group, log feedback for a sample of entity pairs
-                let max_feedback_pairs = 10;
-                let mut pairs_logged = 0;
-
-                for i in 0..entities.len() {
-                    for j in (i + 1)..entities.len() {
-                        if pairs_logged >= max_feedback_pairs {
-                            break;
-                        }
-
-                        let mut orchestrator = reinforcement_orchestrator.unwrap().lock().await;
-                        // Email matches are considered correct (true)
-                        match orchestrator
-                            .log_match_result(
-                                &MatchMethodType::Email,
-                                confidence_score,
-                                true,           // Assume email matches are correct
-                                &entities[i].0, // First entity ID
-                                &entities[j].0, // Second entity ID
-                            )
-                            .await
-                        {
-                            Ok(_) => pairs_logged += 1,
-                            Err(e) => warn!("Failed to log match result to ML system: {}", e),
-                        }
+                    Err(e) => {
+                        individual_transaction_errors += 1;
+                        // Error is already logged by insert_single_entity_group_pair
+                        // We continue to the next pair
                     }
                 }
             }
-
-            total_groups_created += 1;
-            total_entities_matched += entity_count as usize;
-            total_entities_added += entity_count as usize;
-
-            // Email matches have high confidence
-            confidence_scores.push(confidence_score);
-            group_sizes.push(entity_count as f32);
-
-            info!(
-                "Created new email group for {} with {} entities (confidence: {:.4})",
-                normalized_email, entity_count, confidence_score
-            );
         }
     }
 
-    // Commit the transaction
-    tx.commit().await.context("Failed to commit transaction")?;
+    if individual_transaction_errors > 0 {
+        warn!(
+            "Encountered {} errors during individual email pair transaction attempts.",
+            individual_transaction_errors
+        );
+    }
 
-    // Calculate average group size and confidence
-    let avg_group_size: f64 = if !group_sizes.is_empty() {
-        (group_sizes.iter().sum::<f32>() / group_sizes.len() as f32).into()
+    let avg_confidence: f64 = if !confidence_scores_for_stats.is_empty() {
+        confidence_scores_for_stats.iter().sum::<f64>() / confidence_scores_for_stats.len() as f64
     } else {
         0.0
     };
 
-    let avg_confidence: f64 = if !confidence_scores.is_empty() {
-        (confidence_scores.iter().sum::<f64>() / confidence_scores.len() as f64)
-    } else {
-        1.0 // Default confidence for email matching
-    };
-
-    // Create method stats
     let method_stats = MatchMethodStats {
         method_type: MatchMethodType::Email,
-        groups_created: total_groups_created,
-        entities_matched: total_entities_matched,
+        groups_created: new_pairs_created_count,
+        entities_matched: entities_in_new_pairs.len(),
         avg_confidence,
-        avg_group_size,
+        avg_group_size: if new_pairs_created_count > 0 {
+            2.0
+        } else {
+            0.0
+        },
     };
 
     let elapsed = start_time.elapsed();
     info!(
-        "Email matching complete: created {} new entity groups and added {} entities to existing groups in {:.2?}",
-        total_groups_created, total_entities_added, elapsed
+        "Pairwise email matching complete in {:.2?}: created {} new pairs ({} individual transaction errors), involving {} unique entities.",
+        elapsed,
+        method_stats.groups_created,
+        individual_transaction_errors,
+        method_stats.entities_matched
     );
 
-    Ok(EmailMatchResult {
-        groups_created: total_groups_created,
+    let email_specific_result = EmailMatchResult {
+        groups_created: method_stats.groups_created,
         stats: method_stats,
-    })
+    };
+
+    Ok(AnyMatchResult::Email(email_specific_result))
 }
 
-/// Normalize an email address by:
-/// - Converting to lowercase
-/// - Trimming whitespace
-/// - Removing dots before @ in Gmail addresses
-/// - Removing plus addressing (everything between + and @ is removed)
+// normalize_email function remains the same
 fn normalize_email(email: &str) -> String {
-    // Basic normalization
-    let email = email.trim().to_lowercase();
-
-    // If it doesn't contain an @ symbol, just return the trimmed lowercase version
-    if !email.contains('@') {
-        return email;
+    let email_trimmed = email.trim().to_lowercase();
+    if !email_trimmed.contains('@') {
+        return email_trimmed;
     }
 
-    // Split the email into local part and domain
-    let parts: Vec<&str> = email.split('@').collect();
+    let parts: Vec<&str> = email_trimmed.splitn(2, '@').collect();
     if parts.len() != 2 {
-        return email; // Return original if multiple @ symbols
+        return email_trimmed;
     }
 
-    let (local_part, domain) = (parts[0], parts[1]);
+    let (local_part_full, domain_part) = (parts[0], parts[1]);
+    let local_part_no_plus = local_part_full.split('+').next().unwrap_or("").to_string();
 
-    // Normalize the local part based on domain-specific rules
-    let normalized_local = if domain == "gmail.com" || domain == "googlemail.com" {
-        // For Gmail: remove dots and anything after a plus sign
-        let without_dots = local_part.replace('.', "");
-        match without_dots.split('+').next() {
-            Some(username) => username.to_string(),
-            None => local_part.to_string(),
-        }
+    let final_local_part = if domain_part == "gmail.com" || domain_part == "googlemail.com" {
+        local_part_no_plus.replace('.', "")
     } else {
-        // For other domains: just remove anything after a plus sign
-        match local_part.split('+').next() {
-            Some(username) => username.to_string(),
-            None => local_part.to_string(),
-        }
+        local_part_no_plus
     };
 
-    // Normalize domain
-    let normalized_domain = match domain {
+    let final_domain_part = match domain_part {
         "googlemail.com" => "gmail.com",
-        "hotmail.com" | "live.com" | "outlook.com" => "outlook.com",
-        "ymail.com" | "rocketmail.com" => "yahoo.com",
-        _ => domain,
+        _ => domain_part,
     };
 
-    format!("{}@{}", normalized_local, normalized_domain)
-}
-
-/// Extract the domain part from an email address
-fn extract_domain(email: &str) -> String {
-    if let Some(index) = email.find('@') {
-        if index < email.len() - 1 {
-            return email[index + 1..].to_lowercase();
-        }
+    if final_local_part.is_empty() {
+        return String::new();
     }
-
-    // Default fallback if no @ or @ is the last character
-    String::new()
+    format!("{}@{}", final_local_part, final_domain_part)
 }

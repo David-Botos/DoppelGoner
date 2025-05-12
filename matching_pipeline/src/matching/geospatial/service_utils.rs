@@ -196,6 +196,71 @@ fn calculate_token_similarity(text1: &str, text2: &str) -> f64 {
     intersection_size / union_size
 }
 
+// src/matching/geospatial/core.rs
+// ... (other imports) ...
+
+/// Calculates the average service similarity between the first entity and all subsequent entities in a list.
+/// Returns Ok((passes_threshold, average_similarity)) or Err.
+pub async fn calculate_average_service_similarity_for_cluster(
+    tx: &Transaction<'_>,
+    entity_ids: &[EntityId], // Entities forming the potential cluster
+) -> Result<(bool, f64)> {
+    if entity_ids.len() < 2 {
+        debug!("Cannot calculate service similarity for less than 2 entities. Defaulting to pass (0.5).");
+        return Ok((true, 0.5)); // Pass by default if only one entity
+    }
+
+    let first_entity_id = &entity_ids[0];
+    let other_entity_ids = &entity_ids[1..];
+
+    let mut total_similarity = 0.0;
+    let mut comparisons_made = 0;
+    let mut accumulated_error: Option<anyhow::Error> = None; // Store the first error encountered
+
+    for other_entity_id in other_entity_ids {
+        match compare_entity_services(tx, first_entity_id, other_entity_id).await {
+            Ok(similarity) => {
+                trace!(
+                    "Similarity between {} and {}: {:.4}",
+                    first_entity_id.0,
+                    other_entity_id.0,
+                    similarity
+                );
+                total_similarity += similarity;
+                comparisons_made += 1;
+            }
+            Err(e) => {
+                warn!(
+                    "Failed service comparison between {} and {}: {}. Skipping this pair.",
+                    first_entity_id.0, other_entity_id.0, e
+                );
+                // Store the first error but continue comparisons if possible
+                if accumulated_error.is_none() {
+                    accumulated_error = Some(e);
+                }
+            }
+        }
+    }
+
+    // If comparisons were made, calculate average and check threshold
+    if comparisons_made > 0 {
+        let average_similarity = total_similarity / comparisons_made as f64;
+        let passes_threshold = average_similarity >= SERVICE_SIMILARITY_THRESHOLD;
+        debug!(
+            "Cluster service check: Avg Similarity: {:.4} (Threshold: {}), Pass: {}",
+            average_similarity, SERVICE_SIMILARITY_THRESHOLD, passes_threshold
+        );
+        Ok((passes_threshold, average_similarity))
+    } else if let Some(err) = accumulated_error {
+        // If no comparisons succeeded and we had errors, return the first error
+        Err(err.context("No successful service comparisons could be made for the cluster"))
+    } else {
+        // If len >= 2 but no comparisons made (e.g., only 1 entity after filtering?), default to pass
+        debug!("No valid service comparisons made for cluster (entities: {}). Defaulting to pass (0.5).", entity_ids.len());
+        Ok((true, 0.5))
+    }
+}
+
 /// Log service similarity scores and rejections to the database for statistics
 pub async fn log_service_similarity(
     tx: &Transaction<'_>,
@@ -246,7 +311,10 @@ pub async fn log_service_similarity(
         Ok(_) => {
             trace!(
                 "Logged service similarity score {:.4} between entities {} and {} (rejected: {})",
-                similarity, entity1_id, entity2_id, is_rejected
+                similarity,
+                entity1_id,
+                entity2_id,
+                is_rejected
             );
             Ok(())
         }

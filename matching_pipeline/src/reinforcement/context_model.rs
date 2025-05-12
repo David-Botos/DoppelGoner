@@ -1,9 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use smartcore::tree::decision_tree_classifier::SplitCriterion;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet}; // Added HashSet
 use uuid::Uuid;
 
 // SmartCore imports
@@ -11,25 +11,14 @@ use smartcore::ensemble::random_forest_classifier::{
     RandomForestClassifier, RandomForestClassifierParameters,
 };
 use smartcore::linalg::basic::matrix::DenseMatrix;
-use smartcore::metrics::ClassificationMetrics;
 
-use super::feature_extraction::get_feature_metadata;
+use super::feature_extraction::get_feature_metadata; // For metadata structure
 use super::types::TrainingExample;
 use crate::db::PgPool;
+use crate::models::EntityId; // Assuming EntityId is a newtype struct around String
 
-#[derive(Serialize, Deserialize)]
-pub struct ContextModel {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    forest: Option<RandomForestClassifierWrapper>,
-    feature_names: Vec<String>,
-    method_labels: Vec<String>,
-    feature_importance: HashMap<String, f64>,
-    version: u32,
-}
-
-// Wrapper for SmartCore RandomForestClassifier to help with serialization/deserialization
-#[derive(Serialize, Deserialize)]
+// Wrapper for SmartCore RandomForestClassifier (remains the same)
+#[derive(Serialize, Deserialize, Debug)]
 struct RandomForestClassifierWrapper {
     serialized_model: String,
 }
@@ -38,52 +27,56 @@ impl RandomForestClassifierWrapper {
     fn from_forest(
         forest: &RandomForestClassifier<f64, usize, DenseMatrix<f64>, Vec<usize>>,
     ) -> Result<Self> {
-        // Serialize the model to a string
         let serialized_model = serde_json::to_string(forest)
             .map_err(|e| anyhow::anyhow!("Failed to serialize forest: {}", e))?;
-
         Ok(Self { serialized_model })
     }
 
     fn to_forest(
         &self,
     ) -> Result<RandomForestClassifier<f64, usize, DenseMatrix<f64>, Vec<usize>>> {
-        // Deserialize from string to RandomForestClassifier
         let forest: RandomForestClassifier<f64, usize, DenseMatrix<f64>, Vec<usize>> =
             serde_json::from_str(&self.serialized_model)
                 .map_err(|e| anyhow::anyhow!("Failed to deserialize forest: {}", e))?;
-
         Ok(forest)
     }
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct ContextModel {
+    #[serde(skip)]
+    pub live_forest: Option<RandomForestClassifier<f64, usize, DenseMatrix<f64>, Vec<usize>>>,
+    pub forest_for_serde: Option<RandomForestClassifierWrapper>,
+    pub feature_names: Vec<String>,
+    pub method_labels: Vec<String>,
+    pub feature_importance: HashMap<String, f64>,
+    pub version: u32,
+}
+
 impl ContextModel {
     pub fn new() -> Self {
-        // Extract feature names from metadata
         let feature_metadata = get_feature_metadata();
         let mut feature_names = Vec::new();
-
-        // Entity 1 features - individual (first 12 features from metadata)
+        // Entity 1 features
         for i in 0..12 {
             if i < feature_metadata.len() {
                 feature_names.push(format!("{}1", feature_metadata[i].name));
             }
         }
-
-        // Entity 2 features - individual (first 12 features from metadata)
+        // Entity 2 features
         for i in 0..12 {
             if i < feature_metadata.len() {
                 feature_names.push(format!("{}2", feature_metadata[i].name));
             }
         }
-
-        // Pair relationship features (last 7 features from metadata)
+        // Pair relationship features
         for i in 12..feature_metadata.len() {
             feature_names.push(feature_metadata[i].name.clone());
         }
 
         Self {
-            forest: None,
+            live_forest: None,
+            forest_for_serde: None,
             feature_names,
             method_labels: vec![
                 "email".to_string(),
@@ -99,67 +92,81 @@ impl ContextModel {
     }
 
     pub async fn train(&mut self, pool: &PgPool) -> Result<()> {
-        // Fetch training data from human review decisions
-        let training_data = self.collect_training_data(pool).await?;
-
+        let training_data = self
+            .collect_training_data(pool)
+            .await
+            .context("Failed to collect training data for ContextModel")?; // Added context
         if training_data.is_empty() {
-            warn!("No training data available for context model");
+            warn!("No training data available for context model. Model not trained.");
             return Ok(());
         }
-
         info!(
             "Training context model with {} examples",
             training_data.len()
         );
-
-        // Train with the collected data
-        self.train_with_data(&training_data)?;
-
+        self.train_with_data(&training_data)
+            .context("Failed to train ContextModel with data")?; // Added context
         Ok(())
     }
 
     pub fn train_with_data(&mut self, training_data: &[TrainingExample]) -> Result<()> {
-        // Need at least some data to train
         if training_data.is_empty() {
-            return Err(anyhow::anyhow!("No training data provided"));
+            return Err(anyhow::anyhow!(
+                "No training data provided for ContextModel."
+            ));
         }
-
-        // Need at least 2 different classes to train a classifier
         let unique_methods: std::collections::HashSet<&String> =
             training_data.iter().map(|ex| &ex.best_method).collect();
-
         if unique_methods.len() < 2 {
             return Err(anyhow::anyhow!(
-                "Need at least 2 different methods to train a classifier"
+                "Need at least 2 different methods in training data to train. Found {}.",
+                unique_methods.len()
             ));
         }
 
-        // Prepare training matrices
         let n_samples = training_data.len();
-        let n_features = training_data[0].features.len();
+        // Ensure all feature vectors have the same length, matching self.feature_names
+        if n_samples > 0 && training_data[0].features.len() != self.feature_names.len() {
+            return Err(anyhow::anyhow!(
+                "Training data feature count mismatch. Expected {}, got {}.",
+                self.feature_names.len(),
+                training_data[0].features.len()
+            ));
+        }
+        let n_features = self.feature_names.len(); // Use expected feature count
 
         debug!(
             "Building training matrices: {} samples, {} features",
             n_samples, n_features
         );
 
-        // Prepare feature matrices for SmartCore
-        // Convert the flat feature vector into a 2D vector format for from_2d_vec
         let mut feature_2d_vec: Vec<Vec<f64>> = Vec::with_capacity(n_samples);
         for sample in training_data {
-            feature_2d_vec.push(sample.features.clone());
+            if sample.features.len() == n_features {
+                // Validate each sample
+                feature_2d_vec.push(sample.features.clone());
+            } else {
+                warn!(
+                    "Skipping training sample with incorrect feature count. Expected {}, got {}.",
+                    n_features,
+                    sample.features.len()
+                );
+            }
+        }
+        // If all samples were skipped due to feature count mismatch
+        if feature_2d_vec.is_empty() && n_samples > 0 {
+            return Err(anyhow::anyhow!(
+                "All training samples had incorrect feature counts. Model not trained."
+            ));
         }
 
-        // Convert to DenseMatrix using from_2d_vec instead of from_array
         let x = DenseMatrix::from_2d_vec(&feature_2d_vec);
-
-        // Prepare labels
         let y: Vec<usize> = training_data
             .iter()
+            .filter(|s| s.features.len() == n_features) // Filter to match feature_2d_vec
             .map(|sample| self.method_index(&sample.best_method))
             .collect();
 
-        // Configure Random Forest
         let forest_params = RandomForestClassifierParameters {
             criterion: SplitCriterion::Gini,
             max_depth: Some(20),
@@ -171,365 +178,407 @@ impl ContextModel {
             seed: 42,
         };
 
-        // Train the model
-        info!("Training Random Forest model...");
-        let forest = RandomForestClassifier::fit(&x, &y, forest_params)
+        info!("Training Random Forest model for ContextModel...");
+        let trained_forest_model = RandomForestClassifier::fit(&x, &y, forest_params)
             .map_err(|e| anyhow::anyhow!("Failed to train random forest: {}", e))?;
 
-        // Calculate feature importance (SmartCore doesn't provide this directly,
-        // but we could implement a simple permutation importance in the future)
+        self.live_forest = Some(trained_forest_model);
+        if let Some(live_model_ref) = self.live_forest.as_ref() {
+            match RandomForestClassifierWrapper::from_forest(live_model_ref) {
+                Ok(wrapper) => self.forest_for_serde = Some(wrapper),
+                Err(e) => {
+                    warn!("Failed to create RandomForestClassifierWrapper from live_forest post-training: {}.", e);
+                    self.forest_for_serde = None;
+                }
+            }
+        }
+
         self.feature_importance.clear();
-        // For now, use uniform importance
-        for (i, name) in self.feature_names.iter().enumerate() {
+        for name in &self.feature_names {
             self.feature_importance
                 .insert(name.clone(), 1.0 / n_features as f64);
         }
-
-        // Store the trained forest
-        match RandomForestClassifierWrapper::from_forest(&forest) {
-            Ok(wrapper) => {
-                self.forest = Some(wrapper);
-                self.version += 1;
-                info!("Context model training complete, version {}", self.version);
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!("Failed to serialize random forest: {}", e));
-            }
-        }
-
+        self.version += 1;
+        info!(
+            "Context model training complete. New version: {}",
+            self.version
+        );
         Ok(())
     }
 
     pub fn predict_best_method(&self, features: &[f64]) -> Option<(String, f64)> {
+        // ... (Implementation remains the same as in previous optimized version)
         if features.len() != self.feature_names.len() {
-            warn!(
-                "Feature vector length mismatch: got {}, expected {}",
-                features.len(),
-                self.feature_names.len()
-            );
+            warn!("Feature vector length mismatch for ContextModel prediction: got {}, expected {}. Features: {:?}", features.len(), self.feature_names.len(), features);
             return None;
         }
-
-        if let Some(forest_wrapper) = &self.forest {
-            // Convert wrapper back to forest for prediction
-            let forest = match forest_wrapper.to_forest() {
-                Ok(f) => f,
-                Err(e) => {
-                    warn!("Failed to load forest from wrapper: {}", e);
-                    return None;
-                }
-            };
-
-            // Prepare feature data for prediction
+        if let Some(forest_model) = &self.live_forest {
             let feature_vec = vec![features.to_vec()];
             let x = DenseMatrix::from_2d_vec(&feature_vec);
-
-            // Get predictions
-            let predictions = match forest.predict(&x) {
+            let predictions = match forest_model.predict(&x) {
                 Ok(p) => p,
                 Err(e) => {
-                    warn!("Failed to generate prediction: {}", e);
+                    warn!("ContextModel failed to generate prediction: {}", e);
                     return None;
                 }
             };
-
-            // Get probabilities if available (not directly supported in RandomForest,
-            // but we can get an estimate based on tree votes)
             let class_idx = predictions[0];
-
-            // For confidence, we'll use a placeholder value of 0.8 for now
-            // In the future, we could implement proper probability calibration
-            let confidence = 0.8;
-
-            // Return the method name and probability
+            let confidence = 0.8; // Placeholder
             if class_idx < self.method_labels.len() {
-                return Some((self.method_labels[class_idx].clone(), confidence));
+                Some((self.method_labels[class_idx].clone(), confidence))
             } else {
-                warn!(
-                    "Prediction index out of bounds: got {}, max allowed {}",
-                    class_idx,
-                    self.method_labels.len() - 1
-                );
+                warn!("ContextModel prediction index out of bounds: got {}, max allowed {}. Labels: {:?}", class_idx, self.method_labels.len() - 1, self.method_labels);
+                None
             }
         } else {
-            debug!("No trained model available for prediction");
+            debug!("No trained ContextModel (live_forest is None) available for prediction.");
+            None
         }
-
-        None
     }
 
     fn method_index(&self, method: &str) -> usize {
-        self.method_labels
-            .iter()
-            .position(|m| m == method)
-            .unwrap_or(0)
+        // ... (Implementation remains the same)
+        self.method_labels.iter().position(|m| m == method).unwrap_or_else(|| {
+            warn!("Method '{}' not found in method_labels for ContextModel, defaulting to index 0. Labels: {:?}", method, self.method_labels);
+            0
+        })
     }
 
     pub fn feature_importance(&self) -> Vec<(String, f64)> {
-        let mut result = Vec::new();
-
-        for (name, score) in &self.feature_importance {
-            result.push((name.clone(), *score));
-        }
-
-        // Sort by importance (descending)
+        // ... (Implementation remains the same)
+        let mut result: Vec<(String, f64)> = self
+            .feature_importance
+            .iter()
+            .map(|(name, score)| (name.clone(), *score))
+            .collect();
         result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
         result
     }
 
-    // Collect training data from human feedback
+    /// Collects training data by fetching human review feedback and then batch-fetching entity features.
     async fn collect_training_data(&self, pool: &PgPool) -> Result<Vec<TrainingExample>> {
-        let conn = pool.get().await?;
+        info!("Collecting training data for ContextModel (batched approach)...");
+        let conn = pool
+            .get()
+            .await
+            .context("Failed to get DB connection for collect_training_data")?;
 
-        info!("Collecting training data from human review feedback");
+        // 1. Fetch initial feedback: (entity_id_A, correct_cluster_id_for_A, method_type_suggested_by_human)
+        // We are interested in cases where a human indicated a specific method was correct for a pair,
+        // or implied a pair should exist by assigning to the same cluster.
+        // The original query focused on `was_correct` and `correct_cluster_id`.
+        // Let's refine to get pairs from human feedback.
+        let feedback_rows = conn.query(
+            "SELECT 
+                hrd.entity_id AS entity_id_a, 
+                hrd.correct_cluster_id, 
+                hrf.method_type AS reviewed_method_type,
+                hrf.was_correct,
+                hrd.affected_entity_group_id -- If available, helps identify the original pair
+            FROM clustering_metadata.human_review_method_feedback hrf
+            JOIN clustering_metadata.human_review_decisions hrd ON hrf.decision_id = hrd.id
+            WHERE hrd.reviewer_id <> 'ml_system'
+              AND hrd.entity_id IS NOT NULL 
+              AND (hrf.was_correct = TRUE OR hrd.correct_cluster_id IS NOT NULL) -- Positive examples or explicit cluster assignments
+            ORDER BY hrd.created_at DESC
+            LIMIT 500", // Limit for safety during development/testing
+            &[],
+        ).await.context("Failed to query human review feedback")?;
 
-        // Query for feedback that indicates the correct matching method
-        let rows = conn
-            .query(
-                "SELECT hrf.method_type, hrd.entity_id, hrd.correct_cluster_id, 
-                    hrf.was_correct, hrf.confidence_adjustment
-             FROM clustering_metadata.human_review_method_feedback hrf
-             JOIN clustering_metadata.human_review_decisions hrd 
-                 ON hrf.decision_id = hrd.id
-             WHERE hrd.entity_id IS NOT NULL
-             ORDER BY hrd.created_at DESC
-             LIMIT 10000", // Reasonable limit for training data
-                &[],
-            )
-            .await?;
+        debug!(
+            "Fetched {} raw feedback rows for training data.",
+            feedback_rows.len()
+        );
 
-        debug!("Found {} human review feedback records", rows.len());
+        struct TrainingPairCandidate {
+            entity_a_id: String,
+            entity_b_id: String,
+            best_method: String, // The method confirmed or implied by human review
+        }
+        let mut training_pair_candidates: Vec<TrainingPairCandidate> = Vec::new();
+        let mut all_entity_ids_needed: HashSet<String> = HashSet::new();
+        let mut cluster_to_entities_map: HashMap<String, Vec<String>> = HashMap::new();
+        let mut clusters_to_fetch: HashSet<String> = HashSet::new();
 
-        // Extract examples
-        let mut examples = Vec::new();
+        // First pass: identify entities and clusters from feedback
+        for row in &feedback_rows {
+            let entity_a_id: String = row.get("entity_id_a");
+            let correct_cluster_id: Option<String> = row.get("correct_cluster_id");
+            let reviewed_method_type: String = row.get("reviewed_method_type");
+            let was_correct: bool = row.get("was_correct");
+            let affected_entity_group_id: Option<String> = row.get("affected_entity_group_id");
 
-        for row in rows {
-            let method_type: String = row.get(0);
-            let entity_id: String = row.get(1);
-            let correct_cluster_id: Option<String> = row.get(2);
-            let was_correct: bool = row.get(3);
+            if was_correct {
+                // If the system's pairing (and method) was deemed correct
+                if let Some(group_id) = affected_entity_group_id {
+                    // Fetch the original pair from entity_group
+                    let pair_row_opt = conn
+                        .query_opt(
+                            "SELECT entity_id_1, entity_id_2 FROM entity_group WHERE id = $1",
+                            &[&group_id],
+                        )
+                        .await
+                        .context(format!("Failed to fetch pair for group_id {}", group_id))?;
 
-            // Skip examples where we don't know the correct cluster
-            let cluster_id = match (was_correct, correct_cluster_id) {
-                (true, _) => None,             // Current cluster was correct
-                (false, Some(id)) => Some(id), // We have a correction
-                (false, None) => continue,     // No correction provided, skip
-            };
+                    if let Some(pair_row) = pair_row_opt {
+                        let e1: String = pair_row.get("entity_id_1");
+                        let e2: String = pair_row.get("entity_id_2");
+                        training_pair_candidates.push(TrainingPairCandidate {
+                            entity_a_id: e1.clone(),
+                            entity_b_id: e2.clone(),
+                            best_method: reviewed_method_type.clone(),
+                        });
+                        all_entity_ids_needed.insert(e1);
+                        all_entity_ids_needed.insert(e2);
+                    }
+                }
+            } else if let Some(cluster_id) = correct_cluster_id {
+                // If assigned to a specific cluster
+                all_entity_ids_needed.insert(entity_a_id.clone());
+                clusters_to_fetch.insert(cluster_id.clone());
+                // We'll resolve other entities in this cluster later
+            }
+        }
 
-            // For each entity ID, find a "best match" entity in the correct cluster
-            if let Some(cluster_id) = cluster_id {
-                // Find another entity in the correct cluster
-                let entity_rows = conn
-                    .query(
-                        "SELECT ge.entity_id
-                     FROM group_entity ge
-                     JOIN entity_group eg ON ge.entity_group_id = eg.id
-                     WHERE eg.group_cluster_id = $1
-                     AND ge.entity_id <> $2
-                     LIMIT 1",
-                        &[&cluster_id, &entity_id],
-                    )
-                    .await?;
+        // 2. Batch fetch cluster members if any clusters were identified
+        if !clusters_to_fetch.is_empty() {
+            let cluster_ids_vec: Vec<String> = clusters_to_fetch.into_iter().collect();
+            let cluster_member_rows = conn
+                .query(
+                    "SELECT eg.group_cluster_id, ge.entity_id
+                 FROM group_entity ge
+                 JOIN entity_group eg ON ge.entity_group_id = eg.id
+                 WHERE eg.group_cluster_id = ANY($1::TEXT[])",
+                    &[&cluster_ids_vec],
+                )
+                .await
+                .context("Failed to batch fetch cluster members")?;
 
-                if let Some(entity_row) = entity_rows.get(0) {
-                    let other_entity_id: String = entity_row.get(0);
+            for row in cluster_member_rows {
+                let cluster_id: String = row.get(0);
+                let member_entity_id: String = row.get(1);
+                cluster_to_entities_map
+                    .entry(cluster_id)
+                    .or_default()
+                    .push(member_entity_id.clone());
+                all_entity_ids_needed.insert(member_entity_id);
+            }
+        }
 
-                    // Get stored features for both entities
-                    let entity1_features = self.get_entity_features(&conn, &entity_id).await?;
-                    let entity2_features =
-                        self.get_entity_features(&conn, &other_entity_id).await?;
+        // Second pass: form pairs from clustered feedback
+        for row in feedback_rows {
+            // Iterate original feedback again
+            let entity_a_id: String = row.get("entity_id_a");
+            let correct_cluster_id: Option<String> = row.get("correct_cluster_id");
+            let reviewed_method_type: String = row.get("reviewed_method_type"); // This is the method under review
+            let was_correct: bool = row.get("was_correct");
 
-                    // Get pair features
-                    let pair_features = self
-                        .get_pair_features(&conn, &entity_id, &other_entity_id)
-                        .await?;
-
-                    // Combine all features
-                    let mut features = Vec::new();
-                    features.extend(entity1_features);
-                    features.extend(entity2_features);
-                    features.extend(pair_features);
-
-                    // Add to examples
-                    examples.push(TrainingExample {
-                        features,
-                        best_method: method_type,
-                        confidence: 1.0, // Maximum confidence for human feedback
-                    });
+            if !was_correct && correct_cluster_id.is_some() {
+                // Human corrected by assigning to a cluster
+                if let Some(members) =
+                    cluster_to_entities_map.get(correct_cluster_id.as_ref().unwrap())
+                {
+                    for entity_b_id in members {
+                        if &entity_a_id != entity_b_id {
+                            // What's the "best_method" here? The human didn't specify a method, just a cluster.
+                            // We might need to infer it or use a generic "ClusterConfirmed" type,
+                            // or use the `reviewed_method_type` if the context implies it was about *that method* for this new pair.
+                            // For now, let's assume the `reviewed_method_type` is a candidate for this new pair.
+                            training_pair_candidates.push(TrainingPairCandidate {
+                                entity_a_id: entity_a_id.clone(),
+                                entity_b_id: entity_b_id.clone(),
+                                best_method: reviewed_method_type.clone(), // Or a more generic label
+                            });
+                            // all_entity_ids_needed already populated
+                            break; // Take first other entity in cluster to match original logic
+                        }
+                    }
                 }
             }
         }
 
-        info!("Collected {} training examples", examples.len());
+        if all_entity_ids_needed.is_empty() {
+            info!("No entity IDs identified for feature fetching. No training data generated.");
+            return Ok(Vec::new());
+        }
 
-        Ok(examples)
-    }
-
-    // Helper to get entity features
-    async fn get_entity_features(
-        &self,
-        conn: &tokio_postgres::Client,
-        entity_id: &str,
-    ) -> Result<Vec<f64>> {
-        let rows = conn
+        // 3. Batch fetch entity features
+        let entity_ids_param: Vec<String> = all_entity_ids_needed.into_iter().collect();
+        let feature_rows = conn
             .query(
-                "SELECT feature_name, feature_value
-             FROM clustering_metadata.entity_context_features
-             WHERE entity_id = $1
-             ORDER BY feature_name",
-                &[&entity_id],
+                "SELECT entity_id, feature_name, feature_value 
+             FROM clustering_metadata.entity_context_features 
+             WHERE entity_id = ANY($1::TEXT[])",
+                &[&entity_ids_param],
             )
-            .await?;
+            .await
+            .context("Failed to batch fetch entity features")?;
 
-        let mut features = Vec::new();
-        for row in rows {
-            let value: f64 = row.get(1);
-            features.push(value);
+        let mut entity_features_cache: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        for row in feature_rows {
+            let entity_id: String = row.get(0);
+            let feature_name: String = row.get(1);
+            let feature_value: f64 = row.get(2);
+            entity_features_cache
+                .entry(entity_id)
+                .or_default()
+                .insert(feature_name, feature_value);
+        }
+        debug!(
+            "Cached features for {} unique entities.",
+            entity_features_cache.len()
+        );
+
+        // 4. Construct TrainingExamples
+        let mut training_examples = Vec::new();
+        let feature_metadata = get_feature_metadata(); // For ordering
+        const INDIVIDUAL_FEATURE_COUNT: usize = 12;
+
+        for candidate in training_pair_candidates {
+            let e1_features_ordered = Self::get_ordered_features_from_cache(
+                &candidate.entity_a_id,
+                &entity_features_cache,
+                &feature_metadata,
+                INDIVIDUAL_FEATURE_COUNT,
+            );
+            let e2_features_ordered = Self::get_ordered_features_from_cache(
+                &candidate.entity_b_id,
+                &entity_features_cache,
+                &feature_metadata,
+                INDIVIDUAL_FEATURE_COUNT,
+            );
+
+            // If features for either entity are incomplete (e.g. not found in cache), skip.
+            if e1_features_ordered.len() != INDIVIDUAL_FEATURE_COUNT
+                || e2_features_ordered.len() != INDIVIDUAL_FEATURE_COUNT
+            {
+                warn!("Skipping training candidate for pair ({}, {}) due to missing/incomplete entity features.", candidate.entity_a_id, candidate.entity_b_id);
+                continue;
+            }
+
+            // Pair features are currently placeholders in this model's context.
+            let pair_features = vec![0.5; 7]; // 7 pair features as per get_feature_metadata
+
+            let mut combined_features = Vec::new();
+            combined_features.extend(e1_features_ordered);
+            combined_features.extend(e2_features_ordered);
+            combined_features.extend(pair_features);
+
+            // Ensure the total number of features matches model expectation
+            if combined_features.len() == self.feature_names.len() {
+                training_examples.push(TrainingExample {
+                    features: combined_features,
+                    best_method: candidate.best_method,
+                    confidence: 1.0, // Human feedback implies high confidence in this label
+                });
+            } else {
+                warn!("Skipping training example for pair ({}, {}) due to final feature count mismatch. Expected {}, got {}.", 
+                    candidate.entity_a_id, candidate.entity_b_id, self.feature_names.len(), combined_features.len());
+            }
         }
 
-        // If no features found, use zeros
-        if features.is_empty() {
-            // 12 entity features (see feature_extraction.rs)
-            features = vec![0.0; 12];
-        }
-
-        Ok(features)
+        info!(
+            "Collected {} training examples for ContextModel after batch processing.",
+            training_examples.len()
+        );
+        Ok(training_examples)
     }
 
-    // Helper to get pair features
-    async fn get_pair_features(
-        &self,
-        conn: &tokio_postgres::Client,
-        entity1_id: &str,
-        entity2_id: &str,
-    ) -> Result<Vec<f64>> {
-        // This would ideally pull from a cache, but for simplicity we'll use placeholder values
-        // In a real implementation, we would extract these using functions from feature_extraction.rs
-
-        // 7 pair features (see feature_extraction.rs)
-        let pair_features = vec![0.5; 7];
-
-        Ok(pair_features)
-    }
-
-    // Save model to database
-    pub async fn save_to_db(&self, pool: &PgPool) -> Result<String> {
-        let conn = pool.get().await?;
-
-        // Serialize model to JSON
-        let model_json = serde_json::to_value(self)?;
-
-        // Generate a unique ID if saving for the first time
-        let id = Uuid::new_v4().to_string();
-
-        // Check if model already exists
-        let existing = conn
-            .query_opt(
-                "SELECT id FROM clustering_metadata.ml_models
-             WHERE model_type = 'context_model'
-             ORDER BY version DESC
-             LIMIT 1",
-                &[],
-            )
-            .await?;
-
-        let model_id = if let Some(row) = existing {
-            row.get(0)
+    /// Helper to reconstruct an ordered feature vector from a cache of feature maps.
+    fn get_ordered_features_from_cache(
+        entity_id: &str,
+        cache: &HashMap<String, HashMap<String, f64>>,
+        metadata: &[super::types::FeatureMetadata], // Use the type from super
+        expected_count: usize,
+    ) -> Vec<f64> {
+        let mut ordered_features = vec![0.0; expected_count]; // Default to 0.0
+        if let Some(feature_map) = cache.get(entity_id) {
+            for i in 0..expected_count {
+                if i < metadata.len() {
+                    if let Some(value) = feature_map.get(&metadata[i].name) {
+                        ordered_features[i] = *value;
+                    } else {
+                        // Log missing specific feature for an entity if needed
+                        // warn!("Entity {} missing feature '{}', defaulting to 0.0", entity_id, metadata[i].name);
+                    }
+                }
+            }
         } else {
-            id
-        };
+            // Log if entity has no features at all in cache
+            // warn!("Entity {} not found in feature cache.", entity_id);
+        }
+        ordered_features
+    }
 
-        // Prepare parameters JSON
-        let parameters = json!({
-            "feature_names": self.feature_names,
-            "method_labels": self.method_labels,
-            "num_classes": self.method_labels.len(),
-            "version": self.version,
-        });
+    // get_entity_features and get_pair_features are no longer directly used by the revised
+    // collect_training_data. If they were used by other parts of ContextModel, they would need
+    // to be kept or adapted. For this refactoring, we assume their logic is now incorporated
+    // or handled by the batch fetching within collect_training_data.
 
-        // Prepare metrics JSON
-        let metrics = json!({
-            "feature_importance": self.feature_importance()
-                .into_iter()
-                .map(|(name, score)| json!({"feature": name, "importance": score}))
-                .collect::<Vec<_>>()
-        });
-
-        // Insert or update the model
-        conn.execute(
-            "INSERT INTO clustering_metadata.ml_models
-             (id, model_type, parameters, metrics, version, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-             ON CONFLICT (id) DO UPDATE
-             SET parameters = $3, metrics = $4, version = $5, updated_at = CURRENT_TIMESTAMP",
-            &[
-                &model_id,
-                &"context_model",
-                &parameters,
-                &metrics,
-                &(self.version as i32),
-            ],
-        )
-        .await?;
-
-        // Store the serialized model as a separate record
+    pub async fn save_to_db(&mut self, pool: &PgPool) -> Result<String> {
+        // ... (Implementation remains the same as in previous optimized version)
+        let conn = pool
+            .get()
+            .await
+            .context("Failed to get DB conn for save_to_db")?;
+        if let Some(live_model_ref) = &self.live_forest {
+            match RandomForestClassifierWrapper::from_forest(live_model_ref) {
+                Ok(wrapper) => self.forest_for_serde = Some(wrapper),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to wrap live_forest for saving: {}",
+                        e
+                    ))
+                }
+            }
+        } else {
+            self.forest_for_serde = None;
+        }
+        let model_json = serde_json::to_value(&*self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize ContextModel to JSON: {}", e))?;
+        let id = Uuid::new_v4().to_string();
+        let existing = conn.query_opt("SELECT id FROM clustering_metadata.ml_models WHERE model_type = 'context_model' ORDER BY version DESC LIMIT 1", &[]).await?;
+        let model_id = existing.map_or(id, |row| row.get(0));
+        let parameters = json!({ "feature_names": self.feature_names, "method_labels": self.method_labels, "num_classes": self.method_labels.len(), "version": self.version });
+        let metrics = json!({ "feature_importance": self.feature_importance().into_iter().map(|(name, score)| json!({"feature": name, "importance": score})).collect::<Vec<_>>() });
+        conn.execute("INSERT INTO clustering_metadata.ml_models (id, model_type, parameters, metrics, version, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT (id) DO UPDATE SET parameters = $3, metrics = $4, version = $5, updated_at = CURRENT_TIMESTAMP", &[&model_id, &"context_model", &parameters, &metrics, &(self.version as i32)]).await?;
         let binary_id = format!("{}_binary", model_id);
-        conn.execute(
-            "INSERT INTO clustering_metadata.ml_models
-             (id, model_type, parameters, version, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-             ON CONFLICT (id) DO UPDATE
-             SET parameters = $3, version = $4, updated_at = CURRENT_TIMESTAMP",
-            &[
-                &binary_id,
-                &"context_model_binary",
-                &model_json,
-                &(self.version as i32),
-            ],
-        )
-        .await?;
-
+        conn.execute("INSERT INTO clustering_metadata.ml_models (id, model_type, parameters, version, created_at, updated_at) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT (id) DO UPDATE SET parameters = $3, version = $4, updated_at = CURRENT_TIMESTAMP", &[&binary_id, &"context_model_binary", &model_json, &(self.version as i32)]).await?;
         info!(
             "Saved context model to database, ID: {}, version: {}",
             model_id, self.version
         );
-
         Ok(model_id)
     }
 
-    // Load model from database
     pub async fn load_from_db(pool: &PgPool) -> Result<Self> {
-        let conn = pool.get().await?;
-
-        // Get latest model
-        let binary_row = conn
-            .query_opt(
-                "SELECT id, parameters
-             FROM clustering_metadata.ml_models
-             WHERE model_type = 'context_model_binary'
-             ORDER BY version DESC
-             LIMIT 1",
-                &[],
-            )
-            .await?;
-
-        if let Some(row) = binary_row {
-            let params: Value = row.get(1);
-
-            // Deserialize the model
-            let model: ContextModel = serde_json::from_value(params)?;
-
+        // ... (Implementation remains the same as in previous optimized version)
+        let conn = pool
+            .get()
+            .await
+            .context("Failed to get DB conn for load_from_db")?;
+        let binary_row_opt = conn.query_opt("SELECT parameters FROM clustering_metadata.ml_models WHERE model_type = 'context_model_binary' ORDER BY version DESC LIMIT 1", &[]).await?;
+        if let Some(binary_row) = binary_row_opt {
+            let model_json: Value = binary_row.get(0);
+            let mut model: ContextModel = serde_json::from_value(model_json).map_err(|e| {
+                anyhow::anyhow!("Failed to deserialize ContextModel from DB JSON: {}", e)
+            })?;
+            if let Some(wrapper) = &model.forest_for_serde {
+                match wrapper.to_forest() {
+                    Ok(forest_model) => model.live_forest = Some(forest_model),
+                    Err(e) => warn!("Failed to convert wrapper to live_forest during load for model v{}: {}. Model unusable for prediction.", model.version, e),
+                }
+            } else {
+                model.live_forest = None;
+            }
             info!(
                 "Loaded context model from database, version: {}",
                 model.version
             );
-
-            return Ok(model);
+            Ok(model)
+        } else {
+            info!("No existing context model in DB, creating new one.");
+            Ok(Self::new())
         }
-
-        // If no model found, return a new one
-        info!("No existing context model found, creating new one");
-        Ok(Self::new())
     }
 }

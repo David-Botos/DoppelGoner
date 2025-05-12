@@ -1,12 +1,16 @@
 // src/entity_organization.rs
 use anyhow::{Context, Result};
 use chrono::Utc;
-use log::{info, warn};
+use futures::{stream, StreamExt};
+use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::db::PgPool;
 use crate::models::{Entity, EntityFeature, EntityId, OrganizationId};
+use crate::reinforcement::get_stored_entity_features;
 
 /// Extracts entities from the organization table
 /// Creates an entity record for each organization with its metadata
@@ -447,4 +451,105 @@ pub async fn link_entity_features(pool: &PgPool, entities: &[Entity]) -> Result<
 
     // Return the total number of features (existing + new)
     Ok(existing_features.len() + inserted)
+}
+
+/// Extracts and stores context features for all identified entities in PARALLEL.
+/// It iterates through all entities in the 'public.entity' table.
+/// This version uses `get_stored_entity_features` to avoid recalculating existing, complete features.
+pub async fn extract_and_store_all_entity_context_features(pool: &PgPool) -> Result<usize> {
+    info!("Starting PARALLEL extraction and storage of context features for all entities...");
+    let start_time = std::time::Instant::now();
+
+    // Get a connection to fetch the list of all entity IDs
+    let conn_for_list = pool
+        .get()
+        .await
+        .context("Failed to get DB connection for entity list")?;
+    let entity_rows = conn_for_list
+        .query("SELECT id FROM public.entity", &[]) // EntityId is String, so direct mapping
+        .await
+        .context("Failed to query entity IDs for feature extraction")?;
+    drop(conn_for_list); // Release the connection as soon as the list is fetched
+
+    if entity_rows.is_empty() {
+        info!("No entities found to process for context features.");
+        return Ok(0);
+    }
+
+    let entity_ids: Vec<EntityId> = entity_rows
+        .into_iter()
+        .map(|row| EntityId(row.get(0))) // Assuming EntityId(String)
+        .collect();
+
+    let total_entities_to_process = entity_ids.len();
+    info!(
+        "Found {} entities to process for context features.",
+        total_entities_to_process
+    );
+
+    // --- Parallel Processing Logic ---
+    // Set desired concurrency. This value should be tuned based on your DB capacity and machine resources.
+    // Keeping it at 30 to stay well within the preferred 40 connection limit,
+    // assuming other parts of the pipeline might use some connections.
+    // This could be made configurable (e.g., from config.rs or an environment variable).
+    let desired_concurrency = 30;
+
+    // Atomic counters for tracking progress in a thread-safe manner
+    let Succeeded_count = Arc::new(AtomicUsize::new(0));
+    let processed_for_log_count = Arc::new(AtomicUsize::new(0));
+
+    stream::iter(entity_ids)
+        .map(|entity_id| {
+            let pool_clone = pool.clone(); // Clone the pool for each spawned task
+            let Succeeded_clone = Arc::clone(&Succeeded_count);
+            let processed_log_clone = Arc::clone(&processed_for_log_count);
+            // Shadow total_entities_to_process to avoid capturing the outer variable directly in the 'static future
+            let total_entities = total_entities_to_process;
+
+            tokio::spawn(async move { // Spawn a new asynchronous task for each entity
+                match pool_clone.get().await { // Each task gets its own connection from the pool
+                    Ok(conn_guard) => {
+                        // Call `get_stored_entity_features` which handles resumability.
+                        // It will call the actual feature extraction logic only if necessary.
+                        match get_stored_entity_features(&*conn_guard, &entity_id).await {
+                            Ok(_features) => {
+                                // If features are successfully retrieved or generated.
+                                Succeeded_clone.fetch_add(1, Ordering::Relaxed);
+                                debug!("Features ensured for entity {}", entity_id.0);
+                            }
+                            Err(e) => {
+                                warn!("Failed to ensure features for entity {}: {}", entity_id.0, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to get DB connection for entity {}: {}", entity_id.0, e);
+                    }
+                }
+                // Log progress periodically
+                let current_processed = processed_log_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                if current_processed % 100 == 0 || current_processed == total_entities { // Log every 100 entities or at the very end
+                    info!(
+                        "Feature extraction progress: {}/{} entity processing tasks dispatched/completed.",
+                        current_processed, total_entities
+                    );
+                }
+            })
+        })
+        .buffer_unordered(desired_concurrency) // Limit the number of concurrent tasks
+        .for_each(|result| async {
+            if let Err(e) = result { // Handle potential errors from spawned tasks (e.g., panics)
+                warn!("A feature extraction task panicked or failed to join: {:?}", e);
+            }
+        })
+        .await;
+
+    let final_Succeeded_count = Succeeded_count.load(Ordering::Relaxed);
+    let elapsed = start_time.elapsed();
+    info!(
+        "Parallel context feature extraction and storage complete in {:.2?}. Ensured features for {} out of {} entities.",
+        elapsed, final_Succeeded_count, total_entities_to_process
+    );
+
+    Ok(final_Succeeded_count)
 }

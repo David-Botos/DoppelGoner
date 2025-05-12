@@ -1,41 +1,144 @@
-use anyhow::Result;
+// src/reinforcement/orchestrator.rs
+use anyhow::{Context, Result}; // Added Context
+use chrono::Utc;
 use log::{debug, info, warn};
 use uuid::Uuid;
 
 use super::confidence_tuner::ConfidenceTuner;
 use super::context_model::ContextModel;
-use super::feature_extraction::{extract_context_for_pair, extract_entity_features};
-use crate::db::PgPool;
+use super::FeedbackItem;
+// feature_extraction is used via a call in extract_pair_context, no direct use here
+// use super::feature_extraction::{extract_context_for_pair, extract_entity_features};
+use crate::db::{fetch_recent_feedback_items, PgPool};
 use crate::models::{EntityId, MatchMethodType};
+use crate::reinforcement::feedback_processor;
 
 pub struct MatchingOrchestrator {
-    context_model: ContextModel,
-    confidence_tuner: ConfidenceTuner,
+    pub context_model: ContextModel,
+    pub confidence_tuner: ConfidenceTuner,
+}
+
+// This private helper function will now take the pool and other necessary details.
+async fn record_entity_feedback(
+    pool: &PgPool, // Accept the pool
+    entity1_id: &EntityId,
+    entity2_id: &EntityId,
+    method_used: &MatchMethodType, // Method ultimately applied
+    final_confidence_score: f64,   // Confidence of the applied match
+    was_correct: bool,
+    context_features: Option<&Vec<f64>>,
+    ml_predicted_method: Option<&MatchMethodType>, // Method suggested by ContextModel
+    ml_prediction_confidence: Option<f64>,         // Confidence of ContextModel's suggestion
+    context_model_version: u32,                    // Pass from orchestrator
+    confidence_tuner_version: u32,                 // Pass from orchestrator
+) -> Result<()> {
+    let conn = pool
+        .get()
+        .await
+        .context("Failed to get DB connection from pool in record_entity_feedback")?;
+    let decision_id = Uuid::new_v4().to_string();
+    let now = Utc::now().naive_utc();
+
+    // Insert into human_review_decisions (system's perspective)
+    conn.execute(
+        "INSERT INTO clustering_metadata.human_review_decisions
+        (id, reviewer_id, decision_type, entity_id, confidence, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6)",
+        &[
+            &decision_id,
+            &"ml_system",
+            &"match_assessment",
+            &entity1_id.0,
+            &final_confidence_score,
+            &now,
+        ],
+    )
+    .await
+    .context("Failed to insert into human_review_decisions")?; // Added context
+
+    // Insert into human_review_method_feedback
+    let confidence_adjustment = if was_correct { 0.05 } else { -0.05 };
+    conn.execute(
+        "INSERT INTO clustering_metadata.human_review_method_feedback
+        (id, decision_id, method_type, was_correct, confidence_adjustment, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6)",
+        &[
+            &Uuid::new_v4().to_string(),
+            &decision_id,
+            &method_used.as_str(),
+            &was_correct,
+            // Ensure the type is explicitly f64 for ToSql trait
+            &(confidence_adjustment as f64) as &(dyn tokio_postgres::types::ToSql + Sync),
+            &now,
+        ],
+    )
+    .await
+    .context("Failed to insert into human_review_method_feedback")?; // Added context
+
+    let snapshotted_features_json = context_features.map_or(serde_json::Value::Null, |features| {
+        serde_json::to_value(features).unwrap_or(serde_json::Value::Null)
+    });
+
+    let method_for_snapshot_str = ml_predicted_method.unwrap_or(method_used).as_str();
+
+    conn.execute(
+        "INSERT INTO clustering_metadata.entity_match_pairs
+        (decision_id, entity1_id, entity2_id, method_type, prediction_confidence, 
+         snapshotted_features, context_model_version, confidence_tuner_version, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (decision_id) DO UPDATE SET
+            entity1_id = EXCLUDED.entity1_id,
+            entity2_id = EXCLUDED.entity2_id,
+            method_type = EXCLUDED.method_type,
+            prediction_confidence = EXCLUDED.prediction_confidence,
+            snapshotted_features = EXCLUDED.snapshotted_features,
+            context_model_version = EXCLUDED.context_model_version,
+            confidence_tuner_version = EXCLUDED.confidence_tuner_version,
+            created_at = EXCLUDED.created_at",
+        &[
+            &decision_id,
+            &entity1_id.0,
+            &entity2_id.0,
+            &method_for_snapshot_str,
+            &ml_prediction_confidence,
+            &snapshotted_features_json,
+            &(context_model_version as i32), // Use passed-in version
+            &(confidence_tuner_version as i32), // Use passed-in version
+            &now,
+        ],
+    )
+    .await
+    .context("Failed to insert into entity_match_pairs")?; // Added context
+
+    Ok(())
 }
 
 impl MatchingOrchestrator {
     pub async fn new(pool: &PgPool) -> Result<Self> {
-        // Try to load models from database
         let context_model = match ContextModel::load_from_db(pool).await {
             Ok(model) => {
-                info!("Loaded context model from database");
+                info!(
+                    "Loaded context model from database version {}",
+                    model.version
+                );
                 model
             }
             Err(e) => {
-                warn!("Could not load context model: {}", e);
-                info!("Creating new context model");
+                warn!("Could not load context model: {}. Creating new one.", e);
                 ContextModel::new()
             }
         };
 
         let confidence_tuner = match ConfidenceTuner::load_from_db(pool).await {
             Ok(tuner) => {
-                info!("Loaded confidence tuner from database");
+                info!(
+                    "Loaded confidence tuner from database version {}",
+                    tuner.version
+                );
                 tuner
             }
             Err(e) => {
-                warn!("Could not load confidence tuner: {}", e);
-                info!("Creating new confidence tuner");
+                warn!("Could not load confidence tuner: {}. Creating new one.", e);
                 ConfidenceTuner::new()
             }
         };
@@ -46,221 +149,151 @@ impl MatchingOrchestrator {
         })
     }
 
-    pub async fn select_matching_method(
-        &self,
+    pub async fn extract_pair_context(
         pool: &PgPool,
         entity1: &EntityId,
         entity2: &EntityId,
-    ) -> Result<(MatchMethodType, f64)> {
+    ) -> Result<Vec<f64>> {
         info!(
-            "Selecting matching method for entities {:?} and {:?}",
+            "Extracting context for entities {:?} and {:?}",
             entity1, entity2
         );
+        super::feature_extraction::extract_context_for_pair(pool, entity1, entity2).await
+    }
 
-        // Extract context features for this entity pair
-        let context = extract_context_for_pair(pool, entity1, entity2).await?;
+    pub fn predict_method_with_context(
+        &self,
+        context_features: &Vec<f64>,
+    ) -> Result<(MatchMethodType, f64)> {
+        info!("Predicting matching method with pre-extracted context features");
 
-        // Use the context model to predict best method
         let (method_name, context_confidence) =
-            match self.context_model.predict_best_method(&context) {
+            match self.context_model.predict_best_method(context_features) {
                 Some((method, confidence)) => {
                     info!(
-                        "Context model predicts method '{}' with confidence {:.4}",
-                        method, confidence
+                        "Context model (v{}) predicts method '{}' with confidence {:.4}",
+                        self.context_model.version, method, confidence
                     );
                     (method, confidence)
                 }
                 None => {
-                    // Fallback to default method if model is not trained
-                    info!("Using default method (name) due to missing context model");
+                    info!(
+                        "Context model (v{}) could not predict. Using default method (name).",
+                        self.context_model.version
+                    );
                     ("name".to_string(), 0.5)
                 }
             };
 
-        // Use confidence tuner to get the confidence score (with context awareness)
         let confidence = self.confidence_tuner.select_confidence_with_context(
             &method_name,
-            &context,
+            context_features,
             context_confidence,
         );
 
         info!(
-            "Selected confidence {:.4} for method '{}'",
-            confidence, method_name
+            "Confidence tuner (v{}) selected confidence {:.4} for method '{}'",
+            self.confidence_tuner.version, confidence, method_name
         );
 
-        let method_type = match method_name.as_str() {
-            "email" => MatchMethodType::Email,
-            "phone" => MatchMethodType::Phone,
-            "url" => MatchMethodType::Url,
-            "address" => MatchMethodType::Address,
-            "geospatial" => MatchMethodType::Geospatial,
-            _ => MatchMethodType::Name, // Default
-        };
+        let method_type = MatchMethodType::from_str(&method_name); // Use from_str for consistency
 
         Ok((method_type, confidence))
     }
 
     pub async fn log_match_result(
         &mut self,
-        method: &MatchMethodType,
-        confidence: f64,
-        was_correct: bool,
+        pool: &PgPool, // Added pool parameter
         entity1_id: &EntityId,
         entity2_id: &EntityId,
+        method_used: &MatchMethodType,
+        final_confidence_score: f64,
+        was_correct: bool,
+        context_features: Option<&Vec<f64>>,
+        ml_predicted_method: Option<&MatchMethodType>,
+        ml_prediction_confidence: Option<f64>,
     ) -> Result<()> {
-        // Calculate reward (1.0 if correct, 0.0 if incorrect)
-        let reward = if was_correct { 1.0 } else { 0.0 };
+        let reward = if was_correct { 1.0 } else { 0.0 }; // Or -1.0 for incorrect, depends on strategy
 
-        // Update the confidence tuner
+        // Update tuner before potential version increment if it saves itself
         self.confidence_tuner
-            .update(method.as_str(), confidence, reward)?;
+            .update(method_used.as_str(), final_confidence_score, reward)?;
+        // If ConfidenceTuner::update might save & increment version, and you want to log the version *before* this update for this specific call,
+        // you might fetch version numbers before calling update. For now, assume update doesn't auto-save/increment.
 
-        // Record detailed feedback in the database
-        match self
-            .record_entity_feedback(method, confidence, was_correct, entity1_id, entity2_id)
-            .await
+        let context_model_ver = self.context_model.version;
+        let confidence_tuner_ver = self.confidence_tuner.version;
+
+        // Call the refactored record_entity_feedback, now a free function or static method
+        match record_entity_feedback(
+            pool, // Pass the pool
+            entity1_id,
+            entity2_id,
+            method_used,
+            final_confidence_score,
+            was_correct,
+            context_features,
+            ml_predicted_method,
+            ml_prediction_confidence,
+            context_model_ver,    // Pass current version
+            confidence_tuner_ver, // Pass current version
+        )
+        .await
         {
-            Ok(_) => debug!("Recorded detailed entity feedback for ML training"),
-            Err(e) => warn!("Failed to record detailed entity feedback: {}", e),
+            Ok(_) => debug!("Recorded detailed entity feedback (with snapshot) for ML training"),
+            Err(e) => warn!(
+                "Failed to record detailed entity feedback (with snapshot): {}",
+                e
+            ),
         }
 
         info!(
-            "Logged match result for method {}: entities {} and {}, correct={}, confidence={:.4}",
-            method.as_str(),
+            "Logged match result for method {}: entities {} and {}, correct={}, final_confidence={:.4}. RL Models: Context v{}, Tuner v{}",
+            method_used.as_str(),
             entity1_id.0,
             entity2_id.0,
             was_correct,
-            confidence
+            final_confidence_score,
+            context_model_ver,
+            confidence_tuner_ver
         );
-
         Ok(())
     }
 
-    // New method to record detailed entity feedback
-    async fn record_entity_feedback(
-        &self,
-        method: &MatchMethodType,
-        confidence: f64,
-        was_correct: bool,
-        entity1_id: &EntityId,
-        entity2_id: &EntityId,
-    ) -> Result<()> {
-        let pool = crate::db::connect().await?;
-        let conn = pool.get().await?;
-        let decision_id = Uuid::new_v4().to_string();
+    // pub async fn save_models(&self, pool: &PgPool) -> Result<()> {
+    //     info!("Saving ML models to database. ContextModel v{}, ConfidenceTuner v{}", self.context_model.version, self.confidence_tuner.version);
+    //     let context_model_id = self.context_model.save_to_db(pool).await?;
+    //     let confidence_tuner_id = self.confidence_tuner.save_to_db(pool).await?;
+    //     info!(
+    //         "Saved models with IDs: context={}, confidence={}",
+    //         context_model_id, confidence_tuner_id
+    //     );
+    //     Ok(())
+    // }
 
-        // First, create a human_review_decisions record
-        let insert_decision = "
-            INSERT INTO clustering_metadata.human_review_decisions 
-            (id, reviewer_id, decision_type, entity_id, confidence, created_at)
-            VALUES ($1, $2, $3, $4, $5, NOW())
-        ";
-
-        conn.execute(
-            insert_decision,
-            &[
-                &decision_id,
-                &"ml_system",      // Using a standard ID for ML-generated feedback
-                &"match_feedback", // New decision type for ML feedback
-                &entity1_id.0,     // We'll record entity1 as the primary entity
-                &confidence,
-            ],
-        )
-        .await?;
-
-        // Then, create a human_review_method_feedback record
-        let insert_feedback = "
-            INSERT INTO clustering_metadata.human_review_method_feedback
-            (id, decision_id, method_type, was_correct, confidence_adjustment, created_at)
-            VALUES ($1, $2, $3, $4, $5, NOW())
-        ";
-
-        // Calculate a confidence adjustment (positive or negative)
-        let confidence_adjustment = if was_correct { 0.05 } else { -0.05 };
-
-        conn.execute(
-            insert_feedback,
-            &[
-                &Uuid::new_v4().to_string(),
-                &decision_id,
-                &method.as_str(),
-                &was_correct,
-                &confidence_adjustment.to_string(),
-            ],
-        )
-        .await?;
-
-        // Also store the second entity in a custom field or table
-        // This is important for training the context model later
-        let insert_entity_pair = "
-            INSERT INTO clustering_metadata.entity_match_pairs
-            (decision_id, entity1_id, entity2_id, method_type, created_at)
-            VALUES ($1, $2, $3, $4, NOW())
-            ON CONFLICT DO NOTHING
-        ";
-
-        // First check if the entity_match_pairs table exists, create if not
-        let create_table = "
-            CREATE TABLE IF NOT EXISTS clustering_metadata.entity_match_pairs (
-                decision_id TEXT NOT NULL REFERENCES clustering_metadata.human_review_decisions(id),
-                entity1_id TEXT NOT NULL,
-                entity2_id TEXT NOT NULL, 
-                method_type TEXT NOT NULL,
-                created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (decision_id)
-            )
-        ";
-
-        // Create table first
-        match conn.execute(create_table, &[]).await {
-            Ok(_) => debug!("Entity match pairs table exists or was created"),
-            Err(e) => warn!("Failed to create entity match pairs table: {}", e),
-        }
-
-        // Then insert the pair
-        conn.execute(
-            insert_entity_pair,
-            &[&decision_id, &entity1_id.0, &entity2_id.0, &method.as_str()],
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn save_models(&self, pool: &PgPool) -> Result<()> {
-        // Save both models
-        info!("Saving ML models to database");
-
-        let context_model_id = self.context_model.save_to_db(pool).await?;
-        let confidence_tuner_id = self.confidence_tuner.save_to_db(pool).await?;
-
-        info!(
-            "Saved models with IDs: context={}, confidence={}",
-            context_model_id, confidence_tuner_id
-        );
-
-        Ok(())
-    }
-
-    // Force a retrain of the context model
     pub async fn train_context_model(&mut self, pool: &PgPool) -> Result<()> {
-        info!("Manually training context model");
-        self.context_model.train(pool).await?;
+        info!(
+            "Manually training context model (current version: {}).",
+            self.context_model.version
+        );
+        self.context_model.train(pool).await?; // train() should increment version internally on success
+        info!(
+            "Context model training complete. New version: {}.",
+            self.context_model.version
+        );
         Ok(())
     }
 
-    // Get stats about the confidence tuner
     pub fn get_confidence_stats(&self) -> String {
         let stats = self.confidence_tuner.get_stats();
-
-        let mut output = String::from("Confidence Tuner Statistics:\n");
-
+        let mut output = format!(
+            "Confidence Tuner (v{}) Statistics:\n",
+            self.confidence_tuner.version
+        );
         for (method, values) in stats {
             output.push_str(&format!("\nMethod: {}\n", method));
             output.push_str("  Confidence | Avg Reward | Trials\n");
             output.push_str("  -----------|------------|-------\n");
-
             for (confidence, reward, trials) in values {
                 output.push_str(&format!(
                     "    {:.2}     |   {:.4}    |  {}\n",
@@ -268,17 +301,16 @@ impl MatchingOrchestrator {
                 ));
             }
         }
-
         output
     }
 
-    // Extract and store features for an entity
     pub async fn extract_entity_features(
-        &self,
+        // This method seems less used by orchestrator directly for pair matching
+        &self, // but might be a utility.
         pool: &PgPool,
         entity_id: &EntityId,
     ) -> Result<Vec<f64>> {
         let conn = pool.get().await?;
-        extract_entity_features(&conn, entity_id).await
+        super::feature_extraction::extract_entity_features(&conn, entity_id).await
     }
 }

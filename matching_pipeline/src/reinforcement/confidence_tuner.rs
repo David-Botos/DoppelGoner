@@ -2,7 +2,7 @@ use anyhow::Result;
 use log::{debug, info, warn};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -55,7 +55,7 @@ pub struct ConfidenceTuner {
     method_arms: HashMap<String, Vec<ConfidenceArm>>,
     context_thresholds: HashMap<String, Vec<f64>>,
     epsilon: f64,
-    version: u32,
+    pub version: u32,
 }
 
 impl ConfidenceTuner {

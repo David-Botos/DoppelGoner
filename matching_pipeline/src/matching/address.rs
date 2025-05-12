@@ -7,19 +7,36 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::db::PgPool;
+use crate::config;
+use crate::db::{self, PgPool};
 use crate::models::{
-    AddressMatchValue, EntityGroup, EntityGroupId, EntityId, MatchMethodType, MatchValues,
+    ActionType,
+    AddressMatchValue, // Specific MatchValue for Address
+    EntityGroupId,
+    EntityId,
+    MatchMethodType,
+    MatchValues, // Enum holding different MatchValue types
+    NewSuggestedAction,
+    SuggestionStatus,
 };
-use crate::reinforcement;
-use crate::results::{AddressMatchResult, MatchMethodStats};
+use crate::reinforcement::{self, MatchingOrchestrator};
+use crate::results::{AddressMatchResult, AnyMatchResult, MatchMethodStats}; // PairMlResult might not be needed if not used
+use serde_json;
+
+// SQL query for inserting into entity_group
+const INSERT_ENTITY_GROUP_SQL: &str = "
+    INSERT INTO public.entity_group
+    (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, created_at, updated_at, version)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)";
 
 pub async fn find_matches(
     pool: &PgPool,
     reinforcement_orchestrator: Option<&Mutex<reinforcement::MatchingOrchestrator>>,
-) -> Result<AddressMatchResult> {
+    pipeline_run_id: &str,
+) -> Result<AnyMatchResult> {
     info!(
-        "Starting address matching{}...",
+        "Starting pairwise address matching (run ID: {}){}...",
+        pipeline_run_id,
         if reinforcement_orchestrator.is_some() {
             " with ML guidance"
         } else {
@@ -28,83 +45,42 @@ pub async fn find_matches(
     );
     let start_time = Instant::now();
 
+    // Get a connection from the pool. This connection will be used for all operations.
+    // No single overarching transaction will be used.
     let mut conn = pool
         .get()
         .await
         .context("Failed to get DB connection for address matching")?;
 
-    // First, get all entities that are already part of an address match group
-    debug!("Finding entities already processed by address matching");
-    let processed_query = "
-        SELECT DISTINCT ge.entity_id
-        FROM group_entity ge
-        JOIN group_method gm ON ge.entity_group_id = gm.entity_group_id
-        WHERE gm.method_type = 'address'
-    ";
-
-    let processed_rows = conn
-        .query(processed_query, &[])
+    // 1. Fetch existing address-matched pairs
+    debug!("Fetching existing address-matched pairs...");
+    let existing_pairs_query = "
+        SELECT entity_id_1, entity_id_2
+        FROM public.entity_group
+        WHERE method_type = $1";
+    let existing_pair_rows = conn
+        .query(existing_pairs_query, &[&MatchMethodType::Address.as_str()])
         .await
-        .context("Failed to query processed entities")?;
+        .context("Failed to query existing address-matched pairs")?;
 
-    let mut processed_entities = HashSet::new();
-    for row in &processed_rows {
-        let entity_id: String = row.get("entity_id");
-        processed_entities.insert(EntityId(entity_id));
-    }
-
-    info!(
-        "Found {} entities already processed by address matching",
-        processed_entities.len()
-    );
-
-    // Get existing address groups and their normalized addresses
-    debug!("Finding existing address groups");
-    let existing_groups_query = "
-        SELECT 
-            eg.id AS group_id,
-            gm.id AS method_id,
-            gm.match_values
-        FROM 
-            entity_group eg
-            JOIN group_method gm ON eg.id = gm.entity_group_id
-        WHERE 
-            gm.method_type = 'address'
-    ";
-
-    let existing_groups_rows = conn
-        .query(existing_groups_query, &[])
-        .await
-        .context("Failed to query existing groups")?;
-
-    // Map of normalized address -> (group_id, method_id)
-    let mut existing_address_groups: HashMap<String, (String, String)> = HashMap::new();
-
-    for row in &existing_groups_rows {
-        let group_id: String = row.get("group_id");
-        let method_id: String = row.get("method_id");
-        let match_values_json: serde_json::Value = row.get("match_values");
-
-        // Parse the match values
-        if let Ok(match_values) = serde_json::from_value::<MatchValues>(match_values_json.clone()) {
-            if let MatchValues::Address(values) = match_values {
-                if !values.is_empty() {
-                    // Use the normalized address from the first value
-                    let normalized = values[0].normalized.clone();
-                    existing_address_groups.insert(normalized, (group_id, method_id));
-                }
-            }
+    let mut existing_processed_pairs: HashSet<(EntityId, EntityId)> = HashSet::new();
+    for row in existing_pair_rows {
+        let id1: String = row.get("entity_id_1");
+        let id2: String = row.get("entity_id_2");
+        if id1 < id2 {
+            existing_processed_pairs.insert((EntityId(id1), EntityId(id2)));
+        } else {
+            existing_processed_pairs.insert((EntityId(id2), EntityId(id1)));
         }
     }
-
     info!(
-        "Found {} existing address groups",
-        existing_address_groups.len()
+        "Found {} existing address-matched pairs.",
+        existing_processed_pairs.len()
     );
 
-    // Query addresses linked to locations and entities
+    // 2. Fetch Address Data for all entities
     let address_query = "
-        SELECT 
+        SELECT
             e.id AS entity_id,
             a.id AS address_id,
             a.address_1,
@@ -113,542 +89,415 @@ pub async fn find_matches(
             a.state_province,
             a.postal_code,
             a.country
-        FROM 
+        FROM
             entity e
             JOIN entity_feature ef ON e.id = ef.entity_id
             JOIN location l ON ef.table_id = l.id AND ef.table_name = 'location'
             JOIN address a ON a.location_id = l.id
-        WHERE 
-            a.address_1 IS NOT NULL 
-            AND a.address_1 != ''
-            AND a.city IS NOT NULL 
-            AND a.city != ''
+        WHERE
+            a.address_1 IS NOT NULL AND a.address_1 != ''
+            AND a.city IS NOT NULL AND a.city != ''
     ";
-
-    debug!("Executing address query");
+    debug!("Executing address query for all entities...");
     let address_rows = conn
         .query(address_query, &[])
         .await
         .context("Failed to query addresses")?;
+    info!(
+        "Found {} address records across all entities.",
+        address_rows.len()
+    );
 
-    info!("Found {} address records to process", address_rows.len());
-
-    // Process addresses into a structured format
     let mut address_map: HashMap<String, HashMap<EntityId, String>> = HashMap::new();
-    let mut processed_count = 0;
-
     for row in &address_rows {
-        let entity_id: String = row.get("entity_id");
-        let entity_id = EntityId(entity_id);
-
-        // Skip if this entity has already been processed
-        if processed_entities.contains(&entity_id) {
-            continue;
-        }
-
+        let entity_id = EntityId(row.get("entity_id"));
         let address_1: String = row.get("address_1");
-        let address_2: Option<String> = row.try_get("address_2").unwrap_or(None);
+        let address_2: Option<String> = row.try_get("address_2").ok().flatten();
         let city: String = row.get("city");
         let state_province: String = row.get("state_province");
         let postal_code: String = row.get("postal_code");
         let country: String = row.get("country");
 
-        // Assemble full address
         let full_address = format!(
             "{}{}, {}, {} {}, {}",
             address_1,
-            address_2.map_or("".to_string(), |a| format!(", {}", a)),
-            city,
-            state_province,
-            postal_code,
-            country
+            address_2
+                .as_deref()
+                .map_or("".to_string(), |a| format!(", {}", a.trim())),
+            city.trim(),
+            state_province.trim(),
+            postal_code.trim(),
+            country.trim()
         );
-
-        // Normalize the address
         let normalized_address = normalize_address(&full_address);
 
         if !normalized_address.is_empty() {
-            // Get or create the inner entity map for this normalized address
-            let entity_map = address_map.entry(normalized_address).or_default();
-
-            // Only add if this entity isn't already in the map for this address
-            entity_map.entry(entity_id).or_insert(full_address);
-        }
-
-        processed_count += 1;
-        if processed_count % 1000 == 0 {
-            debug!("Processed {} address records so far", processed_count);
+            address_map
+                .entry(normalized_address)
+                .or_default()
+                .insert(entity_id, full_address);
         }
     }
-
-    let unique_addresses = address_map.len();
     info!(
-        "Found {} unique normalized addresses from unprocessed records",
-        unique_addresses
+        "Processed {} unique normalized addresses.",
+        address_map.len()
     );
 
-    // Begin transaction for all database operations
-    let tx = conn
-        .transaction()
-        .await
-        .context("Failed to start transaction")?;
-
-    // Prepare statements for reuse
-    let group_stmt = tx
-        .prepare(
-            "
-    INSERT INTO entity_group 
-    (id, name, created_at, updated_at, confidence_score, entity_count, version) 
-    VALUES ($1, $2, $3, $4, $5, $6, 1)
-",
-        )
-        .await
-        .context("Failed to prepare entity_group statement")?;
-
-    let entity_stmt = tx
-        .prepare(
-            "
-        INSERT INTO group_entity 
-        (id, entity_group_id, entity_id, created_at) 
-        VALUES ($1, $2, $3, $4)
-    ",
-        )
-        .await
-        .context("Failed to prepare group_entity statement")?;
-
-    let method_stmt = tx
-        .prepare(
-            "
-        INSERT INTO group_method 
-        (id, entity_group_id, method_type, description, match_values, confidence_score, created_at) 
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-    ",
-        )
-        .await
-        .context("Failed to prepare group_method statement")?;
-
-    let update_group_count_stmt = tx
-        .prepare(
-            "
-    UPDATE entity_group
-    SET entity_count = entity_count + 1,
-        updated_at = $1,
-        version = version + 1
-    WHERE id = $2
-",
-        )
-        .await
-        .context("Failed to prepare update_group_count statement")?;
-
-    let update_method_stmt = tx
-        .prepare(
-            "
-        UPDATE group_method
-        SET match_values = $1
-        WHERE id = $2
-    ",
-        )
-        .await
-        .context("Failed to prepare update_method statement")?;
+    // 3. Database Operations (No transaction spanning all inserts)
+    // Each insert will be an individual operation.
+    debug!("Starting pairwise address matching inserts (non-transactional for the whole batch).");
 
     let now = Utc::now().naive_utc();
-    let mut total_groups_created = 0;
-    let mut total_entities_added = 0;
-    let mut total_entities_matched = 0;
-    let mut confidence_scores = Vec::new();
-    let mut group_sizes = Vec::new();
+    let mut new_pairs_created_count = 0;
+    let mut entities_in_new_pairs: HashSet<EntityId> = HashSet::new();
+    let mut confidence_scores_for_stats: Vec<f64> = Vec::new();
 
-    // Process addresses
-    for (normalized_address, entity_map) in address_map {
-        // Store value for logging before entity_map is consumed
-        let entity_map_length = entity_map.len();
-        // Check if this address already has a group
-        if let Some((group_id, method_id)) = existing_address_groups.get(&normalized_address) {
-            // Add these entities to the existing group
+    // 4. Process addresses and form pairs
+    for (normalized_shared_address, current_entity_map) in address_map {
+        if current_entity_map.len() < 2 {
+            continue;
+        }
 
-            // First get the current match values for this group
-            let match_values_row = tx
-                .query_one(
-                    "SELECT match_values FROM group_method WHERE id = $1",
-                    &[&method_id],
-                )
-                .await
-                .context("Failed to get current match values")?;
+        let entities_sharing_address: Vec<_> = current_entity_map.iter().collect();
 
-            let match_values_json: serde_json::Value = match_values_row.get("match_values");
+        for i in 0..entities_sharing_address.len() {
+            for j in (i + 1)..entities_sharing_address.len() {
+                let (entity_id1_obj, original_address1) = entities_sharing_address[i];
+                let (entity_id2_obj, original_address2) = entities_sharing_address[j];
 
-            // Parse the current match values
-            let current_match_values = serde_json::from_value::<MatchValues>(match_values_json)
-                .context("Failed to parse current match values")?;
+                let (e1_id, e1_orig_addr, e2_id, e2_orig_addr) =
+                    if entity_id1_obj.0 < entity_id2_obj.0 {
+                        (
+                            entity_id1_obj,
+                            original_address1,
+                            entity_id2_obj,
+                            original_address2,
+                        )
+                    } else {
+                        (
+                            entity_id2_obj,
+                            original_address2,
+                            entity_id1_obj,
+                            original_address1,
+                        )
+                    };
 
-            // Extract the address values
-            let mut address_values = if let MatchValues::Address(values) = current_match_values {
-                values
-            } else {
-                Vec::new()
-            };
-
-            // Track which entities we've actually added and entity pairs for ML logging
-            let mut entities_added = 0;
-            let mut entity_pairs = Vec::new();
-
-            // Add the new entities to the group
-            for (entity_id, original) in entity_map {
-                // Add entity to group
-                tx.execute(
-                    &entity_stmt,
-                    &[&Uuid::new_v4().to_string(), &group_id, &entity_id.0, &now],
-                )
-                .await
-                .context("Failed to insert group entity")?;
-
-                // Update entity count for the group
-                tx.execute(&update_group_count_stmt, &[&now, &group_id])
-                    .await
-                    .context("Failed to update group count")?;
-
-                // Add to match values
-                address_values.push(AddressMatchValue {
-                    original,
-                    normalized: normalized_address.clone(),
-                    match_score: Some(1.0),
-                    entity_id: entity_id.clone(),
-                });
-
-                // Track entity pairs for ML feedback
-                if reinforcement_orchestrator.is_some() {
-                    // Store this entity with each existing entity in the group
-                    // for ML feedback
-                    for existing_value in &address_values {
-                        if existing_value.entity_id != entity_id {
-                            entity_pairs
-                                .push((entity_id.clone(), existing_value.entity_id.clone()));
-                        }
-                    }
+                if existing_processed_pairs.contains(&(e1_id.clone(), e2_id.clone())) {
+                    debug!(
+                        "Pair ({}, {}) already processed by address method. Skipping.",
+                        e1_id.0, e2_id.0
+                    );
+                    continue;
                 }
 
-                entities_added += 1;
-            }
+                let pre_rl_score = Some(1.0_f32);
+                let mut final_confidence_score = 0.95;
+                let mut predicted_method_type_from_ml = MatchMethodType::Address;
+                let mut features_for_logging: Option<Vec<f64>> = None;
 
-            // Update the match values
-            let updated_match_values = MatchValues::Address(address_values);
-            let updated_json = serde_json::to_value(updated_match_values)
-                .context("Failed to serialize updated match values")?;
-
-            tx.execute(&update_method_stmt, &[&updated_json, &method_id])
-                .await
-                .context("Failed to update match values")?;
-
-            // Log ML feedback for newly formed entity pairs
-            if reinforcement_orchestrator.is_some() {
-                // Get the group confidence score
-                let query = "SELECT confidence_score FROM entity_group WHERE id = $1";
-                let group_confidence: f64 = match tx.query_one(query, &[&group_id]).await {
-                    Ok(row) => row.get("confidence_score"),
-                    Err(e) => {
-                        warn!(
-                            "Failed to get confidence score for group {}: {}",
-                            group_id, e
-                        );
-                        0.95 // Default to 0.95 for address groups if query fails
-                    }
-                };
-
-                // Lock the orchestrator for each call
-                if let Some(orchestrator_ref) = reinforcement_orchestrator {
-                    let mut orchestrator = orchestrator_ref.lock().await;
-
-                    for (entity1, entity2) in entity_pairs {
-                        match orchestrator
-                            .log_match_result(
-                                &MatchMethodType::Address,
-                                group_confidence,
-                                true,
-                                &entity1,
-                                &entity2,
-                            )
-                            .await
-                        {
-                            Ok(_) => (),
-                            Err(e) => warn!("Failed to log match result to ML system: {}", e),
-                        }
-                    }
-                }
-            }
-
-            total_entities_added += entities_added;
-            total_entities_matched += entities_added;
-
-            // Query for updated group size to track statistics
-            let group_size_row = tx
-                .query_one(
-                    "SELECT entity_count FROM entity_group WHERE id = $1",
-                    &[&group_id],
-                )
-                .await
-                .context("Failed to get updated group size")?;
-
-            let updated_group_size: i32 = group_size_row.get("entity_count");
-            group_sizes.push(updated_group_size as f32);
-
-            // Address matches have high confidence
-            confidence_scores.push(0.95);
-
-            info!(
-                "Added {} entities to existing address group for normalized address",
-                entity_map_length
-            );
-        } else if entity_map.len() >= 2 {
-            // Create a new group for this address (only if multiple entities)
-
-            // Convert the entity map to a vector of (EntityId, String) pairs
-            let entities: Vec<(EntityId, String)> = entity_map.into_iter().collect();
-            let entity_count = entities.len() as i32;
-
-            // Initialize default confidence score - high for address matches
-            let mut confidence_score = 0.95;
-
-            // If the orchestrator is available, use it to get a ML-guided confidence
-            if reinforcement_orchestrator.is_some() {
-                let mut ml_confidence_scores = Vec::new();
-
-                // Sample entity pairs to get confidence scores
-                let max_pairs = 5;
-                let pair_count = std::cmp::min(max_pairs, (entity_count * (entity_count - 1)) / 2);
-                let mut pairs_checked = 0;
-
-                // Check a sample of entity pairs
-                'outer: for i in 0..entities.len() {
-                    for j in (i + 1)..entities.len() {
-                        if pairs_checked >= pair_count {
-                            break 'outer;
-                        }
-
-                        // Get ML recommendation for this pair
-                        if let Some(orchestrator_ref) = reinforcement_orchestrator {
-                            // Lock for each method call
-                            let mut orchestrator = orchestrator_ref.lock().await;
-                            match orchestrator
-                                .select_matching_method(pool, &entities[i].0, &entities[j].0)
-                                .await
-                            {
-                                Ok((method, conf)) => {
-                                    // If address is recommended method, use its confidence
-                                    if matches!(method, MatchMethodType::Address) {
-                                        ml_confidence_scores.push(conf);
-                                    }
+                if let Some(orchestrator_mutex) = reinforcement_orchestrator {
+                    // Assuming extract_pair_context can use a non-transactional pool or connection reference
+                    match MatchingOrchestrator::extract_pair_context(pool, e1_id, e2_id).await {
+                        Ok(features) => {
+                            features_for_logging = Some(features.clone());
+                            let orchestrator_guard = orchestrator_mutex.lock().await;
+                            match orchestrator_guard.predict_method_with_context(&features) {
+                                Ok((predicted_method, rl_conf)) => {
+                                    predicted_method_type_from_ml = predicted_method;
+                                    final_confidence_score = rl_conf;
+                                    info!("ML guidance for address pair ({}, {}), normalized '{}': Predicted Method: {:?}, Confidence: {:.4}", e1_id.0, e2_id.0, normalized_shared_address, predicted_method_type_from_ml, final_confidence_score);
                                 }
                                 Err(e) => {
-                                    // Log error but continue
-                                    warn!("Error getting ML confidence: {}", e);
+                                    warn!("ML prediction failed for address pair ({}, {}): {}. Using default confidence {:.2}.", e1_id.0, e2_id.0, e, final_confidence_score);
                                 }
                             }
                         }
-
-                        pairs_checked += 1;
+                        Err(e) => {
+                            warn!("Context extraction failed for address pair ({}, {}): {}. Using default confidence {:.2}.", e1_id.0, e2_id.0, e, final_confidence_score);
+                        }
                     }
                 }
 
-                // If we got any ML confidence scores, use their average
-                if !ml_confidence_scores.is_empty() {
-                    confidence_score = ml_confidence_scores.iter().sum::<f64>()
-                        / ml_confidence_scores.len() as f64;
-                    info!(
-                        "Using ML-guided confidence {:.4} for address group",
-                        confidence_score
-                    );
-                } else {
-                    info!("Using default confidence 0.95 for address group (no ML guidance)");
-                }
-            }
-
-            // Create a new entity group
-            let group_id = EntityGroupId(Uuid::new_v4().to_string());
-
-            let group = EntityGroup {
-                id: group_id.clone(),
-                name: Some(format!("Address match")),
-                group_cluster_id: None,
-                created_at: now,
-                updated_at: now,
-                confidence_score,
-                entity_count,
-            };
-
-            // Insert group
-            tx.execute(
-                &group_stmt,
-                &[
-                    &group.id.0,
-                    &group.name,
-                    &group.created_at,
-                    &group.updated_at,
-                    &group.confidence_score,
-                    &group.entity_count,
-                ],
-            )
-            .await
-            .context("Failed to insert entity group")?;
-
-            // Create match values for the group method
-            let mut match_values = Vec::new();
-
-            // Add all entities to the inserts
-            for (entity_id, original) in &entities {
-                // Add to group_entity
-                tx.execute(
-                    &entity_stmt,
-                    &[&Uuid::new_v4().to_string(), &group_id.0, &entity_id.0, &now],
-                )
-                .await
-                .context("Failed to insert group entity")?;
-
-                // Create match value for this entity
-                match_values.push(AddressMatchValue {
-                    original: original.clone(),
-                    normalized: normalized_address.clone(),
-                    match_score: Some(1.0),
-                    entity_id: entity_id.clone(),
+                let match_values = MatchValues::Address(AddressMatchValue {
+                    original_address1: e1_orig_addr.clone(),
+                    original_address2: e2_orig_addr.clone(),
+                    normalized_shared_address: normalized_shared_address.clone(),
+                    pairwise_match_score: pre_rl_score,
                 });
-            }
+                let match_values_json = serde_json::to_value(&match_values).with_context(|| {
+                    format!(
+                        "Failed to serialize address MatchValues for pair ({}, {})",
+                        e1_id.0, e2_id.0
+                    )
+                })?;
 
-            // Serialize match values to JSON
-            let method_values = MatchValues::Address(match_values);
-            let match_values_json =
-                serde_json::to_value(&method_values).context("Failed to serialize match values")?;
+                let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
 
-            // Insert group method
-            tx.execute(
-                &method_stmt,
-                &[
-                    &Uuid::new_v4().to_string(),
-                    &group_id.0,
-                    &MatchMethodType::Address.as_str(),
-                    &format!("Matched on normalized address"),
-                    &match_values_json,
-                    &confidence_score,
-                    &now,
-                ],
-            )
-            .await
-            .context("Failed to insert group method")?;
+                // Execute insert directly on the connection
+                let insert_result = conn
+                    .execute(
+                        INSERT_ENTITY_GROUP_SQL,
+                        &[
+                            &new_entity_group_id.0,
+                            &e1_id.0,
+                            &e2_id.0,
+                            &MatchMethodType::Address.as_str(),
+                            &match_values_json,
+                            &final_confidence_score,
+                            &now,
+                            &now,
+                        ],
+                    )
+                    .await;
 
-            // Log ML feedback for the newly created group
-            if reinforcement_orchestrator.is_some() {
-                // For a new group, log feedback for a sample of entity pairs
-                let max_feedback_pairs = 10;
-                let mut pairs_logged = 0;
+                match insert_result {
+                    Ok(_) => {
+                        new_pairs_created_count += 1;
+                        entities_in_new_pairs.insert(e1_id.clone());
+                        entities_in_new_pairs.insert(e2_id.clone());
+                        confidence_scores_for_stats.push(final_confidence_score);
+                        existing_processed_pairs.insert((e1_id.clone(), e2_id.clone()));
 
-                if let Some(orchestrator_ref) = reinforcement_orchestrator {
-                    for i in 0..entities.len() {
-                        for j in (i + 1)..entities.len() {
-                            if pairs_logged >= max_feedback_pairs {
-                                break;
-                            }
+                        info!(
+                            "Created new address pair group {} for ({}, {}) with shared address '{}', confidence: {:.4}",
+                            new_entity_group_id.0, e1_id.0, e2_id.0, normalized_shared_address, final_confidence_score
+                        );
 
-                            let mut orchestrator = orchestrator_ref.lock().await;
-                            // Address matches are considered correct (true)
-                            match orchestrator
+                        if let Some(orchestrator_mutex) = reinforcement_orchestrator {
+                            let mut orchestrator_guard = orchestrator_mutex.lock().await;
+                            // log_match_result might need to be adapted if it expects a transaction
+                            // or ensure it handles its own DB interaction carefully.
+                            // Assuming it can use the pool or a direct connection if needed.
+                            if let Err(e) = orchestrator_guard
                                 .log_match_result(
-                                    &MatchMethodType::Address,
-                                    confidence_score,
+                                    pool,
+                                    e1_id, // Assuming EntityId is Clone or Copy
+                                    e2_id, // Assuming EntityId is Clone or Copy
+                                    &predicted_method_type_from_ml,
+                                    final_confidence_score,
                                     true,
-                                    &entities[i].0,
-                                    &entities[j].0,
+                                    features_for_logging.as_ref(),
+                                    Some(&predicted_method_type_from_ml), // actual_method_type
+                                    Some(final_confidence_score),         // actual_confidence
                                 )
                                 .await
                             {
-                                Ok(_) => pairs_logged += 1,
-                                Err(e) => warn!("Failed to log match result to ML system: {}", e),
+                                warn!("Failed to log address match result to entity_match_pairs for ({},{}): {}", e1_id.0, e2_id.0, e);
+                            }
+                        }
+
+                        if final_confidence_score < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
+                            let priority = if final_confidence_score
+                                < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD
+                            {
+                                2
+                            } else {
+                                1
+                            };
+                            let details_json = serde_json::json!({
+                                "method_type": MatchMethodType::Address.as_str(),
+                                "matched_value": &normalized_shared_address,
+                                "original_address1": e1_orig_addr,
+                                "original_address2": e2_orig_addr,
+                                "entity_group_id": &new_entity_group_id.0,
+                                "pre_rl_score": pre_rl_score,
+                                "rl_predicted_method": predicted_method_type_from_ml.as_str(),
+                            });
+                            let reason_message = format!(
+                                "Pair ({}, {}) matched by Address with low RL confidence ({:.4}). RL predicted: {:?}.",
+                                e1_id.0, e2_id.0, final_confidence_score, predicted_method_type_from_ml
+                            );
+                            let suggestion = NewSuggestedAction {
+                                pipeline_run_id: Some(pipeline_run_id.to_string()),
+                                action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
+                                entity_id: None,
+                                group_id_1: Some(new_entity_group_id.0.clone()),
+                                group_id_2: None,
+                                cluster_id: None,
+                                triggering_confidence: Some(final_confidence_score),
+                                details: Some(details_json),
+                                reason_code: Some("LOW_RL_CONFIDENCE_PAIR".to_string()),
+                                reason_message: Some(reason_message),
+                                priority,
+                                status: SuggestionStatus::PendingReview.as_str().to_string(),
+                                reviewer_id: None,
+                                reviewed_at: None,
+                                review_notes: None,
+                            };
+                            // Pass the connection `conn` to insert_suggestion
+                            if let Err(e) = db::insert_suggestion(&*conn, &suggestion).await {
+                                warn!("Failed to log suggestion for low confidence address pair ({}, {}): {}. This operation was attempted on the main connection.", e1_id.0, e2_id.0, e);
                             }
                         }
                     }
+                    Err(e) => {
+                        // Detailed error logging for the specific insert failure
+                        let error_message = format!("Failed to insert address pair group for ({}, {}) with shared address '{}'", e1_id.0, e2_id.0, normalized_shared_address);
+                        if let Some(db_err) = e.as_db_error() {
+                            if db_err.constraint() == Some("uq_entity_pair_method") {
+                                debug!("{}: Pair already exists (DB constraint uq_entity_pair_method). Skipping.", error_message);
+                                existing_processed_pairs.insert((e1_id.clone(), e2_id.clone()));
+                            // Mark as processed to avoid retries if logic allows
+                            } else {
+                                warn!("{}: Database error: {:?}. SQLState: {:?}, Detail: {:?}, Hint: {:?}",
+                                    error_message, db_err, db_err.code(), db_err.detail(), db_err.hint());
+                            }
+                        } else {
+                            warn!("{}: Non-database error: {}", error_message, e);
+                        }
+                        // Consider if this error should halt the entire process or just this pair.
+                        // Current logic: logs and continues.
+                    }
                 }
             }
-
-            total_groups_created += 1;
-            total_entities_matched += entity_count as usize;
-
-            // Address matches have high confidence
-            confidence_scores.push(confidence_score);
-            group_sizes.push(entity_count as f32);
-
-            info!(
-                "Created new address group with {} entities (confidence: {:.4})",
-                entity_count, confidence_score
-            );
         }
     }
+    // No transaction to commit.
 
-    // Commit the transaction
-    tx.commit().await.context("Failed to commit transaction")?;
+    debug!("Finished processing address pairs.");
 
-    // Calculate average group size and confidence
-    let avg_group_size: f64 = if !group_sizes.is_empty() {
-        (group_sizes.iter().sum::<f32>() / group_sizes.len() as f32).into()
+    // 5. Calculate Statistics and Return
+    let avg_confidence: f64 = if !confidence_scores_for_stats.is_empty() {
+        confidence_scores_for_stats.iter().sum::<f64>() / confidence_scores_for_stats.len() as f64
     } else {
         0.0
     };
 
-    let avg_confidence: f64 = if !confidence_scores.is_empty() {
-        confidence_scores.iter().sum::<f64>() / confidence_scores.len() as f64
-    } else {
-        0.0
-    };
-
-    // Create method stats
     let method_stats = MatchMethodStats {
         method_type: MatchMethodType::Address,
-        groups_created: total_groups_created,
-        entities_matched: total_entities_matched,
+        groups_created: new_pairs_created_count,
+        entities_matched: entities_in_new_pairs.len(),
         avg_confidence,
-        avg_group_size,
+        avg_group_size: if new_pairs_created_count > 0 {
+            2.0
+        } else {
+            0.0
+        }, // Assuming pairs
     };
 
     let elapsed = start_time.elapsed();
     info!(
-        "Address matching complete: created {} new entity groups and added {} entities to existing groups in {:.2?}",
-        total_groups_created, total_entities_added, elapsed
+        "Pairwise address matching complete in {:.2?}: created {} new pairs, involving {} unique entities. Errors for individual pairs (if any) were logged above.",
+        elapsed,
+        method_stats.groups_created,
+        method_stats.entities_matched
     );
 
-    Ok(AddressMatchResult {
-        groups_created: total_groups_created,
+    let address_result = AddressMatchResult {
+        groups_created: method_stats.groups_created,
         stats: method_stats,
-    })
+    };
+
+    Ok(AnyMatchResult::Address(address_result))
 }
 
 /// Normalize an address by:
 /// - Converting to lowercase
-/// - Removing punctuation
-/// - Standardizing common abbreviations
-/// - Removing apartment/suite numbers
+/// - Removing most punctuation (keeps alphanumeric and whitespace)
+/// - Standardizing common abbreviations (street, road, etc.)
+/// - Removing common unit designators (apt, suite, unit)
+/// - Trimming extra whitespace
 fn normalize_address(address: &str) -> String {
-    // Convert to lowercase
     let lower = address.to_lowercase();
 
-    // Remove punctuation and extra whitespace
     let mut normalized = lower
         .chars()
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '#')
         .collect::<String>();
 
-    normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    // Replace common abbreviations
     normalized = normalized
         .replace(" st ", " street ")
+        .replace(" str ", " street ")
         .replace(" rd ", " road ")
         .replace(" ave ", " avenue ")
+        .replace(" av ", " avenue ")
         .replace(" blvd ", " boulevard ")
+        .replace(" blv ", " boulevard ")
         .replace(" dr ", " drive ")
         .replace(" ln ", " lane ")
-        .replace(" apt ", " ")
-        .replace(" suite ", " ")
-        .replace(" unit ", " ")
-        .replace(" #", " ");
+        .replace(" ct ", " court ")
+        .replace(" pl ", " place ")
+        .replace(" sq ", " square ")
+        .replace(" pkwy ", " parkway ")
+        .replace(" cir ", " circle ");
 
-    // Remove trailing commas and normalize state codes
-    normalized = normalized.trim_end_matches(',').to_string();
+    // Simplified removal of unit designators; consider regex for robustness
+    let patterns_to_remove = [
+        "apt ",
+        "apartment ",
+        "suite ",
+        "ste ",
+        "unit ",
+        "#", // Handle '#' carefully
+        "bldg ",
+        "building ",
+        "fl ",
+        "floor ",
+        "dept ",
+        "department ",
+        "room ",
+        "rm ",
+        "po box ",
+        "p o box ",
+        "p.o. box ",
+    ];
 
+    // Special handling for '#' which might be part of the number or a separator
+    // If # is followed by a space then a digit, it's likely a unit. Otherwise, it might be part of the address number.
+    // This is a heuristic.
+    if let Some(idx) = normalized.find('#') {
+        if normalized
+            .chars()
+            .nth(idx + 1)
+            .map_or(false, |c| c.is_whitespace())
+            && normalized
+                .chars()
+                .nth(idx + 2)
+                .map_or(false, |c| c.is_alphanumeric())
+        {
+            // Likely pattern like "# 123" or "# A"
+            let (before, after_pattern) = normalized.split_at(idx);
+            let mut rest = after_pattern
+                .trim_start_matches('#')
+                .trim_start()
+                .to_string();
+            if let Some(space_idx) = rest.find(|c: char| c.is_whitespace() || c == ',') {
+                rest = rest[space_idx..].to_string();
+            } else {
+                rest.clear();
+            }
+            normalized = format!("{}{}", before.trim_end(), rest.trim_start());
+        }
+        // Else, keep the '#' as it might be like '123# Main St' (uncommon but possible)
+        // Or it was already filtered if not alphanumeric/whitespace.
+    }
+    // Remove other patterns
+    for pattern_base in patterns_to_remove {
+        // Iterate to catch multiple occurrences if not handled by split logic
+        while let Some(idx) = normalized.find(pattern_base) {
+            let (before, after_pattern_full) = normalized.split_at(idx);
+            let mut rest_of_string = after_pattern_full
+                .trim_start_matches(pattern_base)
+                .to_string();
+
+            // Remove the number/identifier after the pattern until a space or comma
+            if let Some(end_of_unit_idx) =
+                rest_of_string.find(|c: char| c.is_whitespace() || c == ',')
+            {
+                rest_of_string = rest_of_string[end_of_unit_idx..].to_string();
+            } else {
+                rest_of_string.clear(); // Pattern was at the end, or no clear separator
+            }
+            normalized = format!("{}{}", before.trim_end(), rest_of_string.trim_start());
+            normalized = normalized.trim().to_string(); // Trim intermediate results
+        }
+    }
+
+    // Final cleanup: multiple spaces to single, trim
     normalized
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
 }

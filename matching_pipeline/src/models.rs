@@ -7,6 +7,7 @@ use chrono::NaiveDateTime;
 use postgres_types::{FromSql, IsNull, ToSql, Type};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use uuid::Uuid;
 
 //------------------------------------------------------------------------------
 // IDENTIFIER TYPES
@@ -126,52 +127,50 @@ pub struct EntityFeature {
     pub created_at: NaiveDateTime,
 }
 
-/// Represents a group of entities that have been matched
+/// Represents a group of two entities that have been matched (pairwise).
 ///
-/// Groups are formed when entities are found to match based on
-/// one or more criteria (phone numbers, emails, etc.)
+/// Groups are formed when a pair of entities is found to match based on
+/// one or more criteria and confirmed by RL scoring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityGroup {
     /// Unique identifier for this group
     pub id: EntityGroupId,
 
-    /// Optional descriptive name
-    pub name: Option<String>,
+    /// First entity in the pair
+    pub entity_id_1: EntityId,
+
+    /// Second entity in the pair (ensure entity_id_1 < entity_id_2 for consistency)
+    pub entity_id_2: EntityId,
+
+    /// The type of matching used (e.g., phone, email)
+    pub method_type: MatchMethodType,
+
+    /// The actual values that matched for this pair (structured by match type)
+    /// This field is optional as some matching methods might not produce detailed values,
+    /// or values might be stored elsewhere depending on final design.
+    /// Based on DDL, this is JSONB NULL.
+    pub match_values: Option<MatchValues>,
+
+    /// RL-derived confidence score for the match between entity_id_1 and entity_id_2.
+    /// Based on DDL, this is FLOAT NULL.
+    pub confidence_score: Option<f64>,
 
     /// The cluster this group belongs to (null until clustering is performed)
     pub group_cluster_id: Option<GroupClusterId>,
+
+    /// Version of this group record, for optimistic locking or history.
+    /// Based on DDL, this is INTEGER NULL.
+    pub version: Option<i32>,
 
     /// When this group was first created
     pub created_at: NaiveDateTime,
 
     /// When this group was last updated
     pub updated_at: NaiveDateTime,
-
-    /// Aggregate confidence score for the matches in this group (0.0-1.0)
-    pub confidence_score: f64,
-
-    /// Number of entities in this group
-    pub entity_count: i32,
 }
 
-/// Maps which entities belong to which groups
-///
-/// This is a many-to-many relationship table since entities
-/// can belong to multiple groups.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GroupEntity {
-    /// Unique identifier for this mapping
-    pub id: String,
-
-    /// The group that contains the entity
-    pub entity_group_id: EntityGroupId,
-
-    /// The entity that belongs to the group
-    pub entity_id: EntityId,
-
-    /// When this mapping was created
-    pub created_at: NaiveDateTime,
-}
+// GroupEntity struct is removed as per the refactoring plan.
+// The relationship is now directly entity_id_1 and entity_id_2 in EntityGroup.
 
 /// Enum for supported matching method types
 ///
@@ -228,32 +227,9 @@ impl MatchMethodType {
     }
 }
 
-/// Records details about how entities in a group were matched
-///
-/// This stores the evidence for why entities were grouped together
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GroupMethod {
-    /// Unique identifier for this matching method record
-    pub id: String,
-
-    /// The group these matches apply to
-    pub entity_group_id: EntityGroupId,
-
-    /// The type of matching used (e.g., phone, email)
-    pub method_type: MatchMethodType,
-
-    /// Human-readable explanation of the match
-    pub description: Option<String>,
-
-    /// The actual values that matched (structured by match type)
-    pub match_values: MatchValues,
-
-    /// Confidence level for this specific matching method (0.0-1.0)
-    pub confidence_score: Option<f32>,
-
-    /// When this matching method was recorded
-    pub created_at: NaiveDateTime,
-}
+// GroupMethod struct is removed as per the refactoring plan.
+// Its essential fields (method_type, match_values, confidence_score)
+// are now incorporated into or represented by the EntityGroup struct.
 
 /// Represents a consolidated set of overlapping groups
 ///
@@ -358,133 +334,119 @@ pub struct ServiceMatch {
 // MATCH VALUE TYPES
 //------------------------------------------------------------------------------
 
-/// Union type for different kinds of match values
+/// Union type for different kinds of match values for a PAIR of entities.
 ///
 /// This is a strongly-typed representation of the JSONB data
-/// stored in the group_method.match_values column
-/// Union type for different kinds of match values
+/// stored in the entity_group.match_values column.
+/// Each variant now holds the specific values related to the matched pair.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "values")]
 pub enum MatchValues {
-    /// URL matching values
-    Url(Vec<UrlMatchValue>),
+    /// URL matching values for the pair
+    Url(UrlMatchValue),
 
-    /// Phone matching values
-    Phone(Vec<PhoneMatchValue>),
+    /// Phone matching values for the pair
+    Phone(PhoneMatchValue),
 
-    /// Email matching values
-    Email(Vec<EmailMatchValue>),
+    /// Email matching values for the pair
+    Email(EmailMatchValue),
 
-    /// Address matching values
-    Address(Vec<AddressMatchValue>),
+    /// Address matching values for the pair
+    Address(AddressMatchValue),
 
-    /// Geospatial matching values
-    Geospatial(Vec<GeospatialMatchValue>),
+    /// Geospatial matching values for the pair
+    Geospatial(GeospatialMatchValue),
 
-    /// Name matching values
-    Name(Vec<NameMatchValue>),
+    /// Name matching values for the pair
+    Name(NameMatchValue),
 
     /// Generic string matching values (for extensibility)
+    /// Kept as Vec<String> if multiple generic attributes can apply to a single pair match.
+    /// If it's a single generic value, it would be Generic(String).
+    /// The plan was less specific here, so retaining Vec for flexibility.
     Generic(Vec<String>),
 }
 
-/// Represents a matched URL value
+/// Represents matched URL values for a pair of entities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UrlMatchValue {
-    /// Original URL as found in the data
-    pub original: String,
-
-    /// Normalized domain (the basis for matching)
-    pub domain: String,
-
-    /// Source entity ID this URL belongs to
-    pub entity_id: EntityId,
+    /// Original URL from the first entity
+    pub original_url1: String,
+    /// Original URL from the second entity
+    pub original_url2: String,
+    /// The normalized shared domain that formed the basis of the match
+    pub normalized_shared_domain: String,
 }
 
-/// Represents a matched phone number
+/// Represents matched phone number values for a pair of entities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhoneMatchValue {
-    /// Original phone number as found in the data
-    pub original: String,
-
-    /// Normalized phone number (the basis for matching)
-    pub normalized: String,
-
-    /// Optional extension (not used for primary matching)
-    pub extension: Option<String>,
-
-    /// Source entity ID this phone belongs to
-    pub entity_id: EntityId,
+    /// Original phone number from the first entity
+    pub original_phone1: String,
+    /// Original phone number from the second entity
+    pub original_phone2: String,
+    /// The normalized shared phone number that formed the basis of the match
+    pub normalized_shared_phone: String,
+    /// Optional extension for the first entity's phone
+    pub extension1: Option<String>,
+    /// Optional extension for the second entity's phone
+    pub extension2: Option<String>,
 }
 
-/// Represents a matched email address
+/// Represents matched email address values for a pair of entities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmailMatchValue {
-    /// Original email as found in the data
-    pub original: String,
-
-    /// Normalized email (the basis for matching)
-    pub normalized: String,
-
-    /// Email domain (may be used for secondary matching)
-    pub domain: String,
-
-    /// Source entity ID this email belongs to
-    pub entity_id: EntityId,
+    /// Original email from the first entity
+    pub original_email1: String,
+    /// Original email from the second entity
+    pub original_email2: String,
+    /// The normalized shared email address that formed the basis of the match
+    pub normalized_shared_email: String,
 }
 
-/// Represents a matched physical address
+/// Represents matched physical address values for a pair of entities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddressMatchValue {
-    /// Original address as found in the data
-    pub original: String,
-
-    /// Normalized address (the basis for matching)
-    pub normalized: String,
-
-    /// Match score for fuzzy matching (0.0-1.0)
-    pub match_score: Option<f32>,
-
-    /// Source entity ID this address belongs to
-    pub entity_id: EntityId,
+    /// Original address from the first entity
+    pub original_address1: String,
+    /// Original address from the second entity
+    pub original_address2: String,
+    /// The normalized shared address that formed the basis of the match
+    pub normalized_shared_address: String,
+    /// Optional pairwise match score if applicable before RL scoring
+    pub pairwise_match_score: Option<f32>,
 }
 
-/// Represents a matched geospatial location
+/// Represents matched geospatial location values for a pair of entities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeospatialMatchValue {
-    /// Latitude coordinate
-    pub latitude: f64,
-
-    /// Longitude coordinate
-    pub longitude: f64,
-
-    /// Distance in meters to the centroid of the match
-    pub distance_to_center: Option<f64>,
-
-    /// Source entity ID this location belongs to
-    pub entity_id: EntityId,
+    /// Latitude of the first entity in the pair.
+    pub latitude1: f64,
+    /// Longitude of the first entity in the pair.
+    pub longitude1: f64,
+    /// Latitude of the second entity in the pair.
+    pub latitude2: f64,
+    /// Longitude of the second entity in the pair.
+    pub longitude2: f64,
+    /// Distance in meters between the two entities in the pair.
+    pub distance: f64,
 }
 
-/// Represents a matched organization name
+/// Represents matched organization name values for a pair of entities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NameMatchValue {
-    /// Original name as found in the data
-    pub original: String,
-
-    /// Normalized name (the basis for matching)
-    pub normalized: String,
-
-    /// Match score (fuzzy or semantic similarity)
-    pub similarity_score: f32,
-
-    /// Type of matching used (fuzzy, semantic, or combined)
-    pub match_type: String,
-
-    /// Source entity ID this name belongs to
-    pub entity_id: EntityId,
-
-    /// The entity ID that this entity matched with
-    pub matched_entity_id: Option<EntityId>,
+    /// Original name from the first entity
+    pub original_name1: String,
+    /// Original name from the second entity
+    pub original_name2: String,
+    /// Normalized name for the first entity
+    pub normalized_name1: String,
+    /// Normalized name for the second entity
+    pub normalized_name2: String,
+    /// Similarity score (e.g., fuzzy, semantic) calculated before RL, if any
+    pub pre_rl_similarity_score: Option<f32>,
+    /// Type of match (e.g., fuzzy, semantic) determined before RL, if any
+    pub pre_rl_match_type: Option<String>,
 }
 
 /// Struct to hold location information for unprocessed entities
@@ -493,12 +455,12 @@ pub struct LocationResults {
     pub has_postgis: bool,
 }
 
-/// Struct to hold information about existing groups
+/// Struct to hold information about existing groups (now pairs)
 pub struct GroupResults {
-    /// Map of group_id to (method_id, centroid_lat, centroid_lon, version)
-    pub groups: HashMap<String, (String, f64, f64, i32)>,
-    /// Map of group_id to vec of (entity_id, lat, lon)
-    pub group_entities: HashMap<String, Vec<(EntityId, f64, f64)>>,
+    // This struct might need significant changes or removal depending on how existing pairs are queried.
+    // For now, keeping its structure but noting it's likely to change in usage.
+    /// Map of group_id to (entity_id_1, entity_id_2, method_type, match_values_json_string)
+    pub groups: HashMap<String, (EntityId, EntityId, String, Option<String>)>,
 }
 
 /// Represents a centroid of a spatial cluster
@@ -510,15 +472,163 @@ pub struct Centroid {
 /// Represents a spatial cluster found through PostgreSQL
 pub struct SpatialCluster {
     pub cluster_id: i32,
-    pub entity_ids: Vec<String>,
+    // Changed to EntityId for type safety, assuming conversion from String happens during fetch.
+    pub entity_ids: Vec<EntityId>,
     pub centroid: Centroid,
     pub entity_count: i64,
 }
 
 /// Represents the result of a matching operation
 pub struct MatchResult {
+    // These fields will represent counts of PAIRS created, and unique entities participating in those pairs.
+    pub groups_created: usize, // Number of new pairwise EntityGroup records
+    pub entities_matched: usize, // Number of unique entities in new pairs
+    // entities_added and entities_skipped might need re-evaluation in pairwise context.
+    // For now, keeping them but their meaning might shift.
     pub entities_added: usize,
     pub entities_skipped: usize,
-    pub groups_created: usize,
     pub processed_entities: HashSet<EntityId>,
+}
+
+// --- Enums for SuggestedAction ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSql, FromSql)]
+#[postgres(name = "action_type_enum")]
+pub enum ActionType {
+    #[postgres(name = "REVIEW_ENTITY_IN_GROUP")] // This might become REVIEW_PAIR or similar
+    ReviewEntityInGroup,
+    #[postgres(name = "REVIEW_INTER_GROUP_LINK")]
+    // This might become REVIEW_INTER_PAIR_LINK or relate to cluster review
+    ReviewInterGroupLink,
+    #[postgres(name = "SUGGEST_SPLIT_CLUSTER")]
+    SuggestSplitCluster,
+    #[postgres(name = "SUGGEST_MERGE_CLUSTERS")]
+    SuggestMergeClusters,
+}
+
+impl ActionType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ActionType::ReviewEntityInGroup => "REVIEW_ENTITY_IN_GROUP",
+            ActionType::ReviewInterGroupLink => "REVIEW_INTER_GROUP_LINK",
+            ActionType::SuggestSplitCluster => "SUGGEST_SPLIT_CLUSTER",
+            ActionType::SuggestMergeClusters => "SUGGEST_MERGE_CLUSTERS",
+        }
+    }
+}
+
+impl From<&str> for ActionType {
+    fn from(s: &str) -> Self {
+        match s {
+            "REVIEW_ENTITY_IN_GROUP" => ActionType::ReviewEntityInGroup,
+            "REVIEW_INTER_GROUP_LINK" => ActionType::ReviewInterGroupLink,
+            "SUGGEST_SPLIT_CLUSTER" => ActionType::SuggestSplitCluster,
+            "SUGGEST_MERGE_CLUSTERS" => ActionType::SuggestMergeClusters,
+            _ => panic!("Invalid ActionType string: {}", s),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSql, FromSql)]
+#[postgres(name = "suggestion_status_enum")]
+pub enum SuggestionStatus {
+    #[postgres(name = "PENDING_REVIEW")]
+    PendingReview,
+    #[postgres(name = "UNDER_REVIEW")]
+    UnderReview,
+    #[postgres(name = "ACCEPTED")]
+    Accepted,
+    #[postgres(name = "REJECTED")]
+    Rejected,
+    #[postgres(name = "IMPLEMENTED")]
+    Implemented,
+    #[postgres(name = "DEFERRED")]
+    Deferred,
+}
+
+impl SuggestionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SuggestionStatus::PendingReview => "PENDING_REVIEW",
+            SuggestionStatus::UnderReview => "UNDER_REVIEW",
+            SuggestionStatus::Accepted => "ACCEPTED",
+            SuggestionStatus::Rejected => "REJECTED",
+            SuggestionStatus::Implemented => "IMPLEMENTED",
+            SuggestionStatus::Deferred => "DEFERRED",
+        }
+    }
+}
+
+impl From<&str> for SuggestionStatus {
+    fn from(s: &str) -> Self {
+        match s {
+            "PENDING_REVIEW" => SuggestionStatus::PendingReview,
+            "UNDER_REVIEW" => SuggestionStatus::UnderReview,
+            "ACCEPTED" => SuggestionStatus::Accepted,
+            "REJECTED" => SuggestionStatus::Rejected,
+            "IMPLEMENTED" => SuggestionStatus::Implemented,
+            "DEFERRED" => SuggestionStatus::Deferred,
+            _ => panic!("Invalid SuggestionStatus string: {}", s),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSql, FromSql)]
+#[postgres(name = "priority_enum")]
+pub enum Priority {
+    Low = 0,
+    Medium = 1,
+    High = 2,
+}
+
+// New struct for inserting a new suggested action
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewSuggestedAction {
+    pub pipeline_run_id: Option<String>,
+    pub action_type: String,
+    pub entity_id: Option<String>,
+    pub group_id_1: Option<String>,
+    pub group_id_2: Option<String>,
+    pub cluster_id: Option<String>,
+    pub triggering_confidence: Option<f64>,
+    pub details: Option<serde_json::Value>,
+    pub reason_code: Option<String>,
+    pub reason_message: Option<String>,
+    pub priority: i32,
+    pub status: String,
+    pub reviewer_id: Option<String>,
+    pub reviewed_at: Option<NaiveDateTime>,
+    pub review_notes: Option<String>,
+}
+
+// --- Struct for cluster_formation_edges table ---
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterFormationEdge {
+    pub id: Uuid,
+    pub pipeline_run_id: String,
+    pub source_group_id: String, // EntityGroupId (pair ID)
+    pub target_group_id: String, // EntityGroupId (pair ID)
+    pub calculated_edge_weight: f64,
+    pub contributing_shared_entities: Option<serde_json::Value>,
+    pub created_at: NaiveDateTime,
+}
+
+// New struct for inserting a new cluster formation edge
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewClusterFormationEdge {
+    pub pipeline_run_id: String,
+    pub source_group_id: String,
+    pub target_group_id: String,
+    pub calculated_edge_weight: f64,
+    pub contributing_shared_entities: Option<serde_json::Value>,
+}
+
+// For the contributing_shared_entities JSONB field in ClusterFormationEdge
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContributingSharedEntityDetail {
+    pub entity_id: String,
+    pub conf_entity_in_source_group: f64, // Confidence of this entity being in the source pair (might be 1.0 or related to original match)
+    pub conf_entity_in_target_group: f64, // Confidence of this entity being in the target pair
+    #[serde(rename = "W_z")]
+    pub w_z: f64, // Weight contribution of this shared entity to the edge
 }

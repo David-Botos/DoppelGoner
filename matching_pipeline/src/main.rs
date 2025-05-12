@@ -1,23 +1,28 @@
 // src/main.rs
 use anyhow::{Context, Result};
 use chrono::Utc;
+use futures::future::try_join_all;
 use log::{info, warn};
-use tokio::sync::Mutex;
-use uuid::Uuid;
 use std::{
+    any::Any,
     collections::HashMap,
     path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::{sync::Mutex, task::JoinHandle};
+use uuid::Uuid;
 
 use dedupe_lib::{
-    consolidate_clusters,
-    db::{self, PgPool, load_env_from_file},
-    entity_organizations,
-    matching,
+    config, consolidate_clusters,
+    db::{self, PgPool},
+    entity_organizations, matching,
     models::*,
     reinforcement::{self, MatchingOrchestrator},
-    results::{self, MatchMethodStats, PipelineStats, collect_cluster_stats, collect_service_stats},
+    results::{
+        self, AddressMatchResult, AnyMatchResult, EmailMatchResult, EnhancedGeospatialMatchResult,
+        MatchMethodStats, NameMatchResult, PhoneMatchResult, PipelineStats, UrlMatchResult,
+    },
     service_matching,
 };
 
@@ -84,13 +89,9 @@ async fn run_pipeline(
 ) -> Result<results::PipelineStats> {
     // Initialize the ML reinforcement_orchestrator
     info!("Initializing ML-guided matching reinforcement_orchestrator");
-    let reinforcement_orchestrator = reinforcement::MatchingOrchestrator::new(pool)
-        .await
-        .context("Failed to initialize ML reinforcement_orchestrator")?;
 
-    // Wrap in a Mutex
-    let reinforcement_orchestrator = Mutex::new(reinforcement_orchestrator);
     let run_id = Uuid::new_v4().to_string();
+    let run_id_clone = run_id.clone();
     let run_timestamp = Utc::now().naive_utc();
 
     // Initialize more complete stats structure
@@ -106,6 +107,7 @@ async fn run_pipeline(
 
         // Initialize timing fields - will be updated later
         entity_processing_time: 0.0,
+        context_feature_extraction_time: 0.0,
         matching_time: 0.0,
         clustering_time: 0.0,
         service_matching_time: 0.0,
@@ -117,7 +119,7 @@ async fn run_pipeline(
         service_stats: None,
     };
 
-    info!("Pipeline started. Progress: [0/4] phases (0%)");
+    info!("Pipeline started. Progress: [0/5] phases (0%)");
 
     // Phase 1: Entity identification
     info!("Phase 1: Entity identification");
@@ -131,242 +133,355 @@ async fn run_pipeline(
         stats.total_entities,
         phase1_start.elapsed()
     );
-    info!("Pipeline progress: [1/4] phases (25%)");
+    info!("Pipeline progress: [1/4] phases (20%)");
 
-    // Phase 2: Entity matching - now returns method stats too
-    info!("Phase 2: Entity matching");
+    // Phase 2: Context Feature Extraction (New Phase)
+    info!("Phase 2: Context Feature Extraction");
     let phase2_start = Instant::now();
-    let (total_groups, method_stats) =
-        run_matching_pipeline(pool, &reinforcement_orchestrator).await?;
-    stats.total_groups = total_groups;
-    stats.method_stats = method_stats;
+    if stats.total_entities > 0 {
+        match entity_organizations::extract_and_store_all_entity_context_features(pool).await {
+            Ok(features_count) => info!("Successfully extracted and stored context features for {} entities.", features_count),
+            Err(e) => warn!("Context feature extraction failed: {}. Proceeding without ML-guided features for some operations potentially.", e),
+        }
+    } else {
+        info!("Skipping context feature extraction as no entities were identified.");
+    }
     let phase2_duration = phase2_start.elapsed();
-    phase_times.insert("entity_matching".to_string(), phase2_duration);
-    stats.matching_time = phase2_duration.as_secs_f64();
+    phase_times.insert("context_feature_extraction".to_string(), phase2_duration);
+    stats.context_feature_extraction_time = phase2_duration.as_secs_f64(); // Store timing
     info!(
-        "Created {} entity groups in {:.2?}",
-        stats.total_groups,
-        phase2_start.elapsed()
+        "Context Feature Extraction complete in {:.2?}. Phase 2 complete.",
+        phase2_duration
     );
-    info!("Pipeline progress: [2/4] phases (50%)");
+    info!("Pipeline progress: [2/5] phases (40%)");
 
-    // Phase 3: Cluster consolidation
-    info!("Phase 3: Cluster consolidation");
+    // Now initialize the ML reinforcement_orchestrator as features should be available
+    info!("Initializing ML-guided matching reinforcement_orchestrator");
+    let reinforcement_orchestrator = reinforcement::MatchingOrchestrator::new(pool)
+        .await
+        .context("Failed to initialize ML reinforcement_orchestrator")?;
+    let reinforcement_orchestrator = Mutex::new(reinforcement_orchestrator);
+
+    // Phase 3: Entity matching
+    info!("Phase 3: Entity matching");
+    info!("Initializing ML-guided matching reinforcement_orchestrator");
+    let reinforcement_orchestrator_instance = reinforcement::MatchingOrchestrator::new(pool) // Pool is already &PgPool
+        .await
+        .context("Failed to initialize ML reinforcement_orchestrator")?;
+    // Wrap in Arc and Mutex for shared, mutable access across tasks
+    let reinforcement_orchestrator = Arc::new(Mutex::new(reinforcement_orchestrator_instance));
+
     let phase3_start = Instant::now();
-    stats.total_clusters = consolidate_clusters(pool, &reinforcement_orchestrator).await?;
+    let (total_groups, method_stats_match) = // Renamed to avoid conflict
+        run_matching_pipeline(pool, reinforcement_orchestrator.clone(), run_id_clone.clone()).await?;
+    stats.total_groups = total_groups;
+    stats.method_stats.extend(method_stats_match); // Extend here
     let phase3_duration = phase3_start.elapsed();
-    phase_times.insert("cluster_consolidation".to_string(), phase3_duration);
-    stats.clustering_time = phase3_duration.as_secs_f64();
+    phase_times.insert("entity_matching".to_string(), phase3_duration);
+    stats.matching_time = phase3_duration.as_secs_f64();
     info!(
-        "Formed {} clusters in {:.2?}",
-        stats.total_clusters,
-        phase3_start.elapsed()
+        "Created {} entity groups in {:.2?}. Phase 3 complete.",
+        stats.total_groups, phase3_duration
     );
-    info!("Pipeline progress: [3/4] phases (75%)");
+    info!("Pipeline progress: [3/5] phases (60%)");
 
-    // Phase 4: Service matching
-    info!("Phase 4: Service matching");
+    // Phase 4: Cluster consolidation (was Phase 3)
+    info!("Phase 4: Cluster consolidation");
     let phase4_start = Instant::now();
-    let service_match_stats = service_matching::semantic_geospatial::match_services(pool)
+    stats.total_clusters =
+        consolidate_clusters_helper(pool, reinforcement_orchestrator, run_id_clone.clone()).await?;
+    let phase4_duration = phase4_start.elapsed();
+    phase_times.insert("cluster_consolidation".to_string(), phase4_duration);
+    stats.clustering_time = phase4_duration.as_secs_f64();
+    info!(
+        "Formed {} clusters in {:.2?}. Phase 4 complete.",
+        stats.total_clusters, phase4_duration
+    );
+    info!("Pipeline progress: [4/5] phases (80%)");
+
+    // Phase 5: Service matching (was Phase 4)
+    info!("Phase 5: Service matching");
+    let phase5_start = Instant::now();
+    let service_match_stats_result = service_matching::semantic_geospatial::match_services(pool) // Renamed
         .await
         .context("failed to match services")?;
-    stats.total_service_matches = service_match_stats.groups_created;
-    stats.method_stats.push(service_match_stats.stats);
-
-    let phase4_duration = phase4_start.elapsed();
-    phase_times.insert("service_matching".to_string(), phase4_duration);
-    stats.service_matching_time = phase4_duration.as_secs_f64();
+    stats.total_service_matches = service_match_stats_result.groups_created;
+    stats.method_stats.push(service_match_stats_result.stats); // Add service matching stats
+    let phase5_duration = phase5_start.elapsed();
+    phase_times.insert("service_matching".to_string(), phase5_duration);
+    stats.service_matching_time = phase5_duration.as_secs_f64();
+    info!(
+        "Service matching processed in {:.2?}. Phase 5 complete.",
+        phase5_duration
+    );
+    info!("Pipeline progress: [5/5] phases (100%)");
 
     // Calculate total processing time
     stats.total_processing_time = stats.entity_processing_time
+        + stats.context_feature_extraction_time
         + stats.matching_time
         + stats.clustering_time
         + stats.service_matching_time;
-
-    // Collect additional statistics
-    let (cluster_stats, service_stats) = tokio::join!(
-        results::collect_cluster_stats(pool),
-        results::collect_service_stats(pool)
-    );
-
-    stats.cluster_stats = cluster_stats?;
-    stats.service_stats = service_stats?;
 
     Ok(stats)
 }
 
 async fn identify_entities(pool: &PgPool) -> Result<usize> {
-    // First, extract entities from organizations
+    info!("Phase 1: Entity identification starting...");
+    // First, extract entities from organizations (creates new ones if necessary)
     let org_entities = entity_organizations::extract_entities(pool)
         .await
         .context("Failed to extract entities from organizations")?;
+    info!(
+        "Discovered or created {} mapping(s) between organization and entity tables.",
+        org_entities.len()
+    );
 
     // Then, link entities to their features (services, phones, etc.)
-    let linked_entities = entity_organizations::link_entity_features(pool, &org_entities)
+    // This step ensures entity_feature table is up-to-date for all entities based on their organization_id
+    // It doesn't directly return the list of entities being linked, but processes based on `org_entities`
+    // and also handles existing links.
+    entity_organizations::link_entity_features(pool, &org_entities) // Pass all current entities
         .await
         .context("Failed to link entity features")?;
 
-    Ok(linked_entities)
+    // After potential new entities are created and features linked,
+    // get the total count of entities from the database.
+    let conn = pool
+        .get()
+        .await
+        .context("Failed to get DB connection for counting entities")?;
+    let total_entities_row = conn
+        .query_one("SELECT COUNT(*) FROM public.entity", &[])
+        .await
+        .context("Failed to count total entities")?;
+    let total_entities_count: i64 = total_entities_row.get(0);
+
+    info!(
+        "Entity identification phase complete. Total entities in system: {}",
+        total_entities_count
+    );
+    Ok(total_entities_count as usize)
 }
 
 async fn run_matching_pipeline(
     pool: &PgPool,
-    reinforcement_orchestrator: &Mutex<reinforcement::MatchingOrchestrator>,
+    reinforcement_orchestrator: Arc<Mutex<reinforcement::MatchingOrchestrator>>, // Correctly taking Arc
+    run_id: String,
 ) -> Result<(usize, Vec<MatchMethodStats>)> {
+    info!("Parallelizing matching strategies...");
+    let start_time_matching = Instant::now();
+
+    // The vector of JoinHandles will hold tasks that resolve to Result<AnyMatchResult, anyhow::Error>
+    let mut tasks: Vec<JoinHandle<Result<AnyMatchResult, anyhow::Error>>> = Vec::new();
+
+    // --- Spawn Email Matching Task ---
+    let pool_clone_email = pool.clone();
+    let orchestrator_clone_email = reinforcement_orchestrator.clone();
+    let run_id_clone_email = run_id.clone();
+    tasks.push(tokio::spawn(async move {
+        info!("Starting email matching task...");
+        let result = matching::email::find_matches(
+            &pool_clone_email,
+            Some(&orchestrator_clone_email),
+            &run_id_clone_email,
+        )
+        .await
+        .context("Email matching task failed"); // context applied to Result<AnyMatchResult, _>
+        info!(
+            "Email matching task finished successfully: {:?}",
+            result.as_ref().map(|r| r.groups_created())
+        );
+        result
+    }));
+
+    // --- Spawn Phone Matching Task ---
+    let pool_clone_phone = pool.clone();
+    let orchestrator_clone_phone = reinforcement_orchestrator.clone();
+    let run_id_clone_phone = run_id.clone();
+    tasks.push(tokio::spawn(async move {
+        info!("Starting phone matching task...");
+        let result = matching::phone::find_matches(
+            &pool_clone_phone,
+            Some(&orchestrator_clone_phone),
+            &run_id_clone_phone,
+        )
+        .await
+        .context("Phone matching task failed");
+        info!(
+            "Phone matching task finished successfully: {:?}",
+            result.as_ref().map(|r| r.groups_created())
+        );
+        result
+    }));
+
+    // --- Spawn URL Matching Task ---
+    let pool_clone_url = pool.clone();
+    let orchestrator_clone_url = reinforcement_orchestrator.clone();
+    let run_id_clone_url = run_id.clone();
+    tasks.push(tokio::spawn(async move {
+        info!("Starting URL matching task...");
+        let result = matching::url::find_matches(
+            &pool_clone_url,
+            Some(&orchestrator_clone_url),
+            &run_id_clone_url,
+        )
+        .await
+        .context("URL matching task failed");
+        info!(
+            "URL matching task finished successfully: {:?}",
+            result.as_ref().map(|r| r.groups_created())
+        );
+        result
+    }));
+
+    // --- Spawn Address Matching Task ---
+    let pool_clone_address = pool.clone();
+    let orchestrator_clone_address = reinforcement_orchestrator.clone();
+    let run_id_clone_address = run_id.clone();
+    tasks.push(tokio::spawn(async move {
+        info!("Starting address matching task...");
+        let result = matching::address::find_matches(
+            &pool_clone_address,
+            Some(&orchestrator_clone_address),
+            &run_id_clone_address,
+        )
+        .await
+        .context("Address matching task failed");
+        info!(
+            "Address matching task finished successfully: {:?}",
+            result.as_ref().map(|r| r.groups_created())
+        );
+        result
+    }));
+
+    // --- Spawn Name Matching Task ---
+    let pool_clone_name = pool.clone();
+    let orchestrator_clone_name = reinforcement_orchestrator.clone();
+    let run_id_clone_name = run_id.clone();
+    tasks.push(tokio::spawn(async move {
+        info!("Starting name matching task...");
+        let result = matching::name::find_matches(
+            &pool_clone_name,
+            Some(orchestrator_clone_name),
+            &run_id_clone_name,
+        )
+        .await
+        .context("Name matching task failed");
+        info!(
+            "Name matching task finished successfully: {:?}",
+            result.as_ref().map(|r| r.groups_created())
+        );
+        result
+    }));
+
+    // --- Spawn Geospatial Matching Task ---
+    let pool_clone_geo = pool.clone();
+    let orchestrator_clone_geo = reinforcement_orchestrator.clone();
+    let run_id_clone_geo = run_id.clone();
+    tasks.push(tokio::spawn(async move {
+        info!("Starting geospatial matching task...");
+        let result = matching::geospatial::find_matches(
+            &pool_clone_geo,
+            Some(&orchestrator_clone_geo),
+            &run_id_clone_geo,
+        )
+        .await
+        .context("Geospatial matching task failed");
+        info!(
+            "Geospatial matching task finished successfully: {:?}",
+            result.as_ref().map(|r| r.groups_created())
+        );
+        result
+    }));
+
+    // try_join_all awaits all JoinHandles.
+    // Each JoinHandle resolves to a Result<InnerTaskResult, JoinError>.
+    // Our InnerTaskResult is Result<AnyMatchResult, anyhow::Error>.
+    let join_handle_results: Result<
+        Vec<Result<AnyMatchResult, anyhow::Error>>,
+        tokio::task::JoinError,
+    > = try_join_all(tasks).await;
+
     let mut total_groups = 0;
-    let mut method_stats = Vec::new();
-    let matching_methods = 6; // Total number of matching methods
+    let mut method_stats_vec = Vec::new();
     let mut completed_methods = 0;
+    let total_matching_methods = 6; // Should match the number of tasks pushed
 
-    // Email matching (highest precision)
-    info!(
-        "Running email matching [{}/{}]",
-        completed_methods + 1,
-        matching_methods
-    );
-    let start = Instant::now();
-    let email_result = matching::email::find_matches(pool, Some(reinforcement_orchestrator))
-        .await
-        .context("Failed during email matching")?;
+    // First, handle potential JoinError from try_join_all
+    match join_handle_results {
+        Ok(individual_task_results) => {
+            // individual_task_results is Vec<Result<AnyMatchResult, anyhow::Error>>
+            for (idx, task_result) in individual_task_results.into_iter().enumerate() {
+                match task_result {
+                    Ok(any_match_result) => {
+                        // Task completed successfully and returned Ok(AnyMatchResult)
+                        info!(
+                            "Processing result for task index {}: method {:?}, groups created {}.",
+                            idx,
+                            any_match_result.stats().method_type,
+                            any_match_result.groups_created()
+                        );
+                        total_groups += any_match_result.groups_created();
+                        method_stats_vec.push(any_match_result.stats().clone()); // Clone stats
+                        completed_methods += 1;
+                    }
+                    Err(task_err) => {
+                        // Task completed but returned an Err from its own logic
+                        warn!(
+                            "Matching task at index {} failed internally: {:?}",
+                            idx, task_err
+                        );
+                        // Depending on requirements, you might want to collect all errors
+                        // or return the first one. try_join_all behavior makes this tricky
+                        // if you want to wait for all even if some fail internally.
+                        // For now, let's return the first internal task error.
+                        return Err(
+                            task_err.context(format!("Matching task at index {} failed", idx))
+                        );
+                    }
+                }
+            }
+        }
+        Err(join_err) => {
+            // One of the tasks panicked or was cancelled
+            warn!(
+                "A matching task failed to join (e.g., panicked): {:?}",
+                join_err
+            );
+            return Err(
+                anyhow::Error::from(join_err).context("A matching task panicked or was cancelled")
+            );
+        }
+    }
 
-    total_groups += email_result.groups_created;
-    method_stats.push(email_result.stats);
-    completed_methods += 1;
-    info!(
-        "Email matching created {} groups in {:.2?} [{}/{}] ({:.0}%)",
-        email_result.groups_created,
-        start.elapsed(),
-        completed_methods,
-        matching_methods,
-        (completed_methods as f32 / matching_methods as f32) * 100.0
-    );
-
-    // Phone matching - updated to use Option<&Mutex<...>>
-    info!(
-        "Running phone matching [{}/{}]",
-        completed_methods + 1,
-        matching_methods
-    );
-    let start = Instant::now();
-    let phone_result = matching::phone::find_matches(pool, Some(reinforcement_orchestrator))
-        .await
-        .context("Failed during phone matching")?;
-
-    total_groups += phone_result.groups_created;
-    method_stats.push(phone_result.stats);
-    completed_methods += 1;
-    info!(
-        "Phone matching created {} groups in {:.2?} [{}/{}] ({:.0}%)",
-        phone_result.groups_created,
-        start.elapsed(),
-        completed_methods,
-        matching_methods,
-        (completed_methods as f32 / matching_methods as f32) * 100.0
-    );
-
-    // URL matching - updated to use Option<&Mutex<...>>
-    info!(
-        "Running URL matching [{}/{}]",
-        completed_methods + 1,
-        matching_methods
-    );
-    let start = Instant::now();
-    let url_result = matching::url::find_matches(pool, Some(reinforcement_orchestrator))
-        .await
-        .context("Failed during URL matching")?;
-
-    total_groups += url_result.groups_created;
-    method_stats.push(url_result.stats);
-    completed_methods += 1;
-    info!(
-        "URL matching created {} groups in {:.2?} [{}/{}] ({:.0}%)",
-        url_result.groups_created,
-        start.elapsed(),
-        completed_methods,
-        matching_methods,
-        (completed_methods as f32 / matching_methods as f32) * 100.0
-    );
-
-    // Address matching - updated to use Option<&Mutex<...>>
-    info!(
-        "Running address matching [{}/{}]",
-        completed_methods + 1,
-        matching_methods
-    );
-    let start = Instant::now();
-    let address_result = matching::address::find_matches(pool, Some(reinforcement_orchestrator))
-        .await
-        .context("Failed during address matching")?;
-
-    total_groups += address_result.groups_created;
-    method_stats.push(address_result.stats);
-    completed_methods += 1;
-    info!(
-        "Address matching created {} groups in {:.2?} [{}/{}] ({:.0}%)",
-        address_result.groups_created,
-        start.elapsed(),
-        completed_methods,
-        matching_methods,
-        (completed_methods as f32 / matching_methods as f32) * 100.0
-    );
-
-    // Name matching (using both fuzzy and semantic similarity) - updated to use Option<&Mutex<...>>
-    info!(
-        "Running name-based matching with hybrid approach [{}/{}]",
-        completed_methods + 1,
-        matching_methods
-    );
-    let start = Instant::now();
-    let name_match_result = matching::name::find_matches(pool, Some(reinforcement_orchestrator))
-        .await
-        .context("Failed during name matching")?;
-    total_groups += name_match_result.groups_created;
-    completed_methods += 1;
-
-    // Add the name matching stats
-    method_stats.push(name_match_result.stats);
+    if completed_methods != total_matching_methods
+        && method_stats_vec.len() != total_matching_methods
+    {
+        warn!(
+            "Expected {} completed matching methods, but only {} results processed successfully. Check logs for task errors.",
+             total_matching_methods, completed_methods
+         );
+        // This state could occur if try_join_all itself didn't error (no panics),
+        // but one or more of the inner Results was an Err, and we decided to continue
+        // rather than returning early. The current logic returns on the first Err.
+    }
 
     info!(
-        "Name matching created {} groups in {:.2?} [{}/{}] ({:.0}%)",
-        name_match_result.groups_created,
-        start.elapsed(),
-        completed_methods,
-        matching_methods,
-        (completed_methods as f32 / matching_methods as f32) * 100.0
+        "All matching strategies processed in {:.2?}. Total groups from successful tasks: {}, Methods processed: {}/{}.",
+        start_time_matching.elapsed(),
+        total_groups,
+        completed_methods, // or method_stats_vec.len()
+        total_matching_methods
     );
 
-    // Geospatial matching with service similarity checks - geospatial module requires separate handling
-    info!(
-        "Running enhanced geospatial matching with service similarity [{}/{}]",
-        completed_methods + 1,
-        matching_methods
-    );
-    let start = Instant::now();
-    let geospatial_match_result =
-        matching::geospatial::find_matches(pool, Some(reinforcement_orchestrator))
-            .await
-            .context("Failed during geospatial matching")?;
-    total_groups += geospatial_match_result.groups_created;
-    completed_methods += 1;
-
-    // Add the geospatial stats
-    method_stats.push(geospatial_match_result.stats);
-
-    info!(
-        "Enhanced geospatial matching created {} groups in {:.2?} [{}/{}] ({:.0}%)",
-        geospatial_match_result.groups_created,
-        start.elapsed(),
-        completed_methods,
-        matching_methods,
-        (completed_methods as f32 / matching_methods as f32) * 100.0
-    );
-
-    Ok((total_groups, method_stats))
+    Ok((total_groups, method_stats_vec))
 }
 
-async fn consolidate_clusters(
+async fn consolidate_clusters_helper(
     pool: &PgPool,
-    reinforcement_orchestrator: &Mutex<reinforcement::MatchingOrchestrator>,
+    reinforcement_orchestrator: Arc<Mutex<reinforcement::MatchingOrchestrator>>,
+    run_id: String,
 ) -> Result<usize> {
     // Get the unassigned group count before we start
     let conn = pool.get().await.context("Failed to get DB connection")?;
@@ -383,10 +498,16 @@ async fn consolidate_clusters(
         unassigned_groups
     );
 
-    // Call the actual implementation
-    let clusters = consolidate_clusters::process_clusters(pool, Some(reinforcement_orchestrator))
-        .await
-        .context("Failed to process clusters")?;
+    if unassigned_groups == 0 {
+        info!("No groups require clustering. Skipping consolidation.");
+        return Ok(0); // No clusters created
+    };
 
-    Ok(clusters)
+    // Call the actual implementation
+    let clusters_created =
+        consolidate_clusters::process_clusters(pool, Some(&reinforcement_orchestrator), &run_id)
+            .await
+            .context("Failed to process clusters")?;
+
+    Ok(clusters_created)
 }

@@ -1,1828 +1,799 @@
 // src/matching/geospatial/core.rs
-//
-// Core matching functionality for geospatial entities
 
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, trace, warn}; // Added error for explicit error logging
 use std::collections::{HashMap, HashSet};
 use tokio::sync::Mutex;
-use tokio_postgres::Transaction;
+use tokio_postgres::Transaction; // Transaction is still used here as it's passed in
 use uuid::Uuid;
 
-use super::config::THRESHOLDS;
-use super::database::DbStatements;
-use super::postgis;
-use super::utils::{
-    calculate_centroid, calculate_centroid_from_full, calculate_haversine_distance,
-    distance_to_centroid,
-};
-use crate::db::PgPool;
+// Local application/crate imports
+use crate::config::{self as app_config, MIN_GEO_PAIR_CONFIDENCE_THRESHOLD}; // Assuming these are top-level config items
+use crate::db::{self as project_db, PgPool}; // project_db for insert_suggestion, PgPool for RL context
 use crate::models::{
-    EntityGroupId, EntityId, GeospatialMatchValue, GroupResults, MatchMethodType, MatchResult,
-    MatchValues,
+    ActionType, EntityGroupId, EntityId, GeospatialMatchValue, MatchMethodType, MatchResult,
+    MatchValues, NewSuggestedAction, SuggestionStatus,
 };
-use crate::reinforcement;
+use crate::reinforcement::{self, MatchingOrchestrator}; // reinforcement module
 
-/// Try to match new entities to existing groups
-pub async fn match_to_existing_groups(
-    tx: &Transaction<'_>,
-    db_stmts: &DbStatements,
-    locations: &[(EntityId, f64, f64)],
-    group_results: &GroupResults,
+// Geospatial submodule specific imports
+use super::config::THRESHOLDS; // Geospatial specific thresholds
+use super::database::{self, DbStatements, ExistingGeoPairsMap}; // DbStatements now holds SQL strings
+use super::postgis; // For PostGIS specific operations
+use super::service_utils::{self, SERVICE_SIMILARITY_THRESHOLD}; // For service comparison logic
+use super::utils::calculate_haversine_distance; // Fallback distance calculation
+
+#[derive(Clone, Debug, Default)]
+struct PairMlSnapshot {
+    features: Option<Vec<f64>>,
+    predicted_method: Option<MatchMethodType>,
+    prediction_confidence: Option<f64>,
+}
+
+/// Orchestrates the entire geospatial pairwise matching process within a given transaction.
+/// DbStatements now contains SQL query strings, not prepared statements.
+pub async fn perform_geospatial_pairwise_matching_in_transaction(
+    tx: &Transaction<'_>,    // The transaction for this batch of operations
+    db_stmts: &DbStatements, // Contains SQL query strings
+    all_unpaired_locations: &[(EntityId, f64, f64)],
+    existing_geospatial_pairs: &ExistingGeoPairsMap,
     has_postgis: bool,
     now: &NaiveDateTime,
-    pool: &PgPool, // Added pool parameter for ML calls
-    reinforcement_orchestrator: Option<&Mutex<reinforcement::MatchingOrchestrator>>, // Added ML orchestrator
+    pool: &PgPool, // For operations outside the transaction, like RL context fetching
+    reinforcement_orchestrator: Option<&Mutex<MatchingOrchestrator>>,
+    pipeline_run_id: &str,
 ) -> Result<MatchResult> {
-    info!(
-        "Starting match_to_existing_groups with {} locations to process{}",
-        locations.len(),
-        if reinforcement_orchestrator.is_some() {
-            " using ML guidance"
-        } else {
-            ""
-        }
-    );
-    debug!("PostGIS available: {}", has_postgis);
-
-    // Track which entities have been processed in this run
-    let mut newly_processed = HashSet::new();
-    let mut total_entities_added = 0;
-    let mut skipped_entities = 0;
-
-    // Set maximum distance to consider (largest threshold)
-    let max_distance = THRESHOLDS.iter().map(|(d, _)| *d).fold(0.0, f64::max);
-    debug!("Maximum distance threshold: {}m", max_distance);
-
-    // Track progress
-    let total_locations = locations.len();
-
-    // For each new location
-    for (idx, (new_entity_id, new_lat, new_lon)) in locations.iter().enumerate() {
-        // Log progress every 10 entities or at the beginning/end
-        if idx % 10 == 0 || idx == total_locations - 1 {
-            info!(
-                "Processing location {}/{} ({:.1}%)",
-                idx + 1,
-                total_locations,
-                (idx + 1) as f64 / total_locations as f64 * 100.0
-            );
-        }
-
-        trace!(
-            "Processing entity {} at coordinates: lat={}, lon={}",
-            new_entity_id.0, new_lat, new_lon
-        );
-
-        if newly_processed.contains(new_entity_id) {
-            debug!(
-                "Entity {} already processed in this run, skipping",
-                new_entity_id.0
-            );
-            continue; // Skip if already processed in this run
-        }
-
-        // Check if this entity is already in a geospatial group (double-check)
-        let check_result = tx
-            .query_one(&db_stmts.consistency_check_stmt, &[&new_entity_id.0])
-            .await
-            .context("Failed to perform consistency check")?;
-
-        let count: i64 = check_result.get(0);
-        if count > 0 {
-            // Entity is already in a geospatial group, skip to avoid duplication
-            warn!(
-                "Entity {} already exists in a geospatial group, skipping",
-                new_entity_id.0
-            );
-            skipped_entities += 1;
-            newly_processed.insert(new_entity_id.clone());
-            continue;
-        }
-
-        // For PostGIS-enabled databases, use spatial filtering to find nearby groups
-        let candidate_group_ids = if has_postgis {
-            // Use PostGIS to find nearby groups efficiently
-            debug!(
-                "Using PostGIS to find nearby groups for entity {}",
-                new_entity_id.0
-            );
-            postgis::find_nearby_groups(tx, *new_lat, *new_lon, max_distance).await?
-        } else {
-            // Fallback to checking all groups
-            debug!(
-                "PostGIS not available, checking all {} existing groups for entity {}",
-                group_results.groups.len(),
-                new_entity_id.0
-            );
-            group_results.groups.keys().cloned().collect::<Vec<_>>()
-        };
-
-        // For each candidate group
-        let mut matched_group = None;
-
-        info!(
-            "Checking {} candidate groups for entity {}",
-            candidate_group_ids.len(),
-            new_entity_id.0
-        );
-
-        for group_id in &candidate_group_ids {
-            if !group_results.groups.contains_key(group_id) {
-                trace!("Group {} not found in group_results, skipping", group_id);
-                continue; // Skip if no group data available
-            }
-
-            let (method_id, centroid_lat, centroid_lon, _version) = &group_results.groups[group_id];
-
-            trace!(
-                "Evaluating group {} with centroid at lat={}, lon={} for entity {}",
-                group_id, centroid_lat, centroid_lon, new_entity_id.0
-            );
-
-            // Calculate distance using PostGIS if available
-            let min_distance = if has_postgis && db_stmts.distance_stmt.is_some() {
-                // Use PostGIS for distance calculation
-                let mut min_dist = f64::MAX;
-
-                // Distance to centroid
-                if let Some(ref stmt) = db_stmts.distance_stmt {
-                    let cent_row = tx
-                        .query_one(stmt, &[&new_lon, &new_lat, &centroid_lon, &centroid_lat])
-                        .await
-                        .context("Failed to calculate PostGIS distance to centroid")?;
-
-                    min_dist = cent_row.get::<_, f64>("distance");
-                    trace!(
-                        "PostGIS distance to centroid of group {}: {}m",
-                        group_id, min_dist
-                    );
-
-                    // Only check individual entities if centroid is close enough
-                    if min_dist <= max_distance * 1.5
-                        && group_results.group_entities.contains_key(group_id)
-                    {
-                        // Check distances to group entities, but limit the number checked
-                        let mut entities_checked = 0;
-                        let max_entities_to_check = 5; // Limit to first 5 entities
-
-                        debug!(
-                            "Centroid of group {} is close, checking up to {} individual entities",
-                            group_id, max_entities_to_check
-                        );
-
-                        for (entity_id, loc_lat, loc_lon) in &group_results.group_entities[group_id]
-                        {
-                            if entities_checked >= max_entities_to_check {
-                                break; // Limit the number of entities we check
-                            }
-
-                            let ent_row = tx
-                                .query_one(stmt, &[&new_lon, &new_lat, &loc_lon, &loc_lat])
-                                .await
-                                .context("Failed to calculate PostGIS distance to entity")?;
-
-                            let dist: f64 = ent_row.get("distance");
-                            trace!(
-                                "Distance from entity {} to group entity {}: {}m",
-                                new_entity_id.0, entity_id.0, dist
-                            );
-
-                            if dist < min_dist {
-                                trace!(
-                                    "Found closer entity in group {}: {}m (previous min: {}m)",
-                                    group_id, dist, min_dist
-                                );
-                                min_dist = dist;
-                            }
-
-                            entities_checked += 1;
-
-                            // Early exit if we found a close match
-                            if min_dist <= THRESHOLDS[0].0 {
-                                debug!(
-                                    "Found very close match ({}m) to entity {} in group {}, stopping search",
-                                    min_dist, entity_id.0, group_id
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                min_dist
-            } else {
-                // Fallback to Haversine calculation
-                let mut min_dist =
-                    calculate_haversine_distance(*new_lat, *new_lon, *centroid_lat, *centroid_lon);
-
-                trace!(
-                    "Haversine distance to centroid of group {}: {}m",
-                    group_id, min_dist
-                );
-
-                // Only check individual entities if centroid is close enough
-                if min_dist <= max_distance * 1.5
-                    && group_results.group_entities.contains_key(group_id)
-                {
-                    // Limit the number of entities we check
-                    let mut entities_checked = 0;
-                    let max_entities_to_check = 5;
-
-                    debug!(
-                        "Centroid of group {} is close, checking up to {} individual entities using Haversine",
-                        group_id, max_entities_to_check
-                    );
-
-                    for (entity_id, loc_lat, loc_lon) in &group_results.group_entities[group_id] {
-                        if entities_checked >= max_entities_to_check {
-                            break;
-                        }
-
-                        let dist =
-                            calculate_haversine_distance(*new_lat, *new_lon, *loc_lat, *loc_lon);
-
-                        trace!(
-                            "Haversine distance from entity {} to group entity {}: {}m",
-                            new_entity_id.0, entity_id.0, dist
-                        );
-
-                        if dist < min_dist {
-                            trace!(
-                                "Found closer entity in group {}: {}m (previous min: {}m)",
-                                group_id, dist, min_dist
-                            );
-                            min_dist = dist;
-                        }
-
-                        entities_checked += 1;
-
-                        // Early exit if we found a close match
-                        if min_dist <= THRESHOLDS[0].0 {
-                            debug!(
-                                "Found very close match ({}m) to entity {} in group {}, stopping search",
-                                min_dist, entity_id.0, group_id
-                            );
-                            break;
-                        }
-                    }
-                }
-
-                min_dist
-            };
-
-            // Check if within any threshold
-            for &(threshold, confidence) in &THRESHOLDS {
-                if min_distance <= threshold {
-                    debug!(
-                        "Entity {} matched to group {} with distance {}m (threshold: {}m, confidence: {})",
-                        new_entity_id.0, group_id, min_distance, threshold, confidence
-                    );
-
-                    // Get sample of entities from the group to compare services
-                    let group_entity_ids =
-                        if let Some(group_entities) = group_results.group_entities.get(group_id) {
-                            group_entities
-                                .iter()
-                                .map(|(entity_id, _, _)| entity_id.clone())
-                                .collect::<Vec<_>>()
-                        } else {
-                            vec![]
-                        };
-
-                    // Sample a few entities from the group for comparison (max 3 to keep performance reasonable)
-                    let entity_sample =
-                        super::service_utils::sample_group_entities(&group_entity_ids, 3);
-
-                    if entity_sample.is_empty() {
-                        debug!(
-                            "No entities found in group {} for service comparison, proceeding with match based on distance only",
-                            group_id
-                        );
-                        matched_group =
-                            Some((group_id.clone(), method_id.clone(), threshold, confidence));
-                        break;
-                    }
-
-                    // Check if services are semantically similar
-                    let mut total_similarity = 0.0;
-                    let mut valid_comparisons = 0;
-
-                    for group_entity_id in &entity_sample {
-                        match super::service_utils::compare_entity_services(
-                            tx,
-                            new_entity_id,
-                            group_entity_id,
-                        )
-                        .await
-                        {
-                            Ok(similarity) => {
-                                debug!(
-                                    "Service similarity between entity {} and group entity {}: {:.4}",
-                                    new_entity_id.0, group_entity_id.0, similarity
-                                );
-                                total_similarity += similarity;
-                                valid_comparisons += 1;
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to compare services for entities {} and {}: {}",
-                                    new_entity_id.0, group_entity_id.0, e
-                                );
-                            }
-                        }
-                    }
-
-                    // Calculate average similarity if any valid comparisons were made
-                    if valid_comparisons > 0 {
-                        let avg_similarity = total_similarity / valid_comparisons as f64;
-
-                        // Only match if services are similar enough
-                        if avg_similarity >= super::service_utils::SERVICE_SIMILARITY_THRESHOLD {
-                            debug!(
-                                "Services of entity {} are similar to those in group {} (score: {:.4}), proceeding with match",
-                                new_entity_id.0, group_id, avg_similarity
-                            );
-
-                            // Adjust confidence using ML if available
-                            let mut final_confidence = confidence;
-
-                            if let Some(orchestrator_ref) = reinforcement_orchestrator {
-                                // If we have ML guidance, check if this match is recommended
-                                if !entity_sample.is_empty() {
-                                    let orchestrator = orchestrator_ref.lock().await;
-                                    // Use first group entity for method recommendation
-                                    match orchestrator
-                                        .select_matching_method(
-                                            pool,
-                                            new_entity_id,
-                                            &entity_sample[0],
-                                        )
-                                        .await
-                                    {
-                                        Ok((method, conf)) => {
-                                            // If geospatial is recommended method, adjust confidence
-                                            if matches!(method, MatchMethodType::Geospatial) {
-                                                debug!(
-                                                    "ML recommends geospatial matching with confidence {:.4}",
-                                                    conf
-                                                );
-                                                // Blend standard and ML confidence (70% ML, 30% standard)
-                                                final_confidence =
-                                                    (conf * 0.7) + (confidence * 0.3);
-                                                debug!(
-                                                    "Using ML-adjusted confidence {:.4} (was {:.4})",
-                                                    final_confidence, confidence
-                                                );
-                                            } else {
-                                                debug!(
-                                                    "ML recommends {} matching instead of geospatial, keeping standard confidence",
-                                                    method.as_str()
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!("Error getting ML confidence: {}", e);
-                                        }
-                                    }
-                                }
-                            }
-
-                            matched_group = Some((
-                                group_id.clone(),
-                                method_id.clone(),
-                                threshold,
-                                final_confidence,
-                            ));
-                            break;
-                        } else {
-                            debug!(
-                                "Services of entity {} are not similar enough to those in group {} (score: {:.4}), skipping despite geographic proximity",
-                                new_entity_id.0, group_id, avg_similarity
-                            );
-                            // Continue to next group, as this one doesn't have similar services
-                            continue;
-                        }
-                    } else {
-                        // If no valid service comparisons, proceed with match based on distance only
-                        debug!(
-                            "No valid service comparisons made between entity {} and group {}, proceeding with match based on distance only",
-                            new_entity_id.0, group_id
-                        );
-
-                        // Use default confidence if no ML guidance
-                        let mut final_confidence = confidence;
-
-                        // Try ML confidence if orchestrator is available
-                        if let Some(orchestrator_ref) = reinforcement_orchestrator {
-                            let orchestrator = orchestrator_ref.lock().await;
-                            // Try with first entity in group if available
-                            if let Some(ref entities) = group_results.group_entities.get(group_id) {
-                                if !entities.is_empty() {
-                                    match orchestrator
-                                        .select_matching_method(pool, new_entity_id, &entities[0].0)
-                                        .await
-                                    {
-                                        Ok((method, conf)) => {
-                                            if matches!(method, MatchMethodType::Geospatial) {
-                                                // Blend standard and ML confidence (70% ML, 30% standard)
-                                                final_confidence =
-                                                    (conf * 0.7) + (confidence * 0.3);
-                                                debug!(
-                                                    "Using ML-adjusted confidence {:.4} for distance-only match",
-                                                    final_confidence
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!("Error getting ML confidence: {}", e);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        matched_group = Some((
-                            group_id.clone(),
-                            method_id.clone(),
-                            threshold,
-                            final_confidence,
-                        ));
-                        break;
-                    }
-                }
-            }
-
-            if matched_group.is_some() {
-                break;
-            }
-        }
-
-        // If a matching group was found, add the entity to it
-        if let Some((group_id, method_id, threshold, confidence)) = matched_group {
-            info!(
-                "Adding entity {} to existing group {} (distance: <={}m, confidence: {:.4})",
-                new_entity_id.0, group_id, threshold, confidence
-            );
-
-            // Fetch the current match values for this group
-            let match_values_row = tx
-                .query_one(
-                    "SELECT match_values FROM group_method WHERE id = $1",
-                    &[&method_id],
-                )
-                .await
-                .context("Failed to get current match values")?;
-
-            let match_values_json: serde_json::Value = match_values_row.get("match_values");
-
-            // Parse the current match values
-            let current_match_values = serde_json::from_value::<MatchValues>(match_values_json)
-                .context("Failed to parse current match values")?;
-
-            // Extract the geospatial values
-            let mut geo_values = if let MatchValues::Geospatial(values) = current_match_values {
-                debug!(
-                    "Retrieved {} existing geospatial match values for group {}",
-                    values.len(),
-                    group_id
-                );
-                values
-            } else {
-                warn!(
-                    "Unexpected match values type for geospatial group {}",
-                    group_id
-                );
-                Vec::new()
-            };
-
-            // Get the centroid for calculating distance
-            let (centroid_lat, centroid_lon) =
-                if let Some((_, cent_lat, cent_lon, _)) = group_results.groups.get(&group_id) {
-                    trace!(
-                        "Using existing centroid for group {}: lat={}, lon={}",
-                        group_id, cent_lat, cent_lon
-                    );
-                    (*cent_lat, *cent_lon)
-                } else {
-                    // Fallback to calculating from values
-                    trace!(
-                        "Recalculating centroid for group {} from {} match values",
-                        group_id,
-                        geo_values.len()
-                    );
-                    let locations: Vec<(EntityId, f64, f64)> = geo_values
-                        .iter()
-                        .map(|v| (v.entity_id.clone(), v.latitude, v.longitude))
-                        .collect();
-                    calculate_centroid(&locations)
-                };
-
-            // Add the new entity to the group
-            debug!(
-                "Inserting entity {} into group {}",
-                new_entity_id.0, group_id
-            );
-            tx.execute(
-                &db_stmts.entity_stmt,
-                &[
-                    &Uuid::new_v4().to_string(),
-                    &group_id,
-                    &new_entity_id.0,
-                    &now,
-                ],
-            )
-            .await
-            .context("Failed to insert group entity")?;
-
-            // Update entity count and version for the group
-            debug!("Updating entity count and version for group {}", group_id);
-            tx.execute(&db_stmts.update_group_count_stmt, &[&now, &group_id])
-                .await
-                .context("Failed to update group count")?;
-
-            // Calculate distance to center using either PostGIS or Haversine
-            let distance_to_center = if has_postgis && db_stmts.distance_stmt.is_some() {
-                if let Some(ref stmt) = db_stmts.distance_stmt {
-                    let row = tx
-                        .query_one(stmt, &[&new_lon, &new_lat, &centroid_lon, &centroid_lat])
-                        .await
-                        .context("Failed to calculate distance to center")?;
-
-                    let dist = row.get::<_, f64>("distance");
-                    trace!(
-                        "PostGIS distance from entity {} to group {} centroid: {}m",
-                        new_entity_id.0, group_id, dist
-                    );
-                    Some(dist)
-                } else {
-                    let dist = calculate_haversine_distance(
-                        *new_lat,
-                        *new_lon,
-                        centroid_lat,
-                        centroid_lon,
-                    );
-                    trace!(
-                        "Haversine distance from entity {} to group {} centroid: {}m",
-                        new_entity_id.0, group_id, dist
-                    );
-                    Some(dist)
-                }
-            } else {
-                let dist =
-                    calculate_haversine_distance(*new_lat, *new_lon, centroid_lat, centroid_lon);
-                trace!(
-                    "Haversine distance from entity {} to group {} centroid: {}m",
-                    new_entity_id.0, group_id, dist
-                );
-                Some(dist)
-            };
-
-            // Add to match values
-            debug!(
-                "Adding entity {} to geospatial match values of group {}",
-                new_entity_id.0, group_id
-            );
-            geo_values.push(GeospatialMatchValue {
-                latitude: *new_lat,
-                longitude: *new_lon,
-                distance_to_center,
-                entity_id: new_entity_id.clone(),
-            });
-
-            // Update the match values
-            let updated_match_values = MatchValues::Geospatial(geo_values);
-            let updated_json = serde_json::to_value(updated_match_values)
-                .context("Failed to serialize updated match values")?;
-
-            debug!("Updating match values for method {}", method_id);
-            tx.execute(&db_stmts.update_method_stmt, &[&updated_json, &method_id])
-                .await
-                .context("Failed to update match values")?;
-
-            // Log ML feedback for this match
-            if let Some(orchestrator_ref) = reinforcement_orchestrator {
-                let mut orchestrator = orchestrator_ref.lock().await;
-
-                // Get a sample of entities from the group to log feedback
-                let feedback_sample =
-                    if let Some(group_entities) = group_results.group_entities.get(&group_id) {
-                        let entity_ids: Vec<EntityId> =
-                            group_entities.iter().map(|(id, _, _)| id.clone()).collect();
-                        let sample = super::service_utils::sample_group_entities(
-                            &entity_ids,
-                            3, // Sample up to 3 entities for feedback
-                        );
-                        sample
-                    } else {
-                        Vec::new()
-                    };
-
-                // Log feedback with each entity in the sample
-                for sample_entity_id in feedback_sample {
-                    match orchestrator
-                        .log_match_result(
-                            &MatchMethodType::Geospatial,
-                            confidence, // Use the original confidence for feedback
-                            true,       // Assume geospatial match is correct
-                            new_entity_id,
-                            &sample_entity_id,
-                        )
-                        .await
-                    {
-                        Ok(_) => {
-                            debug!(
-                                "Logged ML feedback for geospatial match between entities {} and {}",
-                                new_entity_id.0, sample_entity_id.0
-                            );
-                        }
-                        Err(e) => {
-                            warn!("Failed to log ML feedback: {}", e);
-                        }
-                    }
-                }
-            }
-
-            // Add to processed entities
-            newly_processed.insert(new_entity_id.clone());
-            total_entities_added += 1;
-
-            info!(
-                "Successfully added entity {} to existing group {} (within {}m)",
-                new_entity_id.0, group_id, threshold
-            );
-        } else {
-            debug!("No matching group found for entity {}", new_entity_id.0);
-        }
-    }
-
-    info!(
-        "Completed match_to_existing_groups: {} entities added to existing groups, {} entities skipped",
-        total_entities_added, skipped_entities
-    );
-
-    Ok(MatchResult {
-        entities_added: total_entities_added,
-        entities_skipped: skipped_entities,
+    let mut overall_match_result = MatchResult {
         groups_created: 0,
-        processed_entities: newly_processed,
-    })
+        entities_matched: 0,
+        entities_added: 0,
+        entities_skipped: 0,
+        processed_entities: HashSet::new(),
+    };
+
+    let mut current_unpaired_locations = all_unpaired_locations.to_vec();
+
+    // Phase 1: Match entities from `current_unpaired_locations` against `existing_geospatial_pairs`
+    if !existing_geospatial_pairs.is_empty() && !current_unpaired_locations.is_empty() {
+        debug!(
+            "Geo Core - Phase 1: Matching {} unpaired locations to {} existing geo pairs.",
+            current_unpaired_locations.len(),
+            existing_geospatial_pairs.len()
+        );
+
+        let mut still_unpaired_after_phase1 = Vec::new();
+        for (new_entity_id, new_lat, new_lon) in current_unpaired_locations.iter() {
+            if overall_match_result
+                .processed_entities
+                .contains(new_entity_id)
+            {
+                continue;
+            }
+            // Use consistency_check_sql from DbStatements
+            let existing_db_pair_count_row = tx
+                .query_one(db_stmts.consistency_check_sql, &[&new_entity_id.0])
+                .await
+                .with_context(|| {
+                    format!("Consistency check failed for entity {}", new_entity_id.0)
+                })?;
+            let existing_db_pair_count: i64 = existing_db_pair_count_row.get(0);
+
+            if existing_db_pair_count > 0 {
+                overall_match_result.entities_skipped += 1;
+                overall_match_result
+                    .processed_entities
+                    .insert(new_entity_id.clone());
+                continue;
+            }
+
+            let (pair_created, _pair_details) = match_single_entity_to_existing_pairs(
+                tx,
+                db_stmts,
+                new_entity_id,
+                *new_lat,
+                *new_lon,
+                existing_geospatial_pairs,
+                has_postgis,
+                now,
+                pool,
+                reinforcement_orchestrator,
+                pipeline_run_id,
+                &THRESHOLDS,
+                &mut overall_match_result.processed_entities,
+            )
+            .await?;
+
+            if pair_created {
+                overall_match_result.groups_created += 1;
+            } else {
+                still_unpaired_after_phase1.push((new_entity_id.clone(), *new_lat, *new_lon));
+            }
+        }
+        current_unpaired_locations = still_unpaired_after_phase1;
+        debug!(
+            "Geo Core - Phase 1 done. {} locations remaining for new pair creation.",
+            current_unpaired_locations.len()
+        );
+    }
+
+    // Phase 2: Create new pairs from the remaining `current_unpaired_locations`.
+    if !current_unpaired_locations.is_empty() {
+        debug!(
+            "Geo Core - Phase 2: Creating new pairs from {} remaining locations.",
+            current_unpaired_locations.len()
+        );
+
+        let truly_unpaired_for_phase2: Vec<_> = current_unpaired_locations
+            .into_iter()
+            .filter(|(id, _, _)| !overall_match_result.processed_entities.contains(id))
+            .collect();
+
+        if !truly_unpaired_for_phase2.is_empty() {
+            let phase2_result = create_new_pairs_from_candidates_list(
+                tx,
+                db_stmts,
+                &truly_unpaired_for_phase2,
+                has_postgis,
+                now,
+                pool,
+                reinforcement_orchestrator,
+                pipeline_run_id,
+                &THRESHOLDS,
+                &mut overall_match_result.processed_entities,
+            )
+            .await?;
+
+            overall_match_result.groups_created += phase2_result.groups_created;
+            overall_match_result.entities_skipped += phase2_result.entities_skipped;
+        } else {
+            debug!("Geo Core - Phase 2: No truly unpaired entities left after phase 1.");
+        }
+    }
+
+    overall_match_result.entities_matched = overall_match_result.processed_entities.len();
+    overall_match_result.entities_added = overall_match_result.entities_matched; // For pairwise, added is same as matched
+
+    Ok(overall_match_result)
 }
 
-/// Create new groups for entities that couldn't be matched to existing groups
-pub async fn create_new_groups(
+async fn match_single_entity_to_existing_pairs(
     tx: &Transaction<'_>,
-    db_stmts: &DbStatements,
-    locations: &[(EntityId, f64, f64)],
+    db_stmts: &DbStatements, // Contains SQL strings
+    new_entity_id: &EntityId,
+    new_lat: f64,
+    new_lon: f64,
+    existing_geospatial_pairs: &ExistingGeoPairsMap,
     has_postgis: bool,
     now: &NaiveDateTime,
-    pool: &PgPool, // Added pool parameter for ML calls
-    reinforcement_orchestrator: Option<&Mutex<reinforcement::MatchingOrchestrator>>, // Added ML orchestrator
-) -> Result<MatchResult> {
-    info!(
-        "Starting create_new_groups for {} remaining unprocessed entities{}",
-        locations.len(),
-        if reinforcement_orchestrator.is_some() {
-            " with ML guidance"
-        } else {
-            ""
-        }
-    );
-    debug!("PostGIS available: {}", has_postgis);
+    pool: &PgPool,
+    reinforcement_orchestrator: Option<&Mutex<MatchingOrchestrator>>,
+    pipeline_run_id: &str,
+    thresholds_config: &[(f64, f64)],
+    processed_entities_this_run: &mut HashSet<EntityId>,
+) -> Result<(bool, Option<GeospatialMatchValue>)> {
+    let mut best_rl_confidence = app_config::MIN_GEO_PAIR_CONFIDENCE_THRESHOLD - 0.01;
+    let mut best_candidate_info: Option<(EntityId, f64, f64, f64, f64)> = None;
+    let mut best_ml_snapshot: Option<PairMlSnapshot> = None;
 
-    // Track entities processed in new groups
-    let mut newly_processed = HashSet::new();
-    let mut total_groups_created = 0;
-    let mut total_entities_added = 0;
+    let max_dist_from_thresholds = thresholds_config
+        .iter()
+        .map(|(d, _)| *d)
+        .fold(0.0, f64::max);
 
-    let start_time = std::time::Instant::now();
+    for (_existing_pair_id, (e1_id_ref, e2_id_ref, geo_match_val, _current_pair_conf)) in
+        existing_geospatial_pairs.iter()
+    {
+        let members_info_from_existing_pair = [
+            (e1_id_ref, geo_match_val.latitude1, geo_match_val.longitude1),
+            (e2_id_ref, geo_match_val.latitude2, geo_match_val.longitude2),
+        ];
 
-    if has_postgis && db_stmts.distance_stmt.is_some() {
-        // Use PostGIS-based clustering for better performance and accuracy
-        info!("Using PostGIS-based clustering algorithm for group creation");
-        debug!(
-            "Starting PostGIS clustering with {} entities",
-            locations.len()
-        );
-
-        let result = create_groups_with_postgis(
-            tx,
-            db_stmts,
-            locations,
-            &mut newly_processed,
-            now,
-            pool,
-            reinforcement_orchestrator,
-        )
-        .await?;
-
-        total_groups_created = result.groups_created;
-        total_entities_added = result.entities_added;
-
-        info!(
-            "PostGIS clustering completed: created {} new groups with {} entities",
-            result.groups_created, result.entities_added
-        );
-        trace!(
-            "PostGIS clustering processed {} entities total",
-            result.processed_entities.len()
-        );
-    } else {
-        // Use fallback algorithm for proximity detection
-        if has_postgis {
-            warn!(
-                "PostGIS is available but distance statement is missing, falling back to Haversine algorithm"
-            );
-        } else {
-            info!("PostGIS not available, using Haversine-based clustering algorithm");
-        }
-
-        debug!(
-            "Starting Haversine clustering with {} entities",
-            locations.len()
-        );
-
-        let result = create_groups_with_haversine(
-            tx,
-            db_stmts,
-            locations,
-            &mut newly_processed,
-            now,
-            pool,
-            reinforcement_orchestrator,
-        )
-        .await?;
-
-        total_groups_created = result.groups_created;
-        total_entities_added = result.entities_added;
-
-        info!(
-            "Haversine clustering completed: created {} new groups with {} entities",
-            result.groups_created, result.entities_added
-        );
-        trace!(
-            "Haversine clustering processed {} entities total",
-            result.processed_entities.len()
-        );
-    }
-
-    let elapsed = start_time.elapsed();
-    info!(
-        "Group creation completed in {:.2?}: created {} new groups with {} entities",
-        elapsed, total_groups_created, total_entities_added
-    );
-
-    if total_entities_added < locations.len() {
-        debug!(
-            "{} entities were not assigned to any group",
-            locations.len() - total_entities_added
-        );
-    }
-
-    if let Some(skipped) = locations.len().checked_sub(newly_processed.len()) {
-        if skipped > 0 {
-            debug!("{} entities were skipped during processing", skipped);
-        }
-    }
-
-    Ok(MatchResult {
-        entities_added: total_entities_added,
-        entities_skipped: 0,
-        groups_created: total_groups_created,
-        processed_entities: newly_processed,
-    })
-}
-
-/// Create new groups using PostGIS clustering
-async fn create_groups_with_postgis(
-    tx: &Transaction<'_>,
-    db_stmts: &DbStatements,
-    locations: &[(EntityId, f64, f64)],
-    processed_entities: &mut HashSet<EntityId>,
-    now: &NaiveDateTime,
-    pool: &PgPool, // Added for ML calls
-    reinforcement_orchestrator: Option<&Mutex<reinforcement::MatchingOrchestrator>>, // Added for ML integration
-) -> Result<MatchResult> {
-    info!(
-        "Starting PostGIS clustering with {} total locations{}",
-        locations.len(),
-        if reinforcement_orchestrator.is_some() {
-            " with ML guidance"
-        } else {
-            ""
-        }
-    );
-    let start_time = std::time::Instant::now();
-
-    let mut total_groups_created = 0;
-    let mut total_entities_added = 0;
-    let initially_processed = processed_entities.len();
-
-    debug!(
-        "Initially {} entities are already processed",
-        initially_processed
-    );
-
-    // Create temporary table for PostGIS operations - do this once
-    info!("Creating temporary PostGIS tables for clustering");
-    let table_start = std::time::Instant::now();
-    postgis::create_temp_location_table(tx).await?;
-    debug!(
-        "Temporary PostGIS tables created in {:.2?}",
-        table_start.elapsed()
-    );
-
-    // For each threshold, find groups of nearby locations
-    for (threshold_idx, (threshold, confidence)) in THRESHOLDS.iter().enumerate() {
-        info!(
-            "Processing proximity threshold {}/{}: {}m with confidence {}",
-            threshold_idx + 1,
-            THRESHOLDS.len(),
-            threshold,
-            confidence
-        );
-
-        let threshold_start = std::time::Instant::now();
-
-        // Skip locations that are already processed in higher confidence thresholds
-        let candidate_locations: Vec<(EntityId, f64, f64)> = locations
-            .iter()
-            .filter(|(entity_id, _, _)| !processed_entities.contains(entity_id))
-            .map(|(e, lat, lon)| (e.clone(), *lat, *lon))
-            .collect();
-
-        if candidate_locations.is_empty() {
-            info!(
-                "No unprocessed locations for threshold {}m, skipping",
-                threshold
-            );
-            continue;
-        }
-
-        info!(
-            "Found {} candidate locations for {}m threshold",
-            candidate_locations.len(),
-            threshold
-        );
-
-        trace!(
-            "Skipping {} already processed entities for this threshold",
-            locations.len() - candidate_locations.len()
-        );
-
-        // Insert candidate locations (clears and inserts new data)
-        debug!(
-            "Inserting {} locations into temporary PostGIS table",
-            candidate_locations.len()
-        );
-        let insert_start = std::time::Instant::now();
-        postgis::insert_location_data(tx, &candidate_locations).await?;
-        debug!("Location data inserted in {:.2?}", insert_start.elapsed());
-
-        // Find clusters using PostGIS
-        debug!(
-            "Finding location clusters using PostGIS with threshold {}m",
-            threshold
-        );
-        let cluster_start = std::time::Instant::now();
-        let clusters = postgis::find_location_clusters(tx, *threshold).await?;
-        debug!(
-            "Cluster identification completed in {:.2?}: found {} clusters",
-            cluster_start.elapsed(),
-            clusters.len()
-        );
-
-        info!(
-            "Found {} spatial clusters within {}m threshold",
-            clusters.len(),
-            threshold
-        );
-
-        if clusters.is_empty() {
-            debug!(
-                "No clusters found for threshold {}m, continuing to next threshold",
-                threshold
-            );
-            continue;
-        }
-
-        // Calculate total entities in all clusters for validation
-        let total_cluster_entities: usize = clusters.iter().map(|c| c.entity_ids.len()).sum();
-        debug!(
-            "Total entities in all clusters: {} (may include duplicates across clusters)",
-            total_cluster_entities
-        );
-
-        // Process each cluster
-        let clusters_start = std::time::Instant::now();
-        let mut threshold_groups_created = 0;
-        let mut threshold_entities_added = 0;
-
-        for (cluster_idx, cluster) in clusters.iter().enumerate() {
-            // Log progress for large cluster sets
-            if clusters.len() > 10 && (cluster_idx % 10 == 0 || cluster_idx == clusters.len() - 1) {
-                info!(
-                    "Processing cluster {}/{} for {}m threshold",
-                    cluster_idx + 1,
-                    clusters.len(),
-                    threshold
-                );
-            }
-
-            trace!(
-                "Cluster {}/{} contains {} entities with centroid at lat={}, lon={}",
-                cluster_idx + 1,
-                clusters.len(),
-                cluster.entity_ids.len(),
-                cluster.centroid.latitude,
-                cluster.centroid.longitude
-            );
-
-            // Verify that entities in the cluster have semantically similar services
-            debug!(
-                "Verifying service similarity among {} entities in cluster",
-                cluster.entity_ids.len()
-            );
-
-            // Convert string IDs to EntityId structs for the filtering
-            let entity_ids: Vec<EntityId> = cluster
-                .entity_ids
-                .iter()
-                .map(|id| EntityId(id.clone()))
-                .collect();
-
-            // Create a new filtered list based on service similarity
-            let mut filtered_entity_ids = Vec::new();
-            let mut entity_similarity_matrix = HashMap::new();
-
-            // Only process up to 5 entities for performance reasons
-            let sample_size = 5.min(entity_ids.len());
-
-            // First entity is our reference point
-            if !entity_ids.is_empty() {
-                filtered_entity_ids.push(entity_ids[0].clone());
-
-                // Compare other entities to the first one
-                for i in 1..sample_size {
-                    let entity_id = &entity_ids[i];
-                    let similarity = match super::service_utils::compare_entity_services(
-                        tx,
-                        &entity_ids[0],
-                        entity_id,
-                    )
-                    .await
-                    {
-                        Ok(sim) => {
-                            debug!(
-                                "Service similarity between entities {} and {}: {:.4}",
-                                entity_ids[0].0, entity_id.0, sim
-                            );
-                            sim
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to compare services for entities {} and {}: {}. Defaulting to neutral similarity.",
-                                entity_ids[0].0, entity_id.0, e
-                            );
-                            0.5 // Default if comparison fails
-                        }
-                    };
-
-                    entity_similarity_matrix.insert(entity_id.clone(), similarity);
-
-                    // Only add entities with similar enough services
-                    if similarity >= super::service_utils::SERVICE_SIMILARITY_THRESHOLD {
-                        filtered_entity_ids.push(entity_id.clone());
-                    } else {
-                        debug!(
-                            "Entity {} excluded from cluster due to low service similarity ({:.4})",
-                            entity_id.0, similarity
-                        );
-                    }
-                }
-
-                // If we have too few entities after filtering, skip creating this group
-                if filtered_entity_ids.len() < 2 {
-                    debug!(
-                        "Cluster {}/{} has insufficient entities with similar services after filtering, skipping",
-                        cluster_idx + 1,
-                        clusters.len()
-                    );
-                    continue;
-                }
-
-                debug!(
-                    "Cluster {}/{} has {} entities with similar services after filtering",
-                    cluster_idx + 1,
-                    clusters.len(),
-                    filtered_entity_ids.len()
-                );
-            } else {
-                debug!(
-                    "Cluster {}/{} has no entities, skipping",
-                    cluster_idx + 1,
-                    clusters.len()
-                );
+        for (candidate_id_ref, cand_lat, cand_lon) in members_info_from_existing_pair {
+            if candidate_id_ref == new_entity_id
+                || processed_entities_this_run.contains(candidate_id_ref)
+            {
                 continue;
             }
 
-            let group_id = EntityGroupId(postgis::generate_id());
-            debug!("Creating new group with ID: {}", group_id.0);
-
-            // Use ML to get confidence if available
-            let mut final_confidence = *confidence;
-            if let Some(orchestrator_ref) = reinforcement_orchestrator {
-                if filtered_entity_ids.len() >= 2 {
-                    // Use first two entities in the cluster to get ML confidence
-                    let orchestrator = orchestrator_ref.lock().await;
-                    match orchestrator
-                        .select_matching_method(
-                            pool,
-                            &filtered_entity_ids[0],
-                            &filtered_entity_ids[1],
-                        )
-                        .await
-                    {
-                        Ok((method, conf)) => {
-                            if matches!(method, MatchMethodType::Geospatial) {
-                                // Blend ML confidence with standard confidence (70% ML, 30% standard)
-                                final_confidence = (conf * 0.7) + (*confidence * 0.3);
-                                debug!(
-                                    "Using ML-guided confidence {:.4} for new cluster (standard: {})",
-                                    final_confidence, confidence
-                                );
-                            } else {
-                                debug!(
-                                    "ML suggests {} method (conf: {:.4}) instead of geospatial, keeping standard confidence",
-                                    method.as_str(),
-                                    conf
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to get ML confidence: {}", e);
-                        }
-                    }
-                }
-            }
-
-            // Insert the group
-            debug!(
-                "Inserting group {} with description 'Geospatial match within {}m with similar services'",
-                group_id.0, threshold
-            );
-
-            tx.execute(
-                &db_stmts.group_stmt,
-                &[
-                    &group_id.0,
-                    &format!(
-                        "Geospatial match within {}m with similar services",
-                        threshold
-                    ),
-                    &now,
-                    &now,
-                    &final_confidence,
-                    &(filtered_entity_ids.len() as i32),
-                ],
+            let distance = calculate_distance_between_points(
+                tx,
+                db_stmts,
+                new_lat,
+                new_lon,
+                cand_lat,
+                cand_lon,
+                has_postgis,
             )
-            .await
-            .context("Failed to insert entity group")?;
+            .await?;
 
-            // Create a HashSet to track which entities we've processed in this group
-            let mut processed_group_entities = HashSet::<EntityId>::new();
-            let mut match_values = Vec::new();
-            let mut cluster_entities_added = 0;
-            let mut skipped_entities = 0;
-
-            for entity_id_str in &cluster.entity_ids {
-                let entity_id = EntityId(entity_id_str.clone());
-
-                // Skip if we've already processed this entity in this group
-                if processed_group_entities.contains(&entity_id) {
-                    debug!(
-                        "Entity {} already processed for group {}, skipping duplicate",
-                        entity_id.0, group_id.0
-                    );
-                    continue;
-                }
-
-                // Add to processed set
-                processed_group_entities.insert(entity_id.clone());
-
-                trace!(
-                    "Processing entity {} in cluster {}",
-                    entity_id.0,
-                    cluster_idx + 1
-                );
-
-                if let Some(&(_, lat, lon)) =
-                    candidate_locations.iter().find(|(e, _, _)| e == &entity_id)
-                {
-                    let distance = calculate_haversine_distance(
-                        lat,
-                        lon,
-                        cluster.centroid.latitude,
-                        cluster.centroid.longitude,
-                    );
-
-                    trace!(
-                        "Entity {} at lat={}, lon={}, distance to centroid: {}m",
-                        entity_id.0, lat, lon, distance
-                    );
-
-                    match_values.push(GeospatialMatchValue {
-                        latitude: lat,
-                        longitude: lon,
-                        distance_to_center: Some(distance),
-                        entity_id: entity_id.clone(),
-                    });
-
-                    // Add detailed error logging here
-                    debug!(
-                        "Attempting to insert entity {} into group {} with UUID {}",
-                        entity_id.0,
-                        group_id.0,
-                        Uuid::new_v4().to_string()
-                    );
-
-                    // Add try/catch around database operation
-                    let group_entity_uuid = Uuid::new_v4().to_string();
-                    match tx
-                        .execute(
-                            &db_stmts.entity_stmt,
-                            &[&group_entity_uuid, &group_id.0, &entity_id.0, &now],
-                        )
-                        .await
-                    {
-                        Ok(_) => {
-                            debug!(
-                                "Successfully inserted entity {} into group {}",
-                                entity_id.0, group_id.0
-                            );
-                            processed_entities.insert(entity_id.clone());
-                            total_entities_added += 1;
-                            threshold_entities_added += 1;
-                            cluster_entities_added += 1;
-                        }
-                        Err(e) => {
-                            // Log detailed error information
-                            error!(
-                                "Failed to insert entity {} into group {}: {:?}",
-                                entity_id.0, group_id.0, e
-                            );
-
-                            // Log parameter values for debugging
-                            error!(
-                                "Insert parameters: group_entity_uuid={}, group_id={}, entity_id={}, timestamp={:?}",
-                                group_entity_uuid, group_id.0, entity_id.0, now
-                            );
-
-                            // Re-throw the error
-                            return Err(e).context(format!(
-                                "Failed to insert entity {} into group {}",
-                                entity_id.0, group_id.0
-                            ))?;
-                        }
-                    }
-                } else {
-                    warn!(
-                        "Entity {} from cluster not found in candidate locations, skipping",
-                        entity_id.0
-                    );
-                    skipped_entities += 1;
-                }
-            }
-
-            if skipped_entities > 0 {
-                warn!(
-                    "Skipped {} entities when creating group {} due to missing location data",
-                    skipped_entities, group_id.0
-                );
-            }
-
-            debug!("Creating match method entry for group {}", group_id.0);
-            let method_values = MatchValues::Geospatial(match_values);
-            let match_values_json =
-                serde_json::to_value(&method_values).context("Failed to serialize match values")?;
-
-            tx.execute(
-                &db_stmts.method_stmt,
-                &[
-                    &Uuid::new_v4().to_string(),
-                    &group_id.0,
-                    &MatchMethodType::Geospatial.as_str(),
-                    &format!("Matched on geospatial proximity within {}m", threshold),
-                    &match_values_json,
-                    &final_confidence,
-                    &now,
-                ],
-            )
-            .await
-            .context("Failed to insert group method")?;
-
-            // Log ML feedback for the newly created group
-            if let Some(orchestrator_ref) = reinforcement_orchestrator {
-                if filtered_entity_ids.len() >= 2 {
-                    // Log feedback for a sample of pairs in this new group
-                    let max_feedback_pairs = 5;
-                    let mut pairs_logged = 0;
-
-                    let mut orchestrator = orchestrator_ref.lock().await;
-
-                    for i in 0..filtered_entity_ids.len() {
-                        for j in (i + 1)..filtered_entity_ids.len() {
-                            if pairs_logged >= max_feedback_pairs {
-                                break;
-                            }
-
-                            match orchestrator
-                                .log_match_result(
-                                    &MatchMethodType::Geospatial,
-                                    final_confidence,
-                                    true, // Assume match is correct
-                                    &filtered_entity_ids[i],
-                                    &filtered_entity_ids[j],
-                                )
-                                .await
-                            {
-                                Ok(_) => {
-                                    debug!(
-                                        "Logged ML feedback for new geospatial group between entities {} and {}",
-                                        filtered_entity_ids[i].0, filtered_entity_ids[j].0
-                                    );
-                                    pairs_logged += 1;
-                                }
-                                Err(e) => {
-                                    warn!("Failed to log ML feedback: {}", e);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            total_groups_created += 1;
-            threshold_groups_created += 1;
-
-            info!(
-                "Created group {} with {} entities within {}m threshold (confidence: {:.4})",
-                group_id.0, cluster_entities_added, threshold, final_confidence
-            );
-        }
-
-        debug!(
-            "Processed all clusters for {}m threshold in {:.2?}",
-            threshold,
-            clusters_start.elapsed()
-        );
-
-        info!(
-            "Completed threshold {}m in {:.2?}: created {} groups with {} entities",
-            threshold,
-            threshold_start.elapsed(),
-            threshold_groups_created,
-            threshold_entities_added
-        );
-    }
-
-    // Clean up temporary table at the end of all processing
-    info!("Cleaning up temporary PostGIS tables");
-    let cleanup_start = std::time::Instant::now();
-    postgis::cleanup_temp_tables(tx).await?;
-    debug!(
-        "Temporary tables cleanup completed in {:.2?}",
-        cleanup_start.elapsed()
-    );
-
-    let newly_processed = processed_entities.len() - initially_processed;
-
-    info!(
-        "PostGIS clustering completed in {:.2?}: created {} groups containing {} entities",
-        start_time.elapsed(),
-        total_groups_created,
-        total_entities_added
-    );
-
-    if newly_processed != total_entities_added {
-        warn!(
-            "Discrepancy in processed entities: added {} to groups but processed set grew by {}",
-            total_entities_added, newly_processed
-        );
-    }
-
-    Ok(MatchResult {
-        entities_added: total_entities_added,
-        entities_skipped: 0,
-        groups_created: total_groups_created,
-        processed_entities: processed_entities.clone(),
-    })
-}
-
-/// Create new groups using Haversine distance calculations
-async fn create_groups_with_haversine(
-    tx: &Transaction<'_>,
-    db_stmts: &DbStatements,
-    locations: &[(EntityId, f64, f64)],
-    processed_entities: &mut HashSet<EntityId>,
-    now: &NaiveDateTime,
-    pool: &PgPool, // Added for ML calls
-    reinforcement_orchestrator: Option<&Mutex<reinforcement::MatchingOrchestrator>>, // Added for ML integration
-) -> Result<MatchResult> {
-    info!(
-        "Starting Haversine-based clustering with {} total locations{}",
-        locations.len(),
-        if reinforcement_orchestrator.is_some() {
-            " with ML guidance"
-        } else {
-            ""
-        }
-    );
-    let start_time = std::time::Instant::now();
-
-    let mut total_groups_created = 0;
-    let mut total_entities_added = 0;
-    let initially_processed = processed_entities.len();
-
-    debug!(
-        "Initially {} entities are already processed",
-        initially_processed
-    );
-
-    // For each threshold, find groups of nearby locations
-    for (threshold_idx, (threshold, confidence)) in THRESHOLDS.iter().enumerate() {
-        info!(
-            "Processing proximity threshold {}/{}: {}m with confidence {}",
-            threshold_idx + 1,
-            THRESHOLDS.len(),
-            threshold,
-            confidence
-        );
-
-        let threshold_start = std::time::Instant::now();
-        let mut proximity_groups = Vec::new();
-        let mut threshold_entities_added = 0;
-
-        // Skip locations that are already processed in higher confidence thresholds
-        let candidate_locations: Vec<_> = locations
-            .iter()
-            .filter(|(entity_id, _, _)| !processed_entities.contains(entity_id))
-            .collect();
-
-        if candidate_locations.is_empty() {
-            info!(
-                "No unprocessed locations for threshold {}m, skipping",
-                threshold
-            );
-            continue;
-        }
-
-        info!(
-            "Found {} candidate locations for {}m threshold",
-            candidate_locations.len(),
-            threshold
-        );
-
-        trace!(
-            "Skipping {} already processed entities for this threshold",
-            locations.len() - candidate_locations.len()
-        );
-
-        // Process in chunks for better progress tracking
-        let chunk_size = 50;
-        let total_candidates = candidate_locations.len();
-        let mut processed_candidates = 0;
-
-        debug!(
-            "Starting proximity search with O(n²) comparisons for {} candidates",
-            total_candidates
-        );
-        let proximity_start = std::time::Instant::now();
-        let mut total_comparisons = 0;
-        let mut total_matches_found = 0;
-
-        // For each unprocessed location
-        for (i, (entity_id1, lat1, lon1)) in candidate_locations.iter().enumerate() {
-            // Skip if already processed
-            if processed_entities.contains(entity_id1) {
-                trace!(
-                    "Skipping already processed entity {} during proximity search",
-                    entity_id1.0
-                );
-                continue;
-            }
-
-            trace!(
-                "Evaluating entity {} at lat={}, lon={} as potential group center",
-                entity_id1.0, lat1, lon1
-            );
-
-            // Store nearby entities
-            let mut nearby_entities_map: HashMap<EntityId, (f64, f64, f64)> = HashMap::new();
-
-            // Add this entity as the center point (0.0 distance to itself)
-            nearby_entities_map.insert(entity_id1.clone(), (*lat1, *lon1, 0.0));
-
-            // Compare with all other locations
-            for (entity_id2, lat2, lon2) in candidate_locations.iter().skip(i + 1) {
-                total_comparisons += 1;
-
-                // Skip if already processed
-                if processed_entities.contains(entity_id2) {
-                    trace!(
-                        "Skipping already processed entity {} during comparison",
-                        entity_id2.0
-                    );
-                    continue;
-                }
-
-                // Calculate distance using fallback Haversine
-                let distance = calculate_haversine_distance(*lat1, *lon1, *lat2, *lon2);
-
-                trace!(
-                    "Distance between entities {} and {}: {}m",
-                    entity_id1.0, entity_id2.0, distance
-                );
-
-                if distance <= *threshold {
-                    trace!(
-                        "Found nearby entity {} within {}m (actual: {}m)",
-                        entity_id2.0, threshold, distance
-                    );
-
-                    // Check if services are semantically similar
-                    let service_similarity = match super::service_utils::compare_entity_services(
-                        tx, entity_id1, entity_id2,
-                    )
-                    .await
-                    {
-                        Ok(similarity) => {
-                            debug!(
-                                "Service similarity between entities {} and {}: {:.4}",
-                                entity_id1.0, entity_id2.0, similarity
-                            );
-                            similarity
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to compare services for entities {} and {}: {}. Defaulting to neutral similarity.",
-                                entity_id1.0, entity_id2.0, e
-                            );
-                            0.5 // Default to moderate similarity if comparison fails
-                        }
-                    };
-
-                    // Only group entities if their services are similar enough
-                    if service_similarity >= super::service_utils::SERVICE_SIMILARITY_THRESHOLD {
-                        debug!(
-                            "Services of entities {} and {} are similar (score: {:.4}), adding to potential group",
-                            entity_id1.0, entity_id2.0, service_similarity
-                        );
-                        nearby_entities_map.insert(entity_id2.clone(), (*lat2, *lon2, distance));
-                        total_matches_found += 1;
-                    } else {
-                        debug!(
-                            "Services of entities {} and {} are not similar enough (score: {:.4}), not grouping despite geographic proximity",
-                            entity_id1.0, entity_id2.0, service_similarity
-                        );
-                    }
-                }
-            }
-
-            // Convert to vector for further processing
-            let nearby_entities: Vec<(EntityId, f64, f64, f64)> = nearby_entities_map
-                .into_iter()
-                .map(|(entity_id, (lat, lon, distance))| (entity_id, lat, lon, distance))
-                .collect();
-
-            // If we found multiple entities, create a group
-            if nearby_entities.len() > 1 {
-                debug!(
-                    "Found potential group with {} entities centered around entity {}",
-                    nearby_entities.len(),
-                    entity_id1.0
-                );
-
-                // Mark all entities as processed
-                for (entity_id, _, _, _) in &nearby_entities {
-                    processed_entities.insert(entity_id.clone());
-                    trace!("Marking entity {} as processed", entity_id.0);
-                }
-
-                // Then add to proximity_groups
-                proximity_groups.push(nearby_entities);
-            } else {
-                trace!(
-                    "No group formed for entity {} (insufficient nearby entities)",
-                    entity_id1.0
-                );
-            }
-
-            processed_candidates += 1;
-            if processed_candidates % chunk_size == 0 || processed_candidates == total_candidates {
-                debug!(
-                    "Processed {}/{} candidates ({:.1}%) for {}m threshold",
-                    processed_candidates,
-                    total_candidates,
-                    (processed_candidates as f64 / total_candidates as f64) * 100.0,
-                    threshold
-                );
-            }
-        }
-
-        debug!(
-            "Proximity search completed in {:.2?}: made {} comparisons, found {} matches",
-            proximity_start.elapsed(),
-            total_comparisons,
-            total_matches_found
-        );
-
-        let groups_in_threshold = proximity_groups.len();
-        info!(
-            "Found {} proximity groups within {}m threshold",
-            groups_in_threshold, threshold
-        );
-
-        if groups_in_threshold == 0 {
-            debug!(
-                "No groups formed for threshold {}m, continuing to next threshold",
-                threshold
-            );
-            continue;
-        }
-
-        // Calculate total entities across all groups (for validation)
-        let total_in_groups: usize = proximity_groups.iter().map(|g| g.len()).sum();
-        debug!(
-            "Total entities in all groups: {} (may include duplicates due to overlapping groups)",
-            total_in_groups
-        );
-
-        debug!(
-            "Starting database operations for {} groups",
-            groups_in_threshold
-        );
-        let db_start = std::time::Instant::now();
-        let mut threshold_groups_created = 0;
-
-        // Create database records for each proximity group
-        for (group_idx, nearby_entities) in proximity_groups.iter().enumerate() {
-            if group_idx % 50 == 0 || group_idx == groups_in_threshold - 1 {
-                info!(
-                    "Processing group {}/{} ({:.1}%) for {}m threshold",
-                    group_idx + 1,
-                    groups_in_threshold,
-                    (group_idx + 1) as f64 / groups_in_threshold as f64 * 100.0,
-                    threshold
-                );
-            }
-
-            // Create a new entity group
-            let group_id = EntityGroupId(Uuid::new_v4().to_string());
-            let entity_count = nearby_entities.len() as i32;
-
-            debug!(
-                "Creating new group {} with {} entities for {}m threshold",
-                group_id.0, entity_count, threshold
-            );
-
-            // Calculate centroid for the group
-            let (centroid_lat, centroid_lon) = calculate_centroid_from_full(&nearby_entities);
-
-            debug!(
-                "Calculated centroid for group {}: lat={}, lon={}",
-                group_id.0, centroid_lat, centroid_lon
-            );
-
-            // Use ML to get confidence if available
-            let mut final_confidence = *confidence;
-            if let Some(orchestrator_ref) = reinforcement_orchestrator {
-                if nearby_entities.len() >= 2 {
-                    // Use first two entities to get ML confidence
-                    let mut orchestrator = orchestrator_ref.lock().await;
-                    match orchestrator
-                        .select_matching_method(pool, &nearby_entities[0].0, &nearby_entities[1].0)
-                        .await
-                    {
-                        Ok((method, conf)) => {
-                            if matches!(method, MatchMethodType::Geospatial) {
-                                // Blend ML confidence with standard confidence (70% ML, 30% standard)
-                                final_confidence = (conf * 0.7) + (*confidence * 0.3);
-                                debug!(
-                                    "Using ML-guided confidence {:.4} for new Haversine group (standard: {})",
-                                    final_confidence, confidence
-                                );
-                            } else {
-                                debug!(
-                                    "ML suggests {} method (conf: {:.4}) instead of geospatial, keeping standard confidence",
-                                    method.as_str(),
-                                    conf
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to get ML confidence: {}", e);
-                        }
-                    }
-                }
-            }
-
-            // Insert the group with initial version = 1
-            trace!("Inserting group {} record into database", group_id.0);
-            tx.execute(
-                &db_stmts.group_stmt,
-                &[
-                    &group_id.0,
-                    &format!("Geospatial match within {}m", threshold),
-                    &now,
-                    &now,
-                    &final_confidence,
-                    &entity_count,
-                ],
-            )
-            .await
-            .context("Failed to insert entity group")?;
-
-            // Create the group_entity records and match values
-            let mut match_values = Vec::new();
-            let mut group_entities_added = 0;
-
-            for (entity_id, lat, lon, distance_from_center) in nearby_entities {
-                // Calculate distance to actual centroid (may differ from original center entity)
-                let centroid_distance =
-                    distance_to_centroid(*lat, *lon, centroid_lat, centroid_lon);
-
-                trace!(
-                    "Entity {} in group {}: distance to centroid: {}m, distance to center entity: {}m",
-                    entity_id.0, group_id.0, centroid_distance, distance_from_center
-                );
-
-                // Add to match values
-                match_values.push(GeospatialMatchValue {
-                    latitude: *lat,
-                    longitude: *lon,
-                    distance_to_center: Some(centroid_distance),
-                    entity_id: entity_id.clone(),
-                });
-
-                // Insert group entity record with improved error handling
-                let group_entity_uuid = Uuid::new_v4().to_string();
-                debug!(
-                    "Attempting to insert entity {} into group {} with UUID {}",
-                    entity_id.0, group_id.0, group_entity_uuid
-                );
-
-                match tx
-                    .execute(
-                        &db_stmts.entity_stmt,
-                        &[&group_entity_uuid, &group_id.0, &entity_id.0, &now],
-                    )
+            if distance <= max_dist_from_thresholds {
+                match service_utils::compare_entity_services(tx, new_entity_id, candidate_id_ref)
                     .await
                 {
-                    Ok(_) => {
-                        debug!(
-                            "Successfully inserted entity {} into group {}",
-                            entity_id.0, group_id.0
-                        );
-                        total_entities_added += 1;
-                        threshold_entities_added += 1;
-                        group_entities_added += 1;
+                    Ok(service_similarity) => {
+                        if service_similarity >= SERVICE_SIMILARITY_THRESHOLD {
+                            let (pred_method, rl_conf_opt, features) = get_rl_prediction(
+                                pool,
+                                reinforcement_orchestrator,
+                                new_entity_id,
+                                candidate_id_ref,
+                            )
+                            .await?;
+
+                            let base_conf_from_dist_thr = thresholds_config
+                                .iter()
+                                .find(|&&(thr_dist, _)| distance <= thr_dist)
+                                .map_or(0.0, |&(_, base_c)| base_c);
+
+                            let final_conf = calculate_final_confidence(
+                                pred_method.as_ref(),
+                                rl_conf_opt,
+                                base_conf_from_dist_thr,
+                            );
+
+                            if final_conf > best_rl_confidence {
+                                best_rl_confidence = final_conf;
+                                best_candidate_info = Some((
+                                    candidate_id_ref.clone(),
+                                    cand_lat,
+                                    cand_lon,
+                                    distance,
+                                    service_similarity,
+                                ));
+                                best_ml_snapshot = Some(PairMlSnapshot {
+                                    features,
+                                    predicted_method: pred_method,
+                                    prediction_confidence: rl_conf_opt,
+                                });
+                            }
+                        } else {
+                            debug!("Service similarity check failed for new entity {} with candidate {} from existing pair. Similarity: {:.2}", new_entity_id.0, candidate_id_ref.0, service_similarity);
+                        }
                     }
                     Err(e) => {
-                        // Log detailed error information
-                        error!(
-                            "Failed to insert entity {} into group {}: {:?}",
-                            entity_id.0, group_id.0, e
-                        );
-
-                        // Log parameter values for debugging
-                        error!(
-                            "Insert parameters: group_entity_uuid={}, group_id={}, entity_id={}, timestamp={:?}",
-                            group_entity_uuid, group_id.0, entity_id.0, now
-                        );
-
-                        // Re-throw the error
-                        return Err(e).context(format!(
-                            "Failed to insert entity {} into group {}",
-                            entity_id.0, group_id.0
-                        ))?;
+                        warn!("Service comparison API call failed between new entity {} and candidate {}: {}", new_entity_id.0, candidate_id_ref.0, e);
                     }
                 }
             }
+        }
+    }
 
-            debug!(
-                "Added {} entities to group {}",
-                group_entities_added, group_id.0
+    if let Some((paired_entity_id, paired_lat, paired_lon, pair_distance, service_sim)) =
+        best_candidate_info
+    {
+        if best_rl_confidence >= app_config::MIN_GEO_PAIR_CONFIDENCE_THRESHOLD {
+            let (e1, e1_lat, e1_lon, e2, e2_lat, e2_lon) = canonical_order_pair(
+                new_entity_id,
+                new_lat,
+                new_lon,
+                &paired_entity_id,
+                paired_lat,
+                paired_lon,
             );
 
-            // Serialize match_values to JSON
-            trace!("Creating match method entry for group {}", group_id.0);
-            let method_values = MatchValues::Geospatial(match_values);
-            let match_values_json =
-                serde_json::to_value(&method_values).context("Failed to serialize match values")?;
+            let new_pair_geo_details = GeospatialMatchValue {
+                latitude1: e1_lat,
+                longitude1: e1_lon,
+                latitude2: e2_lat,
+                longitude2: e2_lon,
+                distance: pair_distance,
+            };
+            let match_values_obj = MatchValues::Geospatial(new_pair_geo_details.clone());
+            let new_pair_guid = Uuid::new_v4().to_string();
 
-            // Insert group method record
-            tx.execute(
-                &db_stmts.method_stmt,
-                &[
-                    &Uuid::new_v4().to_string(),
-                    &group_id.0,
-                    &MatchMethodType::Geospatial.as_str(),
-                    &format!("Matched on geospatial proximity within {}m", threshold),
-                    &match_values_json,
-                    &final_confidence,
-                    &now,
-                ],
+            // Use new_geospatial_pair_sql from DbStatements
+            insert_new_pair_into_db(
+                tx,
+                db_stmts.new_geospatial_pair_sql,
+                &new_pair_guid,
+                &e1,
+                &e2,
+                &match_values_obj,
+                best_rl_confidence,
+                now,
             )
-            .await
-            .context("Failed to insert group method")?;
+            .await?;
 
-            // Log ML feedback for the newly created group
-            if let Some(orchestrator_ref) = reinforcement_orchestrator {
-                if nearby_entities.len() >= 2 {
-                    // Log feedback for a sample of pairs in this new group
-                    let max_feedback_pairs = 5;
-                    let mut pairs_logged = 0;
+            info!("MATCH_TO_EXISTING: New geo pair {} ({}, {}) created. Dist: {:.1}m, ServSim: {:.2}, Conf: {:.4}",
+                new_pair_guid, e1.0, e2.0, pair_distance, service_sim, best_rl_confidence);
 
-                    let mut orchestrator = orchestrator_ref.lock().await;
+            processed_entities_this_run.insert(e1.clone());
+            processed_entities_this_run.insert(e2.clone());
 
-                    for i in 0..nearby_entities.len() {
-                        for j in (i + 1)..nearby_entities.len() {
-                            if pairs_logged >= max_feedback_pairs {
-                                break;
-                            }
+            log_suggestion_if_needed(
+                tx,
+                pipeline_run_id,
+                &e1,
+                Some(&EntityGroupId(new_pair_guid)),
+                best_rl_confidence,
+                &match_values_obj,
+                Some(service_sim),
+            )
+            .await;
+            log_ml_feedback(
+                pool,
+                reinforcement_orchestrator,
+                &e1,
+                &e2,
+                best_rl_confidence,
+                best_ml_snapshot,
+            )
+            .await;
 
-                            match orchestrator
-                                .log_match_result(
-                                    &MatchMethodType::Geospatial,
-                                    final_confidence,
-                                    true, // Assume match is correct
-                                    &nearby_entities[i].0,
-                                    &nearby_entities[j].0,
-                                )
-                                .await
-                            {
-                                Ok(_) => {
-                                    debug!(
-                                        "Logged ML feedback for new Haversine group between entities {} and {}",
-                                        nearby_entities[i].0.0, nearby_entities[j].0.0
+            return Ok((true, Some(new_pair_geo_details)));
+        } else {
+            debug!("Best candidate pair ({}, {}) did not meet MIN_GEO_PAIR_CONFIDENCE_THRESHOLD ({:.4} < {:.4})",
+                new_entity_id.0, paired_entity_id.0, best_rl_confidence, app_config::MIN_GEO_PAIR_CONFIDENCE_THRESHOLD);
+        }
+    }
+
+    Ok((false, None))
+}
+
+async fn create_new_pairs_from_candidates_list(
+    tx: &Transaction<'_>,
+    db_stmts: &DbStatements, // Contains SQL strings
+    candidate_locations: &[(EntityId, f64, f64)],
+    has_postgis: bool,
+    now: &NaiveDateTime,
+    pool: &PgPool,
+    reinforcement_orchestrator: Option<&Mutex<MatchingOrchestrator>>,
+    pipeline_run_id: &str,
+    thresholds_config: &[(f64, f64)],
+    globally_processed_entities: &mut HashSet<EntityId>,
+) -> Result<MatchResult> {
+    let mut local_match_result = MatchResult {
+        groups_created: 0,
+        entities_matched: 0,
+        entities_added: 0,
+        entities_skipped: 0,
+        processed_entities: HashSet::<EntityId>::new(), // Initialize with an empty HashSet
+    };
+
+    for (threshold_dist, base_conf_for_thresh) in thresholds_config.iter() {
+        let current_tier_candidates: Vec<_> = candidate_locations
+            .iter()
+            .filter(|(id, _, _)| !globally_processed_entities.contains(id))
+            .cloned()
+            .collect();
+        if current_tier_candidates.len() < 2 {
+            continue;
+        }
+
+        let raw_entity_id_clusters: Vec<Vec<EntityId>> = if has_postgis {
+            postgis::create_temp_location_table(tx).await?;
+            postgis::insert_location_data(tx, &current_tier_candidates).await?;
+            let spatial_clusters = postgis::find_location_clusters(tx, *threshold_dist).await?;
+            postgis::cleanup_temp_tables(tx).await?;
+            spatial_clusters
+                .into_iter()
+                .map(|sc| sc.entity_ids)
+                .collect()
+        } else {
+            build_haversine_proximity_clusters(&current_tier_candidates, *threshold_dist)
+        };
+
+        for entity_id_set in raw_entity_id_clusters {
+            if entity_id_set.len() < 2 {
+                continue;
+            }
+
+            for i in 0..entity_id_set.len() {
+                for j in (i + 1)..entity_id_set.len() {
+                    let e1_id = &entity_id_set[i];
+                    let e2_id = &entity_id_set[j];
+
+                    if globally_processed_entities.contains(e1_id)
+                        || globally_processed_entities.contains(e2_id)
+                    {
+                        continue;
+                    }
+                    // Use consistency_check_sql from DbStatements
+                    let e1_check_row = tx
+                        .query_one(db_stmts.consistency_check_sql, &[&e1_id.0])
+                        .await?;
+                    let e1_check: i64 = e1_check_row.get(0);
+                    let e2_check_row = tx
+                        .query_one(db_stmts.consistency_check_sql, &[&e2_id.0])
+                        .await?;
+                    let e2_check: i64 = e2_check_row.get(0);
+
+                    if e1_check > 0 || e2_check > 0 {
+                        if e1_check > 0 {
+                            globally_processed_entities.insert(e1_id.clone());
+                        }
+                        if e2_check > 0 {
+                            globally_processed_entities.insert(e2_id.clone());
+                        }
+                        local_match_result.entities_skipped += 1;
+                        continue;
+                    }
+
+                    let loc1_data = current_tier_candidates
+                        .iter()
+                        .find(|(id, _, _)| id == e1_id);
+                    let loc2_data = current_tier_candidates
+                        .iter()
+                        .find(|(id, _, _)| id == e2_id);
+
+                    if let (Some((_, lat1, lon1)), Some((_, lat2, lon2))) = (loc1_data, loc2_data) {
+                        let distance = calculate_haversine_distance(*lat1, *lon1, *lat2, *lon2);
+
+                        if distance <= *threshold_dist {
+                            match service_utils::compare_entity_services(tx, e1_id, e2_id).await {
+                                Ok(service_sim) if service_sim >= SERVICE_SIMILARITY_THRESHOLD => {
+                                    let (pred_method, rl_conf, features) = get_rl_prediction(
+                                        pool,
+                                        reinforcement_orchestrator,
+                                        e1_id,
+                                        e2_id,
+                                    )
+                                    .await?;
+                                    let final_conf = calculate_final_confidence(
+                                        pred_method.as_ref(),
+                                        rl_conf,
+                                        *base_conf_for_thresh,
                                     );
-                                    pairs_logged += 1;
+
+                                    if final_conf >= MIN_GEO_PAIR_CONFIDENCE_THRESHOLD {
+                                        let (id1_o, lat1_o, lon1_o, id2_o, lat2_o, lon2_o) =
+                                            canonical_order_pair(
+                                                e1_id, *lat1, *lon1, e2_id, *lat2, *lon2,
+                                            );
+                                        let geo_details = GeospatialMatchValue {
+                                            latitude1: lat1_o,
+                                            longitude1: lon1_o,
+                                            latitude2: lat2_o,
+                                            longitude2: lon2_o,
+                                            distance,
+                                        };
+                                        let mv = MatchValues::Geospatial(geo_details);
+                                        let new_pg_id = Uuid::new_v4().to_string();
+
+                                        // Use new_geospatial_pair_sql from DbStatements
+                                        insert_new_pair_into_db(
+                                            tx,
+                                            db_stmts.new_geospatial_pair_sql,
+                                            &new_pg_id,
+                                            &id1_o,
+                                            &id2_o,
+                                            &mv,
+                                            final_conf,
+                                            now,
+                                        )
+                                        .await?;
+
+                                        info!("CREATE_NEW: Geo pair {} ({},{}) created. Dist:{:.1}m, ServSim:{:.2}, Conf:{:.4}", new_pg_id, id1_o.0, id2_o.0, distance, service_sim, final_conf);
+
+                                        local_match_result.groups_created += 1;
+                                        if globally_processed_entities.insert(id1_o.clone()) {
+                                            local_match_result.entities_matched += 1;
+                                        }
+                                        if globally_processed_entities.insert(id2_o.clone()) {
+                                            local_match_result.entities_matched += 1;
+                                        }
+
+                                        log_suggestion_if_needed(
+                                            tx,
+                                            pipeline_run_id,
+                                            &id1_o,
+                                            Some(&EntityGroupId(new_pg_id)),
+                                            final_conf,
+                                            &mv,
+                                            Some(service_sim),
+                                        )
+                                        .await;
+                                        log_ml_feedback(
+                                            pool,
+                                            reinforcement_orchestrator,
+                                            &id1_o,
+                                            &id2_o,
+                                            final_conf,
+                                            Some(PairMlSnapshot {
+                                                features,
+                                                predicted_method: pred_method,
+                                                prediction_confidence: rl_conf,
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                }
+                                Ok(service_sim) => {
+                                    // Service similarity below threshold
+                                    debug!("Service similarity {:.2} for pair ({},{}) below threshold {:.2}. Skipping.", service_sim, e1_id.0, e2_id.0, SERVICE_SIMILARITY_THRESHOLD);
                                 }
                                 Err(e) => {
-                                    warn!("Failed to log ML feedback: {}", e);
+                                    // Error during service comparison
+                                    warn!(
+                                        "Service comparison failed for pair ({},{}): {}. Skipping.",
+                                        e1_id.0, e2_id.0, e
+                                    );
                                 }
                             }
                         }
                     }
                 }
             }
+        }
+    }
+    local_match_result.entities_added = local_match_result.entities_matched;
+    Ok(local_match_result)
+}
 
-            total_groups_created += 1;
-            threshold_groups_created += 1;
+// --- Helper Functions ---
 
-            debug!(
-                "Successfully created group {} with {} entities within {}m (confidence: {:.4})",
-                group_id.0, group_entities_added, threshold, final_confidence
+fn calculate_final_confidence(
+    predicted_method: Option<&MatchMethodType>,
+    rl_confidence: Option<f64>,
+    base_confidence_from_threshold: f64,
+) -> f64 {
+    match (predicted_method, rl_confidence) {
+        (Some(MatchMethodType::Geospatial), Some(rl_conf)) => {
+            (rl_conf * 0.7) + (base_confidence_from_threshold * 0.3)
+        }
+        (Some(_), Some(_rl_conf)) => base_confidence_from_threshold * 0.5, // RL predicted other method, penalize geo
+        _ => base_confidence_from_threshold, // No RL or RL failed, rely on base
+    }
+}
+
+async fn get_rl_prediction(
+    pool: &PgPool, // Use PgPool for operations outside the main transaction
+    orchestrator: Option<&Mutex<MatchingOrchestrator>>,
+    e1_id: &EntityId,
+    e2_id: &EntityId,
+) -> Result<(Option<MatchMethodType>, Option<f64>, Option<Vec<f64>>)> {
+    if let Some(orch_mutex) = orchestrator {
+        // Context extraction might need its own connection if it's complex
+        match MatchingOrchestrator::extract_pair_context(pool, e1_id, e2_id).await {
+            Ok(features) => {
+                let guard = orch_mutex.lock().await;
+                match guard.predict_method_with_context(&features) {
+                    Ok((method, confidence)) => {
+                        Ok((Some(method), Some(confidence), Some(features)))
+                    }
+                    Err(e) => {
+                        warn!(
+                            "RL prediction for pair ({},{}) failed: {}. Features were extracted.",
+                            e1_id.0, e2_id.0, e
+                        );
+                        Ok((None, None, Some(features))) // Return features even if prediction fails
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "RL context extraction for pair ({},{}) failed: {}",
+                    e1_id.0, e2_id.0, e
+                );
+                Ok((None, None, None))
+            }
+        }
+    } else {
+        Ok((None, None, None))
+    }
+}
+
+async fn calculate_distance_between_points(
+    tx: &Transaction<'_>,
+    db_stmts: &DbStatements, // db_stmts contains SQL string
+    lat1: f64,
+    lon1: f64,
+    lat2: f64,
+    lon2: f64,
+    has_postgis: bool,
+) -> Result<f64> {
+    if has_postgis {
+        // Use distance_sql from DbStatements
+        let row = tx
+            .query_one(db_stmts.distance_sql, &[&lon1, &lat1, &lon2, &lat2])
+            .await
+            .with_context(|| {
+                format!(
+                    "PostGIS distance calculation failed for points ({},{}) and ({},{})",
+                    lat1, lon1, lat2, lon2
+                )
+            })?;
+        Ok(row.get("distance"))
+    } else {
+        Ok(calculate_haversine_distance(lat1, lon1, lat2, lon2))
+    }
+}
+
+fn canonical_order_pair<'a>(
+    id1: &'a EntityId,
+    lat1: f64,
+    lon1: f64,
+    id2: &'a EntityId,
+    lat2: f64,
+    lon2: f64,
+) -> (EntityId, f64, f64, EntityId, f64, f64) {
+    // Return owned EntityId
+    if id1.0 < id2.0 {
+        (id1.clone(), lat1, lon1, id2.clone(), lat2, lon2)
+    } else {
+        (id2.clone(), lat2, lon2, id1.clone(), lat1, lon1)
+    }
+}
+
+async fn insert_new_pair_into_db(
+    tx: &Transaction<'_>,
+    new_geospatial_pair_sql: &str, // Pass the SQL string directly
+    pair_guid: &str,
+    e1_id: &EntityId,
+    e2_id: &EntityId,
+    match_values: &MatchValues,
+    confidence: f64,
+    now: &NaiveDateTime,
+) -> Result<()> {
+    let mv_json = serde_json::to_value(match_values).with_context(|| {
+        format!(
+            "Failed to serialize MatchValues for DB insert of pair {}",
+            pair_guid
+        )
+    })?;
+    tx.execute(
+        new_geospatial_pair_sql, // Use the passed SQL string
+        &[
+            &pair_guid,
+            &e1_id.0,
+            &e2_id.0,
+            &MatchMethodType::Geospatial.as_str(),
+            &mv_json,
+            &confidence,
+            now,
+            now,
+        ],
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "DB insert failed for new_geospatial_pair_sql, pair_guid: {}",
+            pair_guid
+        )
+    })?;
+    Ok(())
+}
+
+fn build_haversine_proximity_clusters(
+    locations: &[(EntityId, f64, f64)],
+    threshold_dist: f64,
+) -> Vec<Vec<EntityId>> {
+    if locations.len() < 2 {
+        return Vec::new();
+    }
+    let mut clusters: Vec<Vec<EntityId>> = Vec::new();
+    let mut unclustered_indices: HashSet<usize> = (0..locations.len()).collect();
+
+    while let Some(start_idx) = unclustered_indices.iter().next().copied() {
+        // Copied to avoid borrow issue
+        unclustered_indices.remove(&start_idx);
+        let mut current_cluster_indices = vec![start_idx];
+        let mut current_cluster_ids = vec![locations[start_idx].0.clone()];
+        let mut i = 0;
+        while i < current_cluster_indices.len() {
+            let current_member_idx = current_cluster_indices[i];
+            let (_, lat1, lon1) = locations[current_member_idx];
+
+            let mut neighbors_found_this_iter = Vec::new();
+            for &potential_neighbor_idx in unclustered_indices.iter() {
+                // Iterate over a copy or by index
+                let (_, lat2, lon2) = locations[potential_neighbor_idx];
+                if calculate_haversine_distance(lat1, lon1, lat2, lon2) <= threshold_dist {
+                    neighbors_found_this_iter.push(potential_neighbor_idx);
+                }
+            }
+            for neighbor_idx in neighbors_found_this_iter {
+                if unclustered_indices.remove(&neighbor_idx) {
+                    current_cluster_indices.push(neighbor_idx);
+                    current_cluster_ids.push(locations[neighbor_idx].0.clone());
+                }
+            }
+            i += 1;
+        }
+        if current_cluster_ids.len() >= 2 {
+            // Only add if it's a valid cluster (2 or more entities)
+            clusters.push(current_cluster_ids);
+        }
+    }
+    clusters
+}
+
+async fn log_suggestion_if_needed(
+    tx: &Transaction<'_>,
+    pipeline_run_id: &str,
+    entity_id_for_suggestion: &EntityId,
+    pair_group_id: Option<&EntityGroupId>,
+    confidence: f64,
+    match_values: &MatchValues,
+    service_similarity: Option<f64>,
+) {
+    if confidence < app_config::MODERATE_LOW_SUGGESTION_THRESHOLD {
+        let priority = if confidence < app_config::CRITICALLY_LOW_SUGGESTION_THRESHOLD {
+            2
+        } else {
+            1
+        };
+        let details_json = serde_json::json!({
+            "method_type": MatchMethodType::Geospatial.as_str(),
+            "match_details": match_values,
+            "service_similarity_score": service_similarity,
+            "final_confidence": confidence,
+            "pair_group_id": pair_group_id.map(|id| id.0.clone()),
+        });
+        let reason_msg = format!(
+            "Entity {} part of geospatial pair {} with low confidence {:.4}. Service sim: {:.2?}.",
+            entity_id_for_suggestion.0,
+            pair_group_id.map_or_else(|| "N/A".to_string(), |id| id.0.clone()),
+            confidence,
+            service_similarity
+        );
+        // Use the refactored project_db::insert_suggestion which takes &impl GenericClient
+        let suggestion = NewSuggestedAction {
+            pipeline_run_id: Some(pipeline_run_id.to_string()),
+            action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
+            entity_id: Some(entity_id_for_suggestion.0.clone()), // Suggestion for one of the entities in the pair
+            group_id_1: pair_group_id.map(|id| id.0.clone()),
+            group_id_2: None,
+            cluster_id: None,
+            triggering_confidence: Some(confidence),
+            details: Some(details_json),
+            reason_code: Some("LOW_GEO_PAIR_CONF".to_string()),
+            reason_message: Some(reason_msg),
+            priority,
+            status: SuggestionStatus::PendingReview.as_str().to_string(),
+            reviewer_id: None,
+            reviewed_at: None,
+            review_notes: None,
+        };
+        if let Err(e) = project_db::insert_suggestion(tx, &suggestion).await {
+            warn!(
+                "Failed to log suggestion for geo pair involving entity {}: {}",
+                entity_id_for_suggestion.0, e
+            );
+        } else {
+            info!(
+                "Logged suggestion for entity {} in geo pair {:?}",
+                entity_id_for_suggestion.0,
+                pair_group_id.map(|id| &id.0)
             );
         }
-
-        debug!(
-            "Database operations for {} groups completed in {:.2?}",
-            groups_in_threshold,
-            db_start.elapsed()
-        );
-
-        info!(
-            "Completed threshold {}m in {:.2?}: created {} groups with {} entities",
-            threshold,
-            threshold_start.elapsed(),
-            threshold_groups_created,
-            threshold_entities_added
-        );
     }
+}
 
-    let newly_processed = processed_entities.len() - initially_processed;
-
-    info!(
-        "Haversine clustering completed in {:.2?}: created {} groups containing {} entities",
-        start_time.elapsed(),
-        total_groups_created,
-        total_entities_added
-    );
-
-    if newly_processed != total_entities_added {
-        warn!(
-            "Discrepancy in processed entities: added {} to groups but processed set grew by {}",
-            total_entities_added, newly_processed
-        );
+async fn log_ml_feedback(
+    pool: &PgPool,
+    orchestrator: Option<&Mutex<MatchingOrchestrator>>,
+    e1_id: &EntityId,
+    e2_id: &EntityId,
+    final_confidence: f64,
+    ml_snapshot: Option<PairMlSnapshot>,
+) {
+    if let Some(orch_mutex) = orchestrator {
+        if let Some(snapshot) = ml_snapshot {
+            let mut guard = orch_mutex.lock().await;
+            // Ensure actual_method_type and actual_confidence reflect the geospatial method's outcome
+            if let Err(e) = guard
+                .log_match_result(
+                    pool,
+                    e1_id,
+                    e2_id,
+                    &snapshot
+                        .predicted_method
+                        .unwrap_or(MatchMethodType::Geospatial), // ML's prediction
+                    snapshot.prediction_confidence.unwrap_or(final_confidence), // ML's confidence for its prediction
+                    true,                                                       // is_match
+                    snapshot.features.as_ref(),
+                    Some(&MatchMethodType::Geospatial), // actual_method_type that formed the pair
+                    Some(final_confidence),             // actual_confidence of the geospatial pair
+                )
+                .await
+            {
+                warn!(
+                    "Failed to log ML feedback for geo pair ({},{}): {}",
+                    e1_id.0, e2_id.0, e
+                );
+            }
+        }
     }
-
-    Ok(MatchResult {
-        entities_added: total_entities_added,
-        entities_skipped: 0,
-        groups_created: total_groups_created,
-        processed_entities: processed_entities.clone(),
-    })
 }

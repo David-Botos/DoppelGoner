@@ -1,327 +1,306 @@
 use crate::{
     db::PgPool,
-    models::{MatchMethodType, ServiceMatchStatus},
-    results::ServiceMatchResult,
+    models::{GroupClusterId, MatchMethodType, ServiceId, ServiceMatchStatus},
+    results::{MatchMethodStats, ServiceMatchResult},
 };
 use anyhow::{Context, Result};
-use log::{info, warn};
-use std::collections::{HashMap, HashSet};
-use tokio_postgres::types::Type;
+use candle_core::{Device, IndexOp, Tensor, D};
+use log::{debug, info, warn};
+use pgvector::Vector; // Assuming you use the pgvector crate for fetching vectors
+use std::collections::HashSet;
 use uuid::Uuid;
 
+// Helper function to select Candle device (GPU if available, else CPU)
+fn candle_device() -> Result<Device> {
+    // Try Metal first (for Apple Silicon), then CUDA, then fallback to CPU
+    // Adjust order or add specific checks based on your target hardware
+    if candle_core::utils::metal_is_available() {
+        return Device::new_metal(0).context("Failed to initialize Metal device");
+    }
+    if candle_core::utils::cuda_is_available() {
+        return Device::new_cuda(0).context("Failed to initialize CUDA device");
+    }
+    info!("No GPU backend (Metal or CUDA) found/enabled for Candle. Using CPU.");
+    Ok(Device::Cpu)
+}
+
 pub async fn match_services(pool: &PgPool) -> Result<ServiceMatchResult> {
-    let mut conn = pool.get().await.context("Failed to get DB connection")?;
-    let mut total_matches = 0;
-    let mut clusters_with_matches = HashSet::new();
+    let mut conn = pool
+        .get()
+        .await
+        .context("Failed to get DB connection for service matching")?;
+    let mut total_matches_created = 0;
+    let mut clusters_with_new_matches = HashSet::new();
 
-    // For tracking similarity statistics
-    let mut similarity_sum = 0.0;
-    let mut high_similarity_matches = 0; // >= 0.9
-    let mut medium_similarity_matches = 0; // >= 0.85 and < 0.9
-    let mut low_similarity_matches = 0; // < 0.85 (shouldn't happen with our threshold, but included for completeness)
+    let mut new_match_similarity_sum = 0.0;
+    let mut new_match_count_for_avg = 0;
 
-    info!("Starting service matching based on semantic and geospatial similarity");
+    // Initialize Candle device
+    let device = candle_device().context("Failed to select Candle device")?;
+    info!("Using Candle device: {:?}", device.location());
 
-    // Process each cluster
-    let clusters_query = "SELECT id FROM group_cluster";
-    let clusters_rows = conn
+    info!("Starting service matching based on semantic (batched) and geospatial similarity for consolidated clusters");
+
+    let clusters_query = "SELECT id FROM public.group_cluster";
+    let cluster_rows = conn
         .query(clusters_query, &[])
         .await
-        .context("Failed to fetch clusters")?;
+        .context("Failed to fetch group_cluster IDs")?;
+
+    if cluster_rows.is_empty() {
+        info!("No consolidated clusters found to process for service matching.");
+        return Ok(ServiceMatchResult {
+            groups_created: 0,
+            stats: MatchMethodStats {
+                method_type: MatchMethodType::Custom("semantic_geospatial_candle".to_string()),
+                groups_created: 0,
+                entities_matched: 0,
+                avg_confidence: 0.0,
+                avg_group_size: 2.0,
+            },
+        });
+    }
 
     info!(
-        "Processing {} entity clusters for service matching",
-        clusters_rows.len()
+        "Processing {} consolidated entity clusters for service matching using Candle on device {:?}.",
+        cluster_rows.len(),
+        device.location()
     );
 
-    for (idx, row) in clusters_rows.iter().enumerate() {
-        let cluster_id: String = row.get(0);
+    for (idx, cluster_row) in cluster_rows.iter().enumerate() {
+        let cluster_id_str: String = cluster_row.get(0);
+        let group_cluster_id = GroupClusterId(cluster_id_str.clone());
 
-        // Get all services associated with entities in this cluster
-        let services_query = r#"
-            SELECT DISTINCT s.id 
-            FROM service s
-            JOIN entity_feature ef ON s.id = ef.table_id
-            JOIN entity e ON ef.entity_id = e.id
-            JOIN group_entity ge ON e.id = ge.entity_id
-            JOIN entity_group eg ON ge.entity_group_id = eg.id
-            WHERE eg.group_cluster_id = $1
-              AND ef.table_name = 'service'
-              AND s.embedding_v2 IS NOT NULL
+        // Fetch service IDs and their embeddings for the current cluster
+        let services_with_embeddings_query = r#"
+            SELECT s.id, s.embedding_v2
+            FROM public.service s
+            JOIN public.entity_feature ef ON s.id = ef.table_id AND ef.table_name = 'service'
+            WHERE ef.entity_id IN (
+                SELECT entity_id_1 FROM public.entity_group WHERE group_cluster_id = $1
+                UNION
+                SELECT entity_id_2 FROM public.entity_group WHERE group_cluster_id = $1
+            )
+            AND s.embedding_v2 IS NOT NULL
         "#;
 
-        let services_rows = conn
-            .query(services_query, &[&cluster_id])
+        let service_embedding_rows = conn
+            .query(services_with_embeddings_query, &[&group_cluster_id.0])
             .await
-            .context("Failed to fetch services for cluster")?;
+            .context(format!(
+                "Failed to fetch services and embeddings for cluster {}",
+                group_cluster_id.0
+            ))?;
 
-        if services_rows.is_empty() {
+        if service_embedding_rows.is_empty() {
+            debug!(
+                "No services with embeddings found for cluster {}",
+                group_cluster_id.0
+            );
             continue;
         }
 
-        let mut services = Vec::new();
-        for row in &services_rows {
-            services.push(row.get::<_, String>(0));
+        let mut service_data: Vec<(ServiceId, Vec<f32>)> = Vec::new();
+        let mut expected_embedding_dim: Option<usize> = None;
+
+        for row in service_embedding_rows {
+            let service_id_str: String = row.get("id");
+            let pg_embedding: Vector = row.get("embedding_v2");
+            let embedding_vec = pg_embedding.to_vec(); // Consumes pgvector::Vector
+
+            if embedding_vec.is_empty() {
+                debug!(
+                    "Service {} in cluster {} has an empty embedding. Skipping.",
+                    service_id_str, group_cluster_id.0
+                );
+                continue;
+            }
+
+            if expected_embedding_dim.is_none() {
+                expected_embedding_dim = Some(embedding_vec.len());
+            } else if expected_embedding_dim.unwrap() != embedding_vec.len() {
+                warn!(
+                    "Service {} in cluster {} has an inconsistent embedding dimension. Expected {}, got {}. Skipping.",
+                    service_id_str, group_cluster_id.0, expected_embedding_dim.unwrap(), embedding_vec.len()
+                );
+                continue;
+            }
+            service_data.push((ServiceId(service_id_str), embedding_vec));
+        }
+
+        if service_data.len() < 2 {
+            debug!(
+                "Cluster {} has fewer than 2 services with valid, consistent embeddings. Skipping pairwise comparison.",
+                group_cluster_id.0
+            );
+            continue;
         }
 
         info!(
-            "Cluster {}/{}: Processing {} services",
+            "Cluster {}/{} (ID: {}): Processing {} services with embeddings for batch similarity.",
             idx + 1,
-            clusters_rows.len(),
-            services.len()
+            cluster_rows.len(),
+            group_cluster_id.0,
+            service_data.len()
         );
-        let mut cluster_had_matches = false;
 
-        // Compare each service with other services in the same cluster
-        for i in 0..services.len() {
-            let service_id = &services[i];
+        let num_services = service_data.len();
+        let embedding_dim = expected_embedding_dim.unwrap(); // Safe due to len < 2 check
 
-            // Find semantically similar services using pgvector
-            let similar_services_query = r#"
-                WITH cluster_services AS (
-                    SELECT DISTINCT s.id
-                    FROM service s
-                    JOIN entity_feature ef ON s.id = ef.table_id
-                    JOIN entity e ON ef.entity_id = e.id
-                    JOIN group_entity ge ON e.id = ge.entity_id
-                    JOIN entity_group eg ON ge.entity_group_id = eg.id
-                    WHERE eg.group_cluster_id = $1
-                      AND ef.table_name = 'service'
-                      AND s.embedding_v2 IS NOT NULL
-                      AND s.id != $2
-                )
-                SELECT 
-                    s2.id,
-                    1 - (s1.embedding_v2 <=> s2.embedding_v2) AS similarity
-                FROM 
-                    service s1,
-                    service s2
-                WHERE 
-                    s1.id = $2
-                    AND s2.id IN (SELECT id FROM cluster_services)
-                    AND s1.embedding_v2 IS NOT NULL
-                    AND s2.embedding_v2 IS NOT NULL
-                    AND 1 - (s1.embedding_v2 <=> s2.embedding_v2) >= 0.85
-                ORDER BY 
-                    s1.embedding_v2 <=> s2.embedding_v2
-                LIMIT 20
-            "#;
+        // Prepare data for Candle tensor
+        let mut flat_embeddings_data = Vec::with_capacity(num_services * embedding_dim);
+        for (_, embedding_vec) in &service_data {
+            flat_embeddings_data.extend_from_slice(embedding_vec);
+        }
 
-            let similar_services_rows = conn
-                .query(similar_services_query, &[&cluster_id, &service_id])
-                .await
-                .context("Failed to find similar services")?;
+        let embeddings_tensor =
+            Tensor::from_vec(flat_embeddings_data, (num_services, embedding_dim), &device)
+                .context("Failed to create Candle tensor from embeddings")?;
 
-            // For each semantically similar service, check geospatial proximity
-            for similar_row in similar_services_rows {
-                let similar_id: String = similar_row.get(0);
-                let similarity: f64 = similar_row.get(1);
+        // Calculate cosine similarity matrix
+        // 1. L2 normalize each embedding vector (row)
+        // norms = sqrt(sum(embeddings_tensor^2, dim=1, keepdim=True))
+        let norms = embeddings_tensor
+            .sqr()?
+            .sum_keepdim(D::Minus1)? // Sum along the embedding dimension
+            .sqrt()?;
+        // normalized_embeddings = embeddings_tensor / norms
+        let normalized_embeddings = embeddings_tensor.broadcast_div(&norms)?;
 
-                // Only process pairs where service_id < similar_id to avoid duplicates
-                if service_id >= &similar_id {
+        // 2. similarity_matrix = normalized_embeddings @ normalized_embeddings.T
+        let similarity_matrix = normalized_embeddings
+            .matmul(&normalized_embeddings.transpose(D::Minus2, D::Minus1)?)?;
+
+        let mut cluster_had_new_matches = false;
+
+        for i in 0..num_services {
+            for j in (i + 1)..num_services {
+                // Iterate upper triangle to avoid duplicates and self-comparison
+                let service1_id = &service_data[i].0;
+                let service2_id = &service_data[j].0;
+
+                // Retrieve similarity from the Candle tensor
+                let similarity_val = similarity_matrix
+                    .i((i, j))? // Access element at (row_i, col_j)
+                    .to_scalar::<f32>()
+                    .context(format!(
+                        "Failed to get similarity score from tensor for pair ({}, {})",
+                        i, j
+                    ))?;
+                let similarity = similarity_val as f64;
+
+                if similarity < 0.85 {
+                    // Semantic threshold
                     continue;
                 }
 
-                // Track similarity statistics
-                similarity_sum += similarity;
-                if similarity >= 0.9 {
-                    high_similarity_matches += 1;
-                } else if similarity >= 0.85 {
-                    medium_similarity_matches += 1;
-                } else {
-                    low_similarity_matches += 1;
-                }
-
-                // Check if both services have locations and they are near each other
+                // Geospatial proximity check (remains the same)
                 let location_check_query = r#"
                     WITH service1_locations AS (
-                        SELECT 
-                            l.id,
-                            l.latitude,
-                            l.longitude
-                        FROM 
-                            service_at_location sal
-                        JOIN 
-                            location l ON sal.location_id = l.id
-                        WHERE 
-                            sal.service_id = $1
-                            AND l.latitude IS NOT NULL
-                            AND l.longitude IS NOT NULL
+                        SELECT l.latitude, l.longitude FROM public.service_at_location sal
+                        JOIN public.location l ON sal.location_id = l.id
+                        WHERE sal.service_id = $1 AND l.latitude IS NOT NULL AND l.longitude IS NOT NULL
                     ),
                     service2_locations AS (
-                        SELECT 
-                            l.id,
-                            l.latitude,
-                            l.longitude
-                        FROM 
-                            service_at_location sal
-                        JOIN 
-                            location l ON sal.location_id = l.id
-                        WHERE 
-                            sal.service_id = $2
-                            AND l.latitude IS NOT NULL
-                            AND l.longitude IS NOT NULL
-                    ),
-                    proximity_check AS (
-                        SELECT 
-                            COUNT(*) AS nearby_count
-                        FROM 
-                            service1_locations s1l,
-                            service2_locations s2l
-                        WHERE 
-                            ST_DWithin(
+                        SELECT l.latitude, l.longitude FROM public.service_at_location sal
+                        JOIN public.location l ON sal.location_id = l.id
+                        WHERE sal.service_id = $2 AND l.latitude IS NOT NULL AND l.longitude IS NOT NULL
+                    )
+                    SELECT
+                        (SELECT COUNT(*) FROM service1_locations) > 0 AS s1_has_loc,
+                        (SELECT COUNT(*) FROM service2_locations) > 0 AS s2_has_loc,
+                        EXISTS (
+                            SELECT 1 FROM service1_locations s1l, service2_locations s2l
+                            WHERE ST_DWithin(
                                 ST_SetSRID(ST_MakePoint(s1l.longitude, s1l.latitude), 4326)::geography,
                                 ST_SetSRID(ST_MakePoint(s2l.longitude, s2l.latitude), 4326)::geography,
                                 2000  -- 2km threshold
                             )
-                    )
-                    SELECT
-                        (SELECT COUNT(*) FROM service1_locations) AS s1_loc_count,
-                        (SELECT COUNT(*) FROM service2_locations) AS s2_loc_count,
-                        (SELECT nearby_count FROM proximity_check) AS nearby_count
+                        ) AS nearby
                 "#;
-
-                let location_check_row = conn
-                    .query_one(location_check_query, &[&service_id, &similar_id])
+                let loc_check_row = conn
+                    .query_one(location_check_query, &[&service1_id.0, &service2_id.0])
                     .await
-                    .context("Failed to check service locations")?;
+                    .context(format!(
+                        "Failed to check service locations for {} and {}",
+                        service1_id.0, service2_id.0
+                    ))?;
 
-                let s1_loc_count: i64 = location_check_row.get(0);
-                let s2_loc_count: i64 = location_check_row.get(1);
-                let nearby_count: i64 = location_check_row.get(2);
+                let s1_has_locations: bool = loc_check_row.get("s1_has_loc");
+                let s2_has_locations: bool = loc_check_row.get("s2_has_loc");
+                let has_nearby_locations: bool = loc_check_row.get("nearby");
 
-                let s1_has_locations = s1_loc_count > 0;
-                let s2_has_locations = s2_loc_count > 0;
-                let has_nearby_locations = nearby_count > 0;
-
-                // Create a match if:
-                // 1. Both services have locations and at least one pair is nearby, or
-                // 2. At least one service doesn't have location data (can't verify proximity)
                 let should_match = if s1_has_locations && s2_has_locations {
-                    // Both have locations, check if any are nearby
                     has_nearby_locations
                 } else {
-                    // At least one doesn't have locations, match based on semantics only
-                    true
+                    true // Match on semantics if one or both lack location
                 };
 
                 if should_match {
-                    // Check if the match already exists
                     let existing_match_query = r#"
-                        SELECT id 
-                        FROM service_match 
-                        WHERE 
-                            (service_id_1 = $1 AND service_id_2 = $2)
-                            OR (service_id_1 = $2 AND service_id_2 = $1)
+                        SELECT id FROM public.service_match
+                        WHERE (service_id_1 = $1 AND service_id_2 = $2) OR (service_id_1 = $2 AND service_id_2 = $1)
                     "#;
-
-                    let existing_match_rows = conn
-                        .query(existing_match_query, &[&service_id, &similar_id])
+                    let existing_match = conn
+                        .query_opt(existing_match_query, &[&service1_id.0, &service2_id.0])
                         .await
-                        .context("Failed to check for existing match")?;
+                        .context("Failed to check for existing service match")?;
 
-                    if existing_match_rows.is_empty() {
-                        // Create the match record
+                    if existing_match.is_none() {
                         let match_id = Uuid::new_v4().to_string();
                         let insert_match_query = r#"
-                            INSERT INTO service_match (
-                                id, 
-                                group_cluster_id, 
-                                service_id_1, 
-                                service_id_2, 
-                                similarity_score, 
-                                match_reasons,
-                                status,
-                                created_at
-                            )
-                            VALUES ($1, $2, $3, $4, $5, $6, 'potential', CURRENT_TIMESTAMP)
+                            INSERT INTO public.service_match
+                            (id, group_cluster_id, service_id_1, service_id_2, similarity_score, match_reasons, status, created_at)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
                         "#;
-
                         conn.execute(
                             insert_match_query,
                             &[
                                 &match_id,
-                                &cluster_id,
-                                &service_id,
-                                &similar_id,
-                                &(similarity as f32),
-                                &"Semantic and geospatial similarity",
+                                &group_cluster_id.0,
+                                &service1_id.0,
+                                &service2_id.0,
+                                &(similarity as f32), // Store the calculated similarity
+                                &"Semantic (Candle) and geospatial similarity",
+                                &ServiceMatchStatus::Potential.as_str(),
                             ],
                         )
                         .await
                         .context("Failed to insert service match")?;
 
-                        total_matches += 1;
-                        cluster_had_matches = true;
+                        total_matches_created += 1;
+                        new_match_similarity_sum += similarity;
+                        new_match_count_for_avg += 1;
+                        cluster_had_new_matches = true;
                     }
                 }
             }
         }
-
-        if cluster_had_matches {
-            clusters_with_matches.insert(cluster_id);
+        if cluster_had_new_matches {
+            clusters_with_new_matches.insert(group_cluster_id.0.clone());
         }
     }
 
-    // Calculate average similarity score
-    let avg_similarity = if total_matches > 0 {
-        similarity_sum / (total_matches as f64)
+    let avg_similarity_of_new_matches = if new_match_count_for_avg > 0 {
+        new_match_similarity_sum / (new_match_count_for_avg as f64)
     } else {
         0.0
     };
 
-    // Update the service_match_stats table
-    if total_matches > 0 {
-        let stats_id = Uuid::new_v4().to_string();
-        let pipeline_run_id = "current_run"; // This should be passed in or retrieved from the database
-
-        let insert_stats_query = r#"
-            INSERT INTO clustering_metadata.service_match_stats (
-                id,
-                pipeline_run_id,
-                total_matches,
-                avg_similarity,
-                high_similarity_matches,
-                medium_similarity_matches,
-                low_similarity_matches,
-                clusters_with_matches,
-                created_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
-        "#;
-
-        conn.execute(
-            insert_stats_query,
-            &[
-                &stats_id,
-                &pipeline_run_id,
-                &(total_matches as i64),
-                &avg_similarity,
-                &(high_similarity_matches as i64),
-                &(medium_similarity_matches as i64),
-                &(low_similarity_matches as i64),
-                &(clusters_with_matches.len() as i64),
-            ],
-        )
-        .await
-        .context("Failed to insert service match stats")?;
-    }
-
     info!(
-        "Service matching completed: {} new potential matches found across {} clusters",
-        total_matches,
-        clusters_with_matches.len()
+        "Service matching completed: {} new potential service matches found across {} clusters using Candle.",
+        total_matches_created,
+        clusters_with_new_matches.len()
     );
 
-    // Return ServiceMatchResult
     Ok(ServiceMatchResult {
-        groups_created: total_matches,
-        stats: crate::results::MatchMethodStats {
-            method_type: MatchMethodType::Custom("semantic_geospatial".to_string()),
-            groups_created: total_matches,
-            entities_matched: total_matches * 2, // Each match connects two services
-            avg_confidence: avg_similarity,
-            avg_group_size: 2.0, // Each match always involves 2 services
+        groups_created: total_matches_created,
+        stats: MatchMethodStats {
+            method_type: MatchMethodType::Custom("semantic_geospatial_candle".to_string()),
+            groups_created: total_matches_created,
+            entities_matched: total_matches_created * 2,
+            avg_confidence: avg_similarity_of_new_matches,
+            avg_group_size: 2.0,
         },
     })
 }

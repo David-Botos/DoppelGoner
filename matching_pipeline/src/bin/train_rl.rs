@@ -1,87 +1,186 @@
 // src/bin/train_rl.rs
 
-use anyhow::{Context, Result}; // For easy error handling
-use log::{info, warn}; // For logging
-use std::path::Path; // For path manipulation (e.g., .env file)
-use std::time::Instant; // For timing the run
+use anyhow::{Context, Result};
+use log::{info, warn};
+use std::path::Path;
+use std::time::Instant;
 
-// Imports from your library crate (dedupe_lib)
-// Ensure your lib.rs correctly exports these modules/functions
-use dedupe_lib::db::{self, PgPool}; // For database connection and .env loading
-use dedupe_lib::reinforcement::process_feedback; // The main function to trigger training
+use dedupe_lib::db::{self, fetch_recent_feedback_items, PgPool};
+// Import the new main RL cycle function and the Orchestrator
+use dedupe_lib::reinforcement::{feedback_processor, MatchingOrchestrator};
+
+// This could be a method on MatchingOrchestrator or a free function
+pub async fn run_reinforcement_learning_cycle(
+    pool: &PgPool,
+    orchestrator: &mut MatchingOrchestrator, // Get mutable access to update models
+) -> Result<()> {
+    info!("Starting reinforcement learning cycle...");
+
+    // 1. Fetch recent feedback items
+    let feedback_items = fetch_recent_feedback_items(pool)
+        .await
+        .context("Failed to fetch recent feedback items")?;
+
+    if feedback_items.is_empty() {
+        info!("No new feedback items to process. Models are up-to-date.");
+        return Ok(());
+    }
+    info!("Fetched {} new feedback items.", feedback_items.len());
+
+    // 2. Prepare training data using feedback_processor
+    // The prepare_pairwise_training_data_batched function from the previous step is used here.
+    // It takes &PgClient, so we get one from the pool.
+    let client = pool
+        .get()
+        .await
+        .context("Failed to get client from pool for training data prep")?;
+    let training_examples =
+        feedback_processor::prepare_pairwise_training_data_batched(&client, &feedback_items)
+            .await
+            .context("Failed to prepare pairwise training data")?;
+    drop(client); // Release client
+
+    // 3. Train ContextModel
+    // We need the 'was_correct' labels from feedback_items aligned with training_examples
+    if !training_examples.is_empty() {
+        info!(
+            "Training ContextModel with {} examples...",
+            training_examples.len()
+        );
+        // orchestrator.context_model is public or has a method to access it mutably
+        // For simplicity, let's assume direct mutable access or a specific training method.
+        // The current ContextModel::train_with_data expects &[TrainingExample].
+        // The `was_correct` labels aren't explicitly passed to it, which is a design flaw if it's a typical supervised classifier.
+        // However, TrainingExample.best_method IS derived from was_correct indirectly.
+        // The `collect_training_data` in `ContextModel` also tries to establish `best_method`.
+        // Let's assume `TrainingExample.best_method` (derived from `FeedbackItem.method_type` where `was_correct` is true)
+        // is the target for the RandomForest in ContextModel.
+        orchestrator
+            .context_model
+            .train_with_data(&training_examples)
+            .context("Failed to train ContextModel with prepared data")?;
+        info!(
+            "ContextModel training completed. New version: {}",
+            orchestrator.context_model.version
+        );
+        orchestrator
+            .context_model
+            .save_to_db(pool)
+            .await
+            .context("Failed to save ContextModel")?;
+    } else {
+        info!("No training examples generated for ContextModel.");
+    }
+
+    // 4. Update ConfidenceTuner
+    // The ConfidenceTuner learns from whether its confidence assignments led to correct outcomes.
+    // Each FeedbackItem tells us the method_type, the system's confidence, and if it was_correct.
+    info!("Updating ConfidenceTuner...");
+    for item in &feedback_items {
+        let reward = if item.was_correct { 1.0 } else { 0.0 }; // Simple reward
+        orchestrator
+            .confidence_tuner
+            .update(&item.method_type, item.confidence, reward)
+            .context(format!(
+                "Failed to update confidence tuner for method {}",
+                item.method_type
+            ))?;
+    }
+    orchestrator.confidence_tuner.version += 1; // Manually increment version after a batch of updates
+    orchestrator
+        .confidence_tuner
+        .save_to_db(pool)
+        .await
+        .context("Failed to save ConfidenceTuner")?;
+    info!(
+        "ConfidenceTuner update completed. New version: {}",
+        orchestrator.confidence_tuner.version
+    );
+
+    info!("Reinforcement learning cycle completed.");
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. Initialize logging
-    // You can customize the default log level (e.g., "info", "debug")
-    // It will read the RUST_LOG environment variable if set.
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
 
     info!("🚀 Starting RL Model Training Run...");
     let start_time = Instant::now();
 
-    // 2. Load environment variables (e.g., for database connection)
-    // This attempts to load a .env file from various common locations.
-    // Adjust the paths in `env_paths` if your .env file is located elsewhere relative
-    // to where you run the compiled binary.
-    let env_paths = [
-        ".env",             // Project root
-        ".env.local",       // Common for local overrides
-        "../.env",          // If run from a subdirectory (like target/debug)
-        "../../.env",       // If run from a deeper subdirectory
-    ];
+    // --- Load Environment Variables ---
+    let env_paths = [".env", ".env.local", "../.env", "../../.env"];
     let mut loaded_env = false;
     for path_str in env_paths.iter() {
         let path = Path::new(path_str);
         if path.exists() {
-            let env_path = path.to_str();
-            match db::load_env_from_file(env_path.unwrap()) { // Assuming load_env_from_file is public in db module
+            match db::load_env_from_file(path.to_str().unwrap_or_default()) {
                 Ok(_) => {
                     info!("✅ Loaded environment variables from {}", path.display());
                     loaded_env = true;
-                    break; // Stop searching once an .env file is successfully loaded
+                    break;
                 }
-                Err(e) => {
-                    warn!(
-                        "⚠️ Failed to load environment from {}: {}. Continuing without it.",
-                        path.display(),
-                        e
-                    );
-                }
+                Err(e) => warn!(
+                    "⚠️ Failed to load environment from {}: {}.",
+                    path.display(),
+                    e
+                ),
             }
         }
     }
     if !loaded_env {
-        info!("ℹ️ No .env file found or loaded. Relying on system environment variables for DB connection.");
+        info!("ℹ️ No .env file found or loaded. Relying on system environment variables.");
     }
 
-    // 3. Connect to the database
-    // The db::connect() function should use the loaded environment variables
-    // (or system environment variables) to establish the database connection pool.
+    // --- Connect to Database ---
     info!("🔗 Connecting to the database...");
     let pool: PgPool = db::connect()
         .await
-        .context("Failed to connect to the database. Ensure DB_URL or related env vars are set.")?;
+        .context("Failed to connect to the database.")?;
     info!("✅ Successfully connected to the database.");
 
-    // 4. Call the feedback processing function to trigger training
-    info!("🧠 Starting feedback processing and model training cycle...");
-    match process_feedback(&pool).await {
+    // --- Initialize Matching Orchestrator ---
+    // The orchestrator loads its models (ContextModel, ConfidenceTuner) internally from the DB or creates new ones.
+    info!("🔧 Initializing Matching Orchestrator (loading models)...");
+    let mut orchestrator = MatchingOrchestrator::new(&pool) // `new` now takes &PgPool
+        .await
+        .context("Failed to initialize MatchingOrchestrator")?;
+    info!("✅ Matching Orchestrator initialized.");
+    info!(
+        "   ContextModel version: {}",
+        orchestrator.context_model.version
+    );
+    info!(
+        "   ConfidenceTuner version: {}",
+        orchestrator.confidence_tuner.version
+    );
+
+    // --- Run the Reinforcement Learning Cycle ---
+    info!("🧠 Starting reinforcement learning cycle...");
+    // The run_reinforcement_learning_cycle function now takes a mutable reference to the orchestrator
+    match run_reinforcement_learning_cycle(&pool, &mut orchestrator).await {
         Ok(_) => {
-            info!("✅ Feedback processing and model training completed successfully.");
+            info!("✅ Reinforcement learning cycle completed successfully.");
+            info!(
+                "   ContextModel new version: {}",
+                orchestrator.context_model.version
+            );
+            info!(
+                "   ConfidenceTuner new version: {}",
+                orchestrator.confidence_tuner.version
+            );
         }
         Err(e) => {
-            // Log the error and propagate it to ensure a non-zero exit code on failure
-            warn!("❌ An error occurred during feedback processing and training: {:?}", e);
-            return Err(e).context("RL model training run failed during feedback processing");
+            warn!(
+                "❌ An error occurred during the reinforcement learning cycle: {:?}",
+                e
+            );
+            return Err(e).context("RL model training run failed during RL cycle");
         }
     }
 
     let elapsed = start_time.elapsed();
-    info!(
-        "🏁 RL Model Training Run finished in {:.2?}.",
-        elapsed
-    );
+    info!("🏁 RL Model Training Run finished in {:.2?}.", elapsed);
 
     Ok(())
 }
