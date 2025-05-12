@@ -415,6 +415,7 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
           )
       )
       .on("mouseover", (event: MouseEvent, d: D3Link) => {
+        const [x, y] = d3.pointer(event, svgRef.current);
         const sourceNode = d.source as D3Node;
         const targetNode = d.target as D3Node;
         const entityGroupData: EntityGroup = {
@@ -427,7 +428,7 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
           confirmed: d.confirmed,
         };
         setTooltipLink(entityGroupData);
-        setTooltipPosition({ x: event.pageX, y: event.pageY });
+        setTooltipPosition({ x: x, y: y });
       })
       .on("mouseout", () => {
         setTooltipLink(null);
@@ -470,6 +471,7 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
           )
       )
       .on("mouseover", (event: MouseEvent, d: D3Node) => {
+        const [x, y] = d3.pointer(event, svgRef.current);
         const entityData: Entity = {
           id: d.id,
           name: d.name,
@@ -477,7 +479,7 @@ const GraphVisualization: React.FC<GraphVisualizationProps> = ({
         };
         onNodeHover(entityData.id);
         setTooltipNode(entityData);
-        setTooltipPosition({ x: event.pageX, y: event.pageY });
+        setTooltipPosition({ x: x, y: y });
       })
       .on("mouseout", () => {
         setTooltipNode(null);
