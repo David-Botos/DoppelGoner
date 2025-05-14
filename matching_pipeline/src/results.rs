@@ -72,11 +72,13 @@ pub struct PipelineStats {
     pub total_groups: usize, // "groups" means pairwise links
     pub total_clusters: usize,
     pub total_service_matches: usize,
+    pub total_visualization_edges: usize, // New field for tracking visualization edges
 
     pub entity_processing_time: f64,
     pub context_feature_extraction_time: f64,
     pub matching_time: f64,
     pub clustering_time: f64,
+    pub visualization_edge_calculation_time: f64, // New timing field
     pub service_matching_time: f64,
     pub total_processing_time: f64,
 
@@ -92,7 +94,7 @@ pub enum AnyMatchResult {
     Url(UrlMatchResult),
     Address(AddressMatchResult),
     Name(NameMatchResult),
-    Geospatial(EnhancedGeospatialMatchResult), // Using the specific type from your main.rs imports
+    Geospatial(GeospatialMatchResult), // Using the specific type from your main.rs imports
 }
 
 impl AnyMatchResult {
@@ -149,12 +151,9 @@ pub struct AddressMatchResult {
     pub stats: MatchMethodStats,
 }
 #[derive(Debug, Clone)]
-pub struct EnhancedGeospatialMatchResult {
+pub struct GeospatialMatchResult {
     pub groups_created: usize,
     pub stats: MatchMethodStats,
-    pub rejected_by_service_similarity: usize,
-    pub avg_service_similarity: f64,
-    pub service_similarity_threshold: f64,
 }
 #[derive(Debug, Clone)]
 pub struct NameMatchResult {
@@ -400,16 +399,15 @@ async fn store_pipeline_stats(pool: &PgPool, stats: &PipelineStats) -> Result<()
         .context("Failed to start transaction for storing stats")?;
 
     // Main pipeline run record
-    // Note: DDL for clustering_metadata.pipeline_run seems to miss context_feature_extraction_time
-    // Adding it here, assuming DDL will be/is aligned. If not, remove it.
+    // Add new fields for visualization edges
     let insert_run = "
         INSERT INTO clustering_metadata.pipeline_run (
             id, run_timestamp, description, 
-            total_entities, total_groups, total_clusters, total_service_matches,
+            total_entities, total_groups, total_clusters, total_service_matches, total_visualization_edges,
             entity_processing_time, context_feature_extraction_time, matching_time, 
-            clustering_time, service_matching_time, total_processing_time
+            clustering_time, visualization_edge_calculation_time, service_matching_time, total_processing_time
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
     ";
     transaction
         .execute(
@@ -422,10 +420,12 @@ async fn store_pipeline_stats(pool: &PgPool, stats: &PipelineStats) -> Result<()
                 &(stats.total_groups as i64),
                 &(stats.total_clusters as i64),
                 &(stats.total_service_matches as i64),
+                &(stats.total_visualization_edges as i64), // New parameter
                 &stats.entity_processing_time,
-                &stats.context_feature_extraction_time, // This field needs to exist in the DDL
+                &stats.context_feature_extraction_time,
                 &stats.matching_time,
                 &stats.clustering_time,
+                &stats.visualization_edge_calculation_time, // New parameter
                 &stats.service_matching_time,
                 &stats.total_processing_time,
             ],
@@ -498,8 +498,6 @@ async fn store_pipeline_stats(pool: &PgPool, stats: &PipelineStats) -> Result<()
 
 fn print_report(stats: &PipelineStats) {
     println!("\n========== HSDS ENTITY GROUPING PIPELINE REPORT ==========");
-    // ... (rest of the print_report function remains largely the same,
-    // but the interpretation of printed values for "groups" needs to be understood as "pairwise links")
     println!("Run ID: {}", stats.run_id);
     println!("Timestamp: {}", stats.run_timestamp);
     if let Some(desc) = &stats.description {
@@ -511,11 +509,12 @@ fn print_report(stats: &PipelineStats) {
     println!(
         "Total pairwise links (entity_group records): {}",
         stats.total_groups
-    ); // Clarified meaning
+    );
     println!(
         "Total consolidated clusters formed: {}",
         stats.total_clusters
     );
+    println!("Total visualization edges calculated: {}", stats.total_visualization_edges);
     println!(
         "Total service matches identified: {}",
         stats.total_service_matches
@@ -537,6 +536,10 @@ fn print_report(stats: &PipelineStats) {
     println!(
         "Cluster consolidation time: {:.2} seconds",
         stats.clustering_time
+    );
+    println!(
+        "Visualization edge calculation time: {:.2} seconds", // New line
+        stats.visualization_edge_calculation_time
     );
     println!(
         "Service matching time: {:.2} seconds",

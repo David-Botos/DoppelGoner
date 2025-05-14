@@ -64,10 +64,50 @@ strsim = "0.10.0"
 # For regular expressions in name normalization
 regex = "1.7.0"
 
-# Define multiple binary targets
+# Define binary targets
 [[bin]]
 name = "dedupe"
 path = "src/main.rs"
+
+[[bin]]
+name = "train_rl"
+path = "src/bin/train_rl.rs"
+
+[[bin]]
+name = "identify_entities"
+path = "src/bin/identify_entities.rs"
+
+[[bin]]
+name = "extract_context_features"
+path = "src/bin/extract_context_features.rs"
+
+[[bin]]
+name = "match_email"
+path = "src/bin/match_email.rs"
+
+[[bin]]
+name = "match_phone"
+path = "src/bin/match_phone.rs"
+
+[[bin]]
+name = "match_url"
+path = "src/bin/match_url.rs"
+
+[[bin]]
+name = "match_address"
+path = "src/bin/match_address.rs"
+
+[[bin]]
+name = "match_name"
+path = "src/bin/match_name.rs"
+
+[[bin]]
+name = "consolidate_clusters"
+path = "src/bin/consolidate_clusters.rs"
+
+[[bin]]
+name = "match_services"
+path = "src/bin/match_services.rs"
 
 [lib]
 name = "dedupe_lib"

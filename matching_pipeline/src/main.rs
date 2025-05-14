@@ -14,16 +14,10 @@ use tokio::{sync::Mutex, task::JoinHandle};
 use uuid::Uuid;
 
 use dedupe_lib::{
-    config, consolidate_clusters,
-    db::{self, PgPool},
-    entity_organizations, matching,
-    models::*,
-    reinforcement::{self, MatchingOrchestrator},
-    results::{
-        self, AddressMatchResult, AnyMatchResult, EmailMatchResult, EnhancedGeospatialMatchResult,
+    cluster_visualization, config, consolidate_clusters, db::{self, PgPool}, entity_organizations, matching, models::*, reinforcement::{self, MatchingOrchestrator}, results::{
+        self, AddressMatchResult, AnyMatchResult, EmailMatchResult, GeospatialMatchResult,
         MatchMethodStats, NameMatchResult, PhoneMatchResult, PipelineStats, UrlMatchResult,
-    },
-    service_matching,
+    }, service_matching
 };
 
 #[tokio::main]
@@ -104,12 +98,14 @@ async fn run_pipeline(
         total_groups: 0,
         total_clusters: 0,
         total_service_matches: 0,
+        total_visualization_edges: 0, // New field added
 
         // Initialize timing fields - will be updated later
         entity_processing_time: 0.0,
         context_feature_extraction_time: 0.0,
         matching_time: 0.0,
         clustering_time: 0.0,
+        visualization_edge_calculation_time: 0.0, // New timing field
         service_matching_time: 0.0,
         total_processing_time: 0.0,
 
@@ -119,7 +115,7 @@ async fn run_pipeline(
         service_stats: None,
     };
 
-    info!("Pipeline started. Progress: [0/5] phases (0%)");
+    info!("Pipeline started. Progress: [0/6] phases (0%)"); // Updated number of phases
 
     // Phase 1: Entity identification
     info!("Phase 1: Entity identification");
@@ -133,9 +129,9 @@ async fn run_pipeline(
         stats.total_entities,
         phase1_start.elapsed()
     );
-    info!("Pipeline progress: [1/4] phases (20%)");
+    info!("Pipeline progress: [1/6] phases (17%)"); // Updated progress
 
-    // Phase 2: Context Feature Extraction (New Phase)
+    // Phase 2: Context Feature Extraction
     info!("Phase 2: Context Feature Extraction");
     let phase2_start = Instant::now();
     if stats.total_entities > 0 {
@@ -148,12 +144,12 @@ async fn run_pipeline(
     }
     let phase2_duration = phase2_start.elapsed();
     phase_times.insert("context_feature_extraction".to_string(), phase2_duration);
-    stats.context_feature_extraction_time = phase2_duration.as_secs_f64(); // Store timing
+    stats.context_feature_extraction_time = phase2_duration.as_secs_f64();
     info!(
         "Context Feature Extraction complete in {:.2?}. Phase 2 complete.",
         phase2_duration
     );
-    info!("Pipeline progress: [2/5] phases (40%)");
+    info!("Pipeline progress: [2/6] phases (33%)"); // Updated progress
 
     // Now initialize the ML reinforcement_orchestrator as features should be available
     info!("Initializing ML-guided matching reinforcement_orchestrator");
@@ -165,17 +161,17 @@ async fn run_pipeline(
     // Phase 3: Entity matching
     info!("Phase 3: Entity matching");
     info!("Initializing ML-guided matching reinforcement_orchestrator");
-    let reinforcement_orchestrator_instance = reinforcement::MatchingOrchestrator::new(pool) // Pool is already &PgPool
+    let reinforcement_orchestrator_instance = reinforcement::MatchingOrchestrator::new(pool)
         .await
         .context("Failed to initialize ML reinforcement_orchestrator")?;
     // Wrap in Arc and Mutex for shared, mutable access across tasks
     let reinforcement_orchestrator = Arc::new(Mutex::new(reinforcement_orchestrator_instance));
 
     let phase3_start = Instant::now();
-    let (total_groups, method_stats_match) = // Renamed to avoid conflict
+    let (total_groups, method_stats_match) = 
         run_matching_pipeline(pool, reinforcement_orchestrator.clone(), run_id_clone.clone()).await?;
     stats.total_groups = total_groups;
-    stats.method_stats.extend(method_stats_match); // Extend here
+    stats.method_stats.extend(method_stats_match);
     let phase3_duration = phase3_start.elapsed();
     phase_times.insert("entity_matching".to_string(), phase3_duration);
     stats.matching_time = phase3_duration.as_secs_f64();
@@ -183,9 +179,9 @@ async fn run_pipeline(
         "Created {} entity groups in {:.2?}. Phase 3 complete.",
         stats.total_groups, phase3_duration
     );
-    info!("Pipeline progress: [3/5] phases (60%)");
+    info!("Pipeline progress: [3/6] phases (50%)"); // Updated progress
 
-    // Phase 4: Cluster consolidation (was Phase 3)
+    // Phase 4: Cluster consolidation
     info!("Phase 4: Cluster consolidation");
     let phase4_start = Instant::now();
     stats.total_clusters =
@@ -197,30 +193,47 @@ async fn run_pipeline(
         "Formed {} clusters in {:.2?}. Phase 4 complete.",
         stats.total_clusters, phase4_duration
     );
-    info!("Pipeline progress: [4/5] phases (80%)");
+    info!("Pipeline progress: [4/6] phases (67%)"); // Updated progress
 
-    // Phase 5: Service matching (was Phase 4)
-    info!("Phase 5: Service matching");
+    // NEW PHASE 5: Visualization edge calculation
+    info!("Phase 5: Calculating entity relationship edges for cluster visualization");
     let phase5_start = Instant::now();
-    let service_match_stats_result = service_matching::semantic_geospatial::match_services(pool) // Renamed
+    cluster_visualization::ensure_visualization_tables_exist(pool).await?;
+    stats.total_visualization_edges = cluster_visualization::calculate_visualization_edges(
+        pool, &run_id_clone
+    ).await?;
+    let phase5_duration = phase5_start.elapsed();
+    phase_times.insert("visualization_edge_calculation".to_string(), phase5_duration);
+    stats.visualization_edge_calculation_time = phase5_duration.as_secs_f64();
+    info!(
+        "Calculated {} entity relationship edges for visualization in {:.2?}. Phase 5 complete.",
+        stats.total_visualization_edges, phase5_duration
+    );
+    info!("Pipeline progress: [5/6] phases (83%)"); // Updated progress
+
+    // Now PHASE 6: Service matching (was Phase 5)
+    info!("Phase 6: Service matching");
+    let phase6_start = Instant::now();
+    let service_match_stats_result = service_matching::semantic_geospatial::match_services(pool)
         .await
         .context("failed to match services")?;
     stats.total_service_matches = service_match_stats_result.groups_created;
-    stats.method_stats.push(service_match_stats_result.stats); // Add service matching stats
-    let phase5_duration = phase5_start.elapsed();
-    phase_times.insert("service_matching".to_string(), phase5_duration);
-    stats.service_matching_time = phase5_duration.as_secs_f64();
+    stats.method_stats.push(service_match_stats_result.stats);
+    let phase6_duration = phase6_start.elapsed();
+    phase_times.insert("service_matching".to_string(), phase6_duration);
+    stats.service_matching_time = phase6_duration.as_secs_f64();
     info!(
-        "Service matching processed in {:.2?}. Phase 5 complete.",
-        phase5_duration
+        "Service matching processed in {:.2?}. Phase 6 complete.",
+        phase6_duration
     );
-    info!("Pipeline progress: [5/5] phases (100%)");
+    info!("Pipeline progress: [6/6] phases (100%)");
 
     // Calculate total processing time
     stats.total_processing_time = stats.entity_processing_time
         + stats.context_feature_extraction_time
         + stats.matching_time
         + stats.clustering_time
+        + stats.visualization_edge_calculation_time  // Added new timing field
         + stats.service_matching_time;
 
     Ok(stats)
@@ -244,6 +257,17 @@ async fn identify_entities(pool: &PgPool) -> Result<usize> {
     entity_organizations::link_entity_features(pool, &org_entities) // Pass all current entities
         .await
         .context("Failed to link entity features")?;
+
+    // Update existing entities with new features added since the last time features were linked
+    // This ensures that if new records (services, phones, locations, contacts) have been added
+    // that reference organizations with existing entities, they'll be properly linked
+    let updated_features_count = entity_organizations::update_entity_features(pool)
+        .await
+        .context("Failed to update entity features for existing entities")?;
+    info!(
+        "Added {} new feature links to existing entities",
+        updated_features_count
+    );
 
     // After potential new entities are created and features linked,
     // get the total count of entities from the database.
@@ -375,9 +399,8 @@ async fn run_matching_pipeline(
         result
     }));
 
-    // --- Spawn Geospatial Matching Task ---
     let pool_clone_geo = pool.clone();
-    let orchestrator_clone_geo = reinforcement_orchestrator.clone();
+    let orchestrator_clone_geo = reinforcement_orchestrator.clone(); // Pass the Arc<Mutex<...>>
     let run_id_clone_geo = run_id.clone();
     tasks.push(tokio::spawn(async move {
         info!("Starting geospatial matching task...");
@@ -389,7 +412,7 @@ async fn run_matching_pipeline(
         .await
         .context("Geospatial matching task failed");
         info!(
-            "Geospatial matching task finished successfully: {:?}",
+            "Geospatial matching task finished: {:?}", // Log success or failure details
             result.as_ref().map(|r| r.groups_created())
         );
         result
@@ -406,7 +429,7 @@ async fn run_matching_pipeline(
     let mut total_groups = 0;
     let mut method_stats_vec = Vec::new();
     let mut completed_methods = 0;
-    let total_matching_methods = 6; // Should match the number of tasks pushed
+    let total_matching_methods = 6;
 
     // First, handle potential JoinError from try_join_all
     match join_handle_results {
@@ -486,7 +509,8 @@ async fn consolidate_clusters_helper(
     // Get the unassigned group count before we start
     let conn = pool.get().await.context("Failed to get DB connection")?;
 
-    let unassigned_query = "SELECT COUNT(*) FROM entity_group WHERE group_cluster_id IS NULL";
+    let unassigned_query =
+        "SELECT COUNT(*) FROM public.entity_group WHERE group_cluster_id IS NULL";
     let groups_row = conn
         .query_one(unassigned_query, &[])
         .await

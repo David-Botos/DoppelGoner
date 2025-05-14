@@ -146,20 +146,18 @@ pub struct EntityGroup {
     pub method_type: MatchMethodType,
 
     /// The actual values that matched for this pair (structured by match type)
-    /// This field is optional as some matching methods might not produce detailed values,
-    /// or values might be stored elsewhere depending on final design.
-    /// Based on DDL, this is JSONB NULL.
     pub match_values: Option<MatchValues>,
 
     /// RL-derived confidence score for the match between entity_id_1 and entity_id_2.
-    /// Based on DDL, this is FLOAT NULL.
     pub confidence_score: Option<f64>,
+    
+    /// Pre-RL confidence score calculated by the matching method before RL adjustment
+    pub pre_rl_confidence_score: Option<f64>,
 
     /// The cluster this group belongs to (null until clustering is performed)
     pub group_cluster_id: Option<GroupClusterId>,
 
     /// Version of this group record, for optimistic locking or history.
-    /// Based on DDL, this is INTEGER NULL.
     pub version: Option<i32>,
 
     /// When this group was first created
@@ -168,6 +166,7 @@ pub struct EntityGroup {
     /// When this group was last updated
     pub updated_at: NaiveDateTime,
 }
+
 
 // GroupEntity struct is removed as per the refactoring plan.
 // The relationship is now directly entity_id_1 and entity_id_2 in EntityGroup.
@@ -257,6 +256,11 @@ pub struct GroupCluster {
 
     /// Number of groups in this cluster
     pub group_count: i32,
+
+    /// Average internal pair confidence score for entities within this cluster.
+    /// Populated by the verify_clusters step.
+    /// Corresponds to the 'average_coherence_score' column in the database.
+    pub average_coherence_score: Option<f64>, // New field
 }
 
 /// Enum for service match status
@@ -376,6 +380,8 @@ pub struct UrlMatchValue {
     pub original_url2: String,
     /// The normalized shared domain that formed the basis of the match
     pub normalized_shared_domain: String,
+    /// The number of slugs that match after the domain
+    pub matching_slug_count: usize,
 }
 
 /// Represents matched phone number values for a pair of entities.
@@ -443,8 +449,6 @@ pub struct NameMatchValue {
     pub normalized_name1: String,
     /// Normalized name for the second entity
     pub normalized_name2: String,
-    /// Similarity score (e.g., fuzzy, semantic) calculated before RL, if any
-    pub pre_rl_similarity_score: Option<f32>,
     /// Type of match (e.g., fuzzy, semantic) determined before RL, if any
     pub pre_rl_match_type: Option<String>,
 }
