@@ -314,7 +314,7 @@ impl ContextModel {
                     // Fetch the original pair from entity_group
                     let pair_row_opt = conn
                         .query_opt(
-                            "SELECT entity_id_1, entity_id_2 FROM entity_group WHERE id = $1",
+                            "SELECT entity_id_1, entity_id_2 FROM public.entity_group WHERE id = $1",
                             &[&group_id],
                         )
                         .await
@@ -346,7 +346,7 @@ impl ContextModel {
             let cluster_member_rows = conn
                 .query(
                     "SELECT eg.group_cluster_id, ge.entity_id
-                 FROM group_entity ge
+                 FROM public.group_entity ge
                  JOIN entity_group eg ON ge.entity_group_id = eg.id
                  WHERE eg.group_cluster_id = ANY($1::TEXT[])",
                     &[&cluster_ids_vec],

@@ -166,8 +166,8 @@ pub async fn prepare_pairwise_training_data_batched(
         let org_rows = client
             .query(
                 "SELECT e.id as entity_id_str, o.name, o.url, o.embedding
-                 FROM entity e
-                 JOIN organization o ON e.organization_id = o.id
+                 FROM public.entity e
+                 JOIN public.organization o ON e.organization_id = o.id
                  WHERE e.id = ANY($1)",
                 &[&entity_ids_vec_str],
             )
@@ -198,8 +198,8 @@ pub async fn prepare_pairwise_training_data_batched(
         let service_rows = client
             .query(
                 "SELECT ef.entity_id as entity_id_str, s.id as service_id, s.embedding_v2
-                 FROM entity_feature ef
-                 JOIN service s ON ef.table_id = s.id
+                 FROM public.entity_feature ef
+                 JOIN public.service s ON ef.table_id = s.id
                  WHERE ef.table_name = 'service' AND ef.entity_id = ANY($1)",
                 &[&entity_ids_vec_str],
             )
@@ -229,8 +229,8 @@ pub async fn prepare_pairwise_training_data_batched(
         let location_rows = client
             .query(
                 "SELECT ef.entity_id as entity_id_str, l.id as location_id, l.latitude, l.longitude
-                 FROM entity_feature ef
-                 JOIN location l ON ef.table_id = l.id
+                 FROM public.entity_feature ef
+                 JOIN public.location l ON ef.table_id = l.id
                  WHERE ef.table_name = 'location' AND ef.entity_id = ANY($1)",
                 &[&entity_ids_vec_str],
             )
@@ -259,8 +259,8 @@ pub async fn prepare_pairwise_training_data_batched(
         let phone_rows = client
             .query(
                 "SELECT ef.entity_id as entity_id_str, p.number -- Assuming p.number is already normalized
-                 FROM entity_feature ef
-                 JOIN phone p ON ef.table_id = p.id
+                 FROM public.entity_feature ef
+                 JOIN public.phone p ON ef.table_id = p.id
                  WHERE ef.table_name = 'phone' AND ef.entity_id = ANY($1) AND p.number IS NOT NULL AND p.number <> ''",
                 &[&entity_ids_vec_str],
             )
@@ -302,8 +302,8 @@ pub async fn prepare_pairwise_training_data_batched(
         let sal_rows = client
             .query(
                 "SELECT sal.service_id, sal.location_id, loc.latitude, loc.longitude
-                 FROM service_at_location sal
-                 JOIN location loc ON sal.location_id = loc.id
+                 FROM public.service_at_location sal
+                 JOIN public.location loc ON sal.location_id = loc.id
                  WHERE sal.service_id = ANY($1)",
                 &[&unique_service_ids],
             )

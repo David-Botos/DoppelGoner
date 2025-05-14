@@ -258,11 +258,11 @@ pub async fn extract_entity_features<'conn, 'id>(
                 o.url AS org_url,
                 o.tax_id AS org_tax_id,
                 o.legal_status AS org_legal_status,
-                EXISTS (SELECT 1 FROM phone p JOIN entity_feature ef ON ef.table_id = p.id WHERE ef.entity_id = e.id AND ef.table_name = 'phone' AND p.number IS NOT NULL AND p.number <> '') AS has_phone_flag,
-                EXISTS (SELECT 1 FROM address a JOIN location l_addr ON a.location_id = l_addr.id JOIN entity_feature ef_addr ON ef_addr.table_id = l_addr.id WHERE ef_addr.entity_id = e.id AND ef_addr.table_name = 'location') AS has_address_flag,
-                EXISTS (SELECT 1 FROM location l JOIN entity_feature ef_loc ON ef_loc.table_id = l.id WHERE ef_loc.entity_id = e.id AND ef_loc.table_name = 'location' AND l.latitude IS NOT NULL AND l.longitude IS NOT NULL) AS has_location_coords_flag,
-                (SELECT COUNT(*) FROM service s JOIN entity_feature ef_s ON ef_s.table_id = s.id WHERE ef_s.entity_id = e.id AND ef_s.table_name = 'service') AS service_count_val,
-                (SELECT COUNT(*) FROM location l_loc_count JOIN entity_feature ef_lc ON ef_lc.table_id = l_loc_count.id WHERE ef_lc.entity_id = e.id AND ef_lc.table_name = 'location') AS location_count_val
+                EXISTS (SELECT 1 FROM public.phone p JOIN entity_feature ef ON ef.table_id = p.id WHERE ef.entity_id = e.id AND ef.table_name = 'phone' AND p.number IS NOT NULL AND p.number <> '') AS has_phone_flag,
+                EXISTS (SELECT 1 FROM public.address a JOIN location l_addr ON a.location_id = l_addr.id JOIN entity_feature ef_addr ON ef_addr.table_id = l_addr.id WHERE ef_addr.entity_id = e.id AND ef_addr.table_name = 'location') AS has_address_flag,
+                EXISTS (SELECT 1 FROM public.location l JOIN entity_feature ef_loc ON ef_loc.table_id = l.id WHERE ef_loc.entity_id = e.id AND ef_loc.table_name = 'location' AND l.latitude IS NOT NULL AND l.longitude IS NOT NULL) AS has_location_coords_flag,
+                (SELECT COUNT(*) FROM public.service s JOIN entity_feature ef_s ON ef_s.table_id = s.id WHERE ef_s.entity_id = e.id AND ef_s.table_name = 'service') AS service_count_val,
+                (SELECT COUNT(*) FROM public.location l_loc_count JOIN entity_feature ef_lc ON ef_lc.table_id = l_loc_count.id WHERE ef_lc.entity_id = e.id AND ef_lc.table_name = 'location') AS location_count_val
             FROM entity e
             JOIN organization o ON e.organization_id = o.id
             WHERE e.id = $1";
@@ -484,7 +484,7 @@ pub async fn extract_context_for_pair(
     let pair_context_for_outer_wrapper = pair_context.clone(); //
 
     let all_feature_metadata = get_feature_metadata(); //
-    // Assuming all_feature_metadata is a Vec; it will be moved into pair_features_calculation_task_inner. This is fine.
+                                                       // Assuming all_feature_metadata is a Vec; it will be moved into pair_features_calculation_task_inner. This is fine.
 
     let context_steps_completed = Arc::new(AtomicUsize::new(0)); //
     let total_context_steps = 3; //
@@ -493,7 +493,8 @@ pub async fn extract_context_for_pair(
         .map_err(|e| anyhow::anyhow!("Failed to get candle device for pair context: {}", e))?;
 
     // Step 2: Use conn_ref for tasks that borrow the connection.
-    let entity1_features_task = wrap_with_progress( //
+    let entity1_features_task = wrap_with_progress(
+        //
         get_stored_entity_features(conn_ref, entity1), // Use conn_ref
         context_steps_completed.clone(),
         total_context_steps,
@@ -502,7 +503,8 @@ pub async fn extract_context_for_pair(
         LogLevel::Info,
     );
 
-    let entity2_features_task = wrap_with_progress( //
+    let entity2_features_task = wrap_with_progress(
+        //
         get_stored_entity_features(conn_ref, entity2), // Use conn_ref
         context_steps_completed.clone(),
         total_context_steps,
@@ -515,7 +517,8 @@ pub async fn extract_context_for_pair(
 
     // Step 3: The async move block will now capture `conn_ref` (a reference, which is Copy)
     // and other necessary owned/cloned values. `conn_guard` itself is NOT moved.
-    let pair_features_calculation_task_inner = async move { //
+    let pair_features_calculation_task_inner = async move {
+        //
         // This async move captures:
         // - conn_ref (by copy, as it's a reference: &'some_lifetime PgConnection)
         // - entity1, entity2 (by copy, as they are references: &EntityId)
@@ -527,73 +530,113 @@ pub async fn extract_context_for_pair(
         const PAIRWISE_METADATA_OFFSET: usize = 12; //
         const NUM_PAIRWISE_FEATURES: usize = 7; //
 
-        let pair_features_futures_list: [SingleFeatureFuture<'_>; NUM_PAIRWISE_FEATURES] = [ //
-            Box::pin(wrap_with_progress( //
+        let pair_features_futures_list: [SingleFeatureFuture<'_>; NUM_PAIRWISE_FEATURES] = [
+            //
+            Box::pin(wrap_with_progress(
+                //
                 calculate_name_similarity(conn_ref, entity1, entity2), // Use conn_ref
                 pair_calc_tasks_completed_inner.clone(),
                 NUM_PAIRWISE_FEATURES,
-                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 0].name.clone(),
+                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 0]
+                    .name
+                    .clone(),
                 pair_context.clone(), // Uses the moved pair_context
                 LogLevel::Debug,
             )),
-            Box::pin(wrap_with_progress( //
-                calculate_embedding_similarity(conn_ref, entity1, entity2, device_for_pair_calc.clone()), // Use conn_ref
+            Box::pin(wrap_with_progress(
+                //
+                calculate_embedding_similarity(
+                    conn_ref,
+                    entity1,
+                    entity2,
+                    device_for_pair_calc.clone(),
+                ), // Use conn_ref
                 pair_calc_tasks_completed_inner.clone(),
                 NUM_PAIRWISE_FEATURES,
-                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 1].name.clone(),
+                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 1]
+                    .name
+                    .clone(),
                 pair_context.clone(),
                 LogLevel::Debug,
             )),
-            Box::pin(wrap_with_progress( //
-                calculate_max_service_similarity(conn_ref, entity1, entity2, device_for_pair_calc.clone()), // Use conn_ref
+            Box::pin(wrap_with_progress(
+                //
+                calculate_max_service_similarity(
+                    conn_ref,
+                    entity1,
+                    entity2,
+                    device_for_pair_calc.clone(),
+                ), // Use conn_ref
                 pair_calc_tasks_completed_inner.clone(),
                 NUM_PAIRWISE_FEATURES,
-                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 2].name.clone(),
+                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 2]
+                    .name
+                    .clone(),
                 pair_context.clone(),
                 LogLevel::Debug,
             )),
-            Box::pin(wrap_with_progress( //
+            Box::pin(wrap_with_progress(
+                //
                 calculate_geographic_distance(conn_ref, entity1, entity2), // Use conn_ref
                 pair_calc_tasks_completed_inner.clone(),
                 NUM_PAIRWISE_FEATURES,
-                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 3].name.clone(),
+                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 3]
+                    .name
+                    .clone(),
                 pair_context.clone(),
                 LogLevel::Debug,
             )),
-            Box::pin(wrap_with_progress( //
+            Box::pin(wrap_with_progress(
+                //
                 check_shared_domain(conn_ref, entity1, entity2), // Use conn_ref
                 pair_calc_tasks_completed_inner.clone(),
                 NUM_PAIRWISE_FEATURES,
-                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 4].name.clone(),
+                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 4]
+                    .name
+                    .clone(),
                 pair_context.clone(),
                 LogLevel::Debug,
             )),
-            Box::pin(wrap_with_progress( //
+            Box::pin(wrap_with_progress(
+                //
                 check_shared_phone(conn_ref, entity1, entity2), // Use conn_ref
                 pair_calc_tasks_completed_inner.clone(),
                 NUM_PAIRWISE_FEATURES,
-                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 5].name.clone(),
+                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 5]
+                    .name
+                    .clone(),
                 pair_context.clone(),
                 LogLevel::Debug,
             )),
-            Box::pin(wrap_with_progress( //
-                calculate_service_geo_semantic_score(conn_ref, entity1, entity2, device_for_pair_calc.clone()), // Use conn_ref
+            Box::pin(wrap_with_progress(
+                //
+                calculate_service_geo_semantic_score(
+                    conn_ref,
+                    entity1,
+                    entity2,
+                    device_for_pair_calc.clone(),
+                ), // Use conn_ref
                 pair_calc_tasks_completed_inner.clone(),
                 NUM_PAIRWISE_FEATURES,
-                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 6].name.clone(),
+                all_feature_metadata[PAIRWISE_METADATA_OFFSET + 6]
+                    .name
+                    .clone(),
                 pair_context.clone(),
                 LogLevel::Debug,
             )),
         ];
         let results = future::try_join_all(Vec::from(pair_features_futures_list)).await; //
-        if results.is_ok() { //
-            info!( //
+        if results.is_ok() {
+            //
+            info!(
+                //
                 "{} Completed calculation of {} pair-specific features.",
                 pair_context.clone(), // Uses the moved pair_context
                 NUM_PAIRWISE_FEATURES
             );
         } else {
-            warn!( //
+            warn!(
+                //
                 "{} Failed during calculation of some pair-specific features.",
                 pair_context.clone() // Uses the moved pair_context
             );
@@ -601,7 +644,8 @@ pub async fn extract_context_for_pair(
         results
     };
 
-    let pair_features_task_logged = wrap_with_progress( //
+    let pair_features_task_logged = wrap_with_progress(
+        //
         pair_features_calculation_task_inner,
         context_steps_completed.clone(),
         total_context_steps,
@@ -610,7 +654,8 @@ pub async fn extract_context_for_pair(
         LogLevel::Info,
     );
 
-    let (entity1_features_vec_res, entity2_features_vec_res, pair_features_vec_res) = tokio::join!( //
+    let (entity1_features_vec_res, entity2_features_vec_res, pair_features_vec_res) = tokio::join!(
+        //
         entity1_features_task,
         entity2_features_task,
         pair_features_task_logged
@@ -620,7 +665,8 @@ pub async fn extract_context_for_pair(
     let entity2_features_vec = entity2_features_vec_res?; //
     let pair_features_vec = pair_features_vec_res?; //
 
-    info!( //
+    info!(
+        //
         "{} Completed overall context assembly.",
         pair_context_for_outer_wrapper
     );
@@ -832,12 +878,12 @@ async fn extract_embedding_centroid_distance(
         entity_id.0
     );
     let org_embedding_row = conn.query_opt(
-        "SELECT o.embedding FROM organization o JOIN entity e ON e.organization_id = o.id WHERE e.id = $1 AND o.embedding IS NOT NULL",
+        "SELECT o.embedding FROM public.organization o JOIN public.entity e ON e.organization_id = o.id WHERE e.id = $1 AND o.embedding IS NOT NULL",
         &[&entity_id.0]
     ).await.context("DB query for org_embedding failed")?;
 
     let centroid_embedding_row = conn.query_opt(
-        "SELECT avg(embedding) as centroid_embedding FROM organization WHERE embedding IS NOT NULL", // pgvector can average embeddings
+        "SELECT avg(embedding) as centroid_embedding FROM public.organization WHERE embedding IS NOT NULL", // pgvector can average embeddings
         &[]
     ).await.context("DB query for centroid_embedding failed")?;
 
@@ -893,7 +939,7 @@ async fn extract_service_semantic_coherence(
         entity_id.0
     );
     let service_embeddings_rows = conn.query(
-        "SELECT s.embedding_v2 FROM service s JOIN entity_feature ef ON ef.table_id = s.id WHERE ef.entity_id = $1 AND ef.table_name = 'service' AND s.embedding_v2 IS NOT NULL",
+        "SELECT s.embedding_v2 FROM public.service s JOIN public.entity_feature ef ON ef.table_id = s.id WHERE ef.entity_id = $1 AND ef.table_name = 'service' AND s.embedding_v2 IS NOT NULL",
         &[&entity_id.0]
     ).await.context("DB query for service_embeddings failed")?;
 
@@ -953,8 +999,8 @@ async fn extract_embedding_quality_score(
             WHEN LENGTH(o.description) < 100 THEN 0.6
             ELSE 0.9
         END::DOUBLE PRECISION as embedding_quality
-        FROM entity e
-        JOIN organization o ON e.organization_id = o.id
+        FROM public.entity e
+        JOIN public.organization o ON e.organization_id = o.id
         WHERE e.id = $1",
             &[&entity_id.0],
         )
@@ -980,8 +1026,8 @@ async fn calculate_name_similarity(
     let row_opt = conn
         .query_opt(
             "SELECT similarity(LOWER(o1.name), LOWER(o2.name))::DOUBLE PRECISION as name_similarity
-         FROM entity e1 JOIN organization o1 ON e1.organization_id = o1.id,
-              entity e2 JOIN organization o2 ON e2.organization_id = o2.id
+         FROM public.entity e1 JOIN public.organization o1 ON e1.organization_id = o1.id,
+              public.entity e2 JOIN public.organization o2 ON e2.organization_id = o2.id
          WHERE e1.id = $1 AND e2.id = $2 AND o1.name IS NOT NULL AND o2.name IS NOT NULL",
             &[&entity1.0, &entity2.0],
         )
@@ -1010,8 +1056,8 @@ async fn calculate_embedding_similarity(
     let row_opt = conn
         .query_opt(
             "SELECT o1.embedding as emb1, o2.embedding as emb2
-         FROM entity e1 JOIN organization o1 ON e1.organization_id = o1.id,
-              entity e2 JOIN organization o2 ON e2.organization_id = o2.id
+         FROM public.entity e1 JOIN public.organization o1 ON e1.organization_id = o1.id,
+              public.entity e2 JOIN public.organization o2 ON e2.organization_id = o2.id
          WHERE e1.id = $1 AND e2.id = $2",
             &[&entity1.0, &entity2.0],
         )
@@ -1059,12 +1105,12 @@ async fn calculate_max_service_similarity(
         entity1.0, entity2.0
     );
     let services1_rows = conn.query(
-        "SELECT s.embedding_v2 FROM service s JOIN entity_feature ef ON ef.table_id = s.id WHERE ef.entity_id = $1 AND ef.table_name = 'service' AND s.embedding_v2 IS NOT NULL",
+        "SELECT s.embedding_v2 FROM public.service s JOIN public.entity_feature ef ON ef.table_id = s.id WHERE ef.entity_id = $1 AND ef.table_name = 'service' AND s.embedding_v2 IS NOT NULL",
         &[&entity1.0]
     ).await.context(format!("DB query for services of entity1 ({}) failed", entity1.0))?;
 
-let services2_rows = conn.query(
-        "SELECT s.embedding_v2 FROM service s JOIN entity_feature ef ON ef.table_id = s.id WHERE ef.entity_id = $1 AND ef.table_name = 'service' AND s.embedding_v2 IS NOT NULL", // Changed $2 to $1
+    let services2_rows = conn.query(
+        "SELECT s.embedding_v2 FROM public.service s JOIN public.entity_feature ef ON ef.table_id = s.id WHERE ef.entity_id = $1 AND ef.table_name = 'service' AND s.embedding_v2 IS NOT NULL", // Changed $2 to $1
         &[&entity2.0]
     ).await.context(format!("DB query for services of entity2 ({}) failed", entity2.0))?;
 
@@ -1132,8 +1178,8 @@ async fn calculate_geographic_distance(
         .query_one(
             "WITH loc_distances AS (
             SELECT ST_Distance(l1.geom, l2.geom) as distance
-            FROM location l1 JOIN entity_feature ef1 ON ef1.table_id = l1.id,
-                 location l2 JOIN entity_feature ef2 ON ef2.table_id = l2.id
+            FROM public.location l1 JOIN public.entity_feature ef1 ON ef1.table_id = l1.id,
+                 public.location l2 JOIN public.entity_feature ef2 ON ef2.table_id = l2.id
             WHERE ef1.entity_id = $1 AND ef1.table_name = 'location'
               AND ef2.entity_id = $2 AND ef2.table_name = 'location'
               AND l1.geom IS NOT NULL AND l2.geom IS NOT NULL
@@ -1166,8 +1212,8 @@ async fn check_shared_domain(
             "WITH domain_extract AS (
             SELECT regexp_replace(LOWER(o1.url), '^https?://(www\\.)?|/.*$', '', 'g') as domain1,
                    regexp_replace(LOWER(o2.url), '^https?://(www\\.)?|/.*$', '', 'g') as domain2
-            FROM entity e1 JOIN organization o1 ON e1.organization_id = o1.id,
-                 entity e2 JOIN organization o2 ON e2.organization_id = o2.id
+            FROM public.entity e1 JOIN public.organization o1 ON e1.organization_id = o1.id,
+                 public.entity e2 JOIN public.organization o2 ON e2.organization_id = o2.id
             WHERE e1.id = $1 AND e2.id = $2 AND o1.url IS NOT NULL AND o1.url <> ''
                                           AND o2.url IS NOT NULL AND o2.url <> ''
         )
@@ -1195,8 +1241,8 @@ async fn check_shared_phone(
 ) -> Result<f64> {
     let row = conn.query_one(
         "SELECT CASE WHEN EXISTS (
-            SELECT 1 FROM phone p1 JOIN entity_feature ef1 ON ef1.table_id = p1.id,
-                         phone p2 JOIN entity_feature ef2 ON ef2.table_id = p2.id
+            SELECT 1 FROM public.phone p1 JOIN public.entity_feature ef1 ON ef1.table_id = p1.id,
+                         public.phone p2 JOIN public.entity_feature ef2 ON ef2.table_id = p2.id
             WHERE ef1.entity_id = $1 AND ef1.table_name = 'phone'
               AND ef2.entity_id = $2 AND ef2.table_name = 'phone'
               AND regexp_replace(p1.number, '[^0-9]', '', 'g') = regexp_replace(p2.number, '[^0-9]', '', 'g')
@@ -1225,8 +1271,8 @@ async fn calculate_service_geo_semantic_score(
     // Fetch pairs of embeddings and their geo_distance
     let rows = conn.query(
         "SELECT s1.embedding_v2 as emb1, s2.embedding_v2 as emb2, ST_Distance(l1.geom, l2.geom) as geo_distance
-         FROM service s1 JOIN entity_feature ef1 ON ef1.table_id = s1.id JOIN service_at_location sal1 ON sal1.service_id = s1.id JOIN location l1 ON l1.id = sal1.location_id,
-              service s2 JOIN entity_feature ef2 ON ef2.table_id = s2.id JOIN service_at_location sal2 ON sal2.service_id = s2.id JOIN location l2 ON l2.id = sal2.location_id
+         FROM public.service s1 JOIN public.entity_feature ef1 ON ef1.table_id = s1.id JOIN public.service_at_location sal1 ON sal1.service_id = s1.id JOIN public.location l1 ON l1.id = sal1.location_id,
+              public.service s2 JOIN public.entity_feature ef2 ON ef2.table_id = s2.id JOIN public.service_at_location sal2 ON sal2.service_id = s2.id JOIN public.location l2 ON l2.id = sal2.location_id
          WHERE ef1.entity_id = $1 AND ef1.table_name = 'service' AND s1.embedding_v2 IS NOT NULL AND l1.geom IS NOT NULL
            AND ef2.entity_id = $2 AND ef2.table_name = 'service' AND s2.embedding_v2 IS NOT NULL AND l2.geom IS NOT NULL",
         &[&entity1.0, &entity2.0]
