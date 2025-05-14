@@ -1,4 +1,4 @@
-// components/GraphVisualization/NodeTooltip.tsx
+// components/EntityDetails/EntityDetailsCard.tsx
 import React from 'react';
 import { Entity, EntityDetails } from '../../lib/types';
 import { 
@@ -14,46 +14,33 @@ import {
   CircularProgress, 
   Box
 } from '@mui/material';
-import { styled } from '@mui/material/styles';
 import PlaceIcon from '@mui/icons-material/Place';
 import PhoneIcon from '@mui/icons-material/Phone';
 import LocationOnIcon from '@mui/icons-material/LocationOn';
 import LanguageIcon from '@mui/icons-material/Language';
 import MiscellaneousServicesIcon from '@mui/icons-material/MiscellaneousServices';
 
-interface NodeTooltipProps {
-  node: Entity;
-  position: { x: number; y: number };
+interface EntityDetailsCardProps {
+  entity: Entity;
   entityDetails: EntityDetails | undefined;
-  loading: boolean;
+  loading?: boolean;
+  title?: string;
+  elevation?: number;
 }
 
-const TooltipCard = styled(Card)(({ theme }) => ({
-  position: 'absolute',
-  zIndex: 1000,
-  maxWidth: 320,
-  boxShadow: theme.shadows[8],
-  border: `1px solid ${theme.palette.divider}`,
-  borderRadius: theme.shape.borderRadius,
-}));
-
-const NodeTooltip: React.FC<NodeTooltipProps> = ({ 
-  node, 
-  position, 
+const EntityDetailsCard: React.FC<EntityDetailsCardProps> = ({ 
+  entity, 
   entityDetails, 
-  loading 
+  loading = false,
+  title,
+  elevation = 1
 }) => {
-  if (!node) return null;
+  if (!entity) return null;
   
   return (
-    <TooltipCard
-      sx={{
-        left: position.x + 10, 
-        top: position.y + 10,
-      }}
-    >
+    <Card elevation={elevation}>
       <CardHeader
-        title={node.name}
+        title={title || entity.name}
         titleTypographyProps={{ variant: 'h6' }}
         sx={{ pb: 1 }}
       />
@@ -205,8 +192,8 @@ const NodeTooltip: React.FC<NodeTooltipProps> = ({
           </Typography>
         )}
       </CardContent>
-    </TooltipCard>
+    </Card>
   );
 };
 
-export default NodeTooltip;
+export default EntityDetailsCard;
