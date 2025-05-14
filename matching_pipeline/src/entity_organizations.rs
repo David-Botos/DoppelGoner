@@ -30,7 +30,7 @@ pub async fn extract_entities(pool: &PgPool) -> Result<Vec<Entity>> {
 
     // First, get all existing entities to avoid duplicates
     let existing_rows = conn
-        .query("SELECT id, organization_id FROM entity", &[])
+        .query("SELECT id, organization_id FROM public.entity", &[])
         .await
         .context("Failed to query existing entities")?;
 
@@ -58,7 +58,7 @@ pub async fn extract_entities(pool: &PgPool) -> Result<Vec<Entity>> {
 
     // Query the organization table to get all organizations
     let org_rows = conn
-        .query("SELECT id, name FROM organization", &[])
+        .query("SELECT id, name FROM public.organization", &[])
         .await
         .context("Failed to query organization table")?;
 
@@ -209,7 +209,7 @@ pub async fn link_entity_features(pool: &PgPool, entities: &[Entity]) -> Result<
     // First, get all existing entity_feature records to avoid duplicates
     let existing_rows = conn
         .query(
-            "SELECT entity_id, table_name, table_id FROM entity_feature",
+            "SELECT entity_id, table_name, table_id FROM public.entity_feature",
             &[],
         )
         .await
@@ -238,7 +238,7 @@ pub async fn link_entity_features(pool: &PgPool, entities: &[Entity]) -> Result<
     info!("Linking services to entities...");
     let service_rows = conn
         .query(
-            "SELECT id, organization_id FROM service WHERE organization_id IS NOT NULL",
+            "SELECT id, organization_id FROM public.service WHERE organization_id IS NOT NULL",
             &[],
         )
         .await
@@ -271,18 +271,192 @@ pub async fn link_entity_features(pool: &PgPool, entities: &[Entity]) -> Result<
         }
     }
 
-    // 2. Link phones
-    info!("Linking phones to entities...");
-    let phone_rows = conn
-        .query(
-            "SELECT id, organization_id FROM phone WHERE organization_id IS NOT NULL",
-            &[],
-        )
-        .await
-        .context("Failed to query phones")?;
+    // 2. Link phones with all possible paths
+    info!("Linking phones to entities with all relationship paths...");
 
-    for row in &phone_rows {
+    // 2.1 Direct organization_id relationship
+    let direct_phone_query = "
+        SELECT id, organization_id 
+        FROM public.phone 
+        WHERE organization_id IS NOT NULL";
+
+    let direct_phone_rows = conn
+        .query(direct_phone_query, &[])
+        .await
+        .context("Failed to query phones with direct organization relationship")?;
+
+    for row in &direct_phone_rows {
         let phone_id: String = row.get("id");
+        let org_id: String = row.get("organization_id");
+
+        if let Some(entity_id) = org_to_entity.get(&org_id) {
+            let table_name = "phone".to_string();
+
+            // Skip if this feature already exists
+            if existing_features.contains(&(
+                entity_id.clone(),
+                table_name.clone(),
+                phone_id.clone(),
+            )) {
+                continue;
+            }
+
+            let feature = EntityFeature {
+                id: Uuid::new_v4().to_string(),
+                entity_id: EntityId(entity_id.clone()),
+                table_name,
+                table_id: phone_id,
+                created_at: now,
+            };
+            new_features.push(feature);
+        }
+    }
+
+    // 2.2 phone -> service -> organization relationship
+    let service_phone_query = "
+        SELECT p.id as phone_id, s.organization_id
+        FROM public.phone p
+        JOIN public.service s ON p.service_id = s.id
+        WHERE p.service_id IS NOT NULL 
+        AND s.organization_id IS NOT NULL
+        AND p.organization_id IS NULL"; // Only get phones not directly linked
+
+    let service_phone_rows = conn
+        .query(service_phone_query, &[])
+        .await
+        .context("Failed to query phones linked via service")?;
+
+    for row in &service_phone_rows {
+        let phone_id: String = row.get("phone_id");
+        let org_id: String = row.get("organization_id");
+
+        if let Some(entity_id) = org_to_entity.get(&org_id) {
+            let table_name = "phone".to_string();
+
+            // Skip if this feature already exists
+            if existing_features.contains(&(
+                entity_id.clone(),
+                table_name.clone(),
+                phone_id.clone(),
+            )) {
+                continue;
+            }
+
+            let feature = EntityFeature {
+                id: Uuid::new_v4().to_string(),
+                entity_id: EntityId(entity_id.clone()),
+                table_name,
+                table_id: phone_id,
+                created_at: now,
+            };
+            new_features.push(feature);
+        }
+    }
+
+    // 2.3 phone -> service_at_location -> service -> organization relationship
+    let sal_service_phone_query = "
+        SELECT p.id as phone_id, s.organization_id
+        FROM public.phone p
+        JOIN public.service_at_location sal ON p.service_at_location_id = sal.id
+        JOIN public.service s ON sal.service_id = s.id
+        WHERE p.service_at_location_id IS NOT NULL 
+        AND s.organization_id IS NOT NULL
+        AND p.organization_id IS NULL
+        AND p.service_id IS NULL"; // Only get phones not already linked
+
+    let sal_service_phone_rows = conn
+        .query(sal_service_phone_query, &[])
+        .await
+        .context("Failed to query phones linked via service_at_location->service")?;
+
+    for row in &sal_service_phone_rows {
+        let phone_id: String = row.get("phone_id");
+        let org_id: String = row.get("organization_id");
+
+        if let Some(entity_id) = org_to_entity.get(&org_id) {
+            let table_name = "phone".to_string();
+
+            // Skip if this feature already exists
+            if existing_features.contains(&(
+                entity_id.clone(),
+                table_name.clone(),
+                phone_id.clone(),
+            )) {
+                continue;
+            }
+
+            let feature = EntityFeature {
+                id: Uuid::new_v4().to_string(),
+                entity_id: EntityId(entity_id.clone()),
+                table_name,
+                table_id: phone_id,
+                created_at: now,
+            };
+            new_features.push(feature);
+        }
+    }
+
+    // 2.4 phone -> service_at_location -> location -> organization relationship
+    let sal_location_phone_query = "
+        SELECT p.id as phone_id, l.organization_id
+        FROM public.phone p
+        JOIN public.service_at_location sal ON p.service_at_location_id = sal.id
+        JOIN public.location l ON sal.location_id = l.id
+        WHERE p.service_at_location_id IS NOT NULL 
+        AND l.organization_id IS NOT NULL
+        AND p.organization_id IS NULL
+        AND p.service_id IS NULL"; // Only get phones not already linked
+
+    let sal_location_phone_rows = conn
+        .query(sal_location_phone_query, &[])
+        .await
+        .context("Failed to query phones linked via service_at_location->location")?;
+
+    for row in &sal_location_phone_rows {
+        let phone_id: String = row.get("phone_id");
+        let org_id: String = row.get("organization_id");
+
+        if let Some(entity_id) = org_to_entity.get(&org_id) {
+            let table_name = "phone".to_string();
+
+            // Skip if this feature already exists
+            if existing_features.contains(&(
+                entity_id.clone(),
+                table_name.clone(),
+                phone_id.clone(),
+            )) {
+                continue;
+            }
+
+            let feature = EntityFeature {
+                id: Uuid::new_v4().to_string(),
+                entity_id: EntityId(entity_id.clone()),
+                table_name,
+                table_id: phone_id,
+                created_at: now,
+            };
+            new_features.push(feature);
+        }
+    }
+
+    // 2.5 phone -> contact -> organization relationship
+    let contact_phone_query = "
+        SELECT p.id as phone_id, c.organization_id
+        FROM public.phone p
+        JOIN public.contact c ON p.contact_id = c.id
+        WHERE p.contact_id IS NOT NULL 
+        AND c.organization_id IS NOT NULL
+        AND p.organization_id IS NULL
+        AND p.service_id IS NULL
+        AND p.service_at_location_id IS NULL"; // Only get phones not already linked
+
+    let contact_phone_rows = conn
+        .query(contact_phone_query, &[])
+        .await
+        .context("Failed to query phones linked via contact")?;
+
+    for row in &contact_phone_rows {
+        let phone_id: String = row.get("phone_id");
         let org_id: String = row.get("organization_id");
 
         if let Some(entity_id) = org_to_entity.get(&org_id) {
@@ -312,7 +486,7 @@ pub async fn link_entity_features(pool: &PgPool, entities: &[Entity]) -> Result<
     info!("Linking locations to entities...");
     let location_rows = conn
         .query(
-            "SELECT id, organization_id FROM location WHERE organization_id IS NOT NULL",
+            "SELECT id, organization_id FROM public.location WHERE organization_id IS NOT NULL",
             &[],
         )
         .await
@@ -349,7 +523,7 @@ pub async fn link_entity_features(pool: &PgPool, entities: &[Entity]) -> Result<
     info!("Linking contacts to entities...");
     let contact_rows = conn
         .query(
-            "SELECT id, organization_id FROM contact WHERE organization_id IS NOT NULL",
+            "SELECT id, organization_id FROM public.contact WHERE organization_id IS NOT NULL",
             &[],
         )
         .await
@@ -451,6 +625,148 @@ pub async fn link_entity_features(pool: &PgPool, entities: &[Entity]) -> Result<
 
     // Return the total number of features (existing + new)
     Ok(existing_features.len() + inserted)
+}
+
+/// Updates existing entities with new features that have been added since the
+/// last time features were linked. This ensures all entities have complete
+/// feature sets even as the database changes over time.
+///
+/// This involves:
+/// 1. Finding all features (services, phones, locations, contacts) that reference
+///    organizations with existing entities but don't yet have entity_feature links
+/// 2. Creating entity_feature records for these new features
+/// 3. Efficiently inserting them in a single database operation
+pub async fn update_entity_features(pool: &PgPool) -> Result<usize> {
+    info!("Updating entity features for existing entities...");
+
+    let conn = pool.get().await.context("Failed to get DB connection")?;
+
+    // The SQL query has been expanded to include all the indirect paths
+    info!("Finding and inserting new features for existing entities...");
+    let result = conn
+        .execute(
+            "
+            INSERT INTO public.entity_feature (id, entity_id, table_name, table_id, created_at)
+            SELECT 
+                gen_random_uuid()::text, 
+                entity_id, 
+                table_name, 
+                table_id, 
+                NOW() 
+            FROM (
+                -- Find new services not yet linked to their entities
+                SELECT 'service' as table_name, s.id as table_id, e.id as entity_id
+                FROM public.service s
+                JOIN public.entity e ON s.organization_id = e.organization_id
+                LEFT JOIN public.entity_feature ef ON ef.entity_id = e.id 
+                    AND ef.table_name = 'service' AND ef.table_id = s.id
+                WHERE ef.id IS NULL AND s.organization_id IS NOT NULL
+
+                UNION ALL
+
+                -- Direct path: organization_id directly on phone
+                SELECT 'phone' as table_name, p.id as table_id, e.id as entity_id
+                FROM public.phone p
+                JOIN public.entity e ON p.organization_id = e.organization_id
+                LEFT JOIN public.entity_feature ef ON ef.entity_id = e.id 
+                    AND ef.table_name = 'phone' AND ef.table_id = p.id
+                WHERE ef.id IS NULL AND p.organization_id IS NOT NULL
+
+                UNION ALL
+
+                -- Path: phone -> service -> organization
+                SELECT 'phone' as table_name, p.id as table_id, e.id as entity_id
+                FROM public.phone p
+                JOIN public.service s ON p.service_id = s.id
+                JOIN public.entity e ON s.organization_id = e.organization_id
+                LEFT JOIN public.entity_feature ef ON ef.entity_id = e.id 
+                    AND ef.table_name = 'phone' AND ef.table_id = p.id
+                WHERE ef.id IS NULL 
+                  AND p.service_id IS NOT NULL
+                  AND s.organization_id IS NOT NULL
+                  AND p.organization_id IS NULL
+
+                UNION ALL
+
+                -- Path: phone -> service_at_location -> service -> organization
+                SELECT 'phone' as table_name, p.id as table_id, e.id as entity_id
+                FROM public.phone p
+                JOIN public.service_at_location sal ON p.service_at_location_id = sal.id
+                JOIN public.service s ON sal.service_id = s.id
+                JOIN public.entity e ON s.organization_id = e.organization_id
+                LEFT JOIN public.entity_feature ef ON ef.entity_id = e.id 
+                    AND ef.table_name = 'phone' AND ef.table_id = p.id
+                WHERE ef.id IS NULL 
+                  AND p.service_at_location_id IS NOT NULL
+                  AND s.organization_id IS NOT NULL
+                  AND p.organization_id IS NULL
+                  AND p.service_id IS NULL
+
+                UNION ALL
+
+                -- Path: phone -> service_at_location -> location -> organization
+                SELECT 'phone' as table_name, p.id as table_id, e.id as entity_id
+                FROM public.phone p
+                JOIN public.service_at_location sal ON p.service_at_location_id = sal.id
+                JOIN public.location l ON sal.location_id = l.id
+                JOIN public.entity e ON l.organization_id = e.organization_id
+                LEFT JOIN public.entity_feature ef ON ef.entity_id = e.id 
+                    AND ef.table_name = 'phone' AND ef.table_id = p.id
+                WHERE ef.id IS NULL 
+                  AND p.service_at_location_id IS NOT NULL
+                  AND l.organization_id IS NOT NULL
+                  AND p.organization_id IS NULL
+                  AND p.service_id IS NULL
+
+                UNION ALL
+
+                -- Path: phone -> contact -> organization
+                SELECT 'phone' as table_name, p.id as table_id, e.id as entity_id
+                FROM public.phone p
+                JOIN public.contact c ON p.contact_id = c.id
+                JOIN public.entity e ON c.organization_id = e.organization_id
+                LEFT JOIN public.entity_feature ef ON ef.entity_id = e.id 
+                    AND ef.table_name = 'phone' AND ef.table_id = p.id
+                WHERE ef.id IS NULL 
+                  AND p.contact_id IS NOT NULL
+                  AND c.organization_id IS NOT NULL
+                  AND p.organization_id IS NULL
+                  AND p.service_id IS NULL
+                  AND p.service_at_location_id IS NULL
+
+                UNION ALL
+
+                -- Find new locations not yet linked to their entities
+                SELECT 'location' as table_name, l.id as table_id, e.id as entity_id
+                FROM public.location l
+                JOIN public.entity e ON l.organization_id = e.organization_id
+                LEFT JOIN public.entity_feature ef ON ef.entity_id = e.id 
+                    AND ef.table_name = 'location' AND ef.table_id = l.id
+                WHERE ef.id IS NULL AND l.organization_id IS NOT NULL
+
+                UNION ALL
+
+                -- Find new contacts not yet linked to their entities
+                SELECT 'contact' as table_name, c.id as table_id, e.id as entity_id
+                FROM public.contact c
+                JOIN public.entity e ON c.organization_id = e.organization_id
+                LEFT JOIN public.entity_feature ef ON ef.entity_id = e.id 
+                    AND ef.table_name = 'contact' AND ef.table_id = c.id
+                WHERE ef.id IS NULL AND c.organization_id IS NOT NULL
+            ) as new_features
+            ",
+            &[],
+        )
+        .await
+        .context("Failed to insert new features")?;
+
+    let inserted = result as usize;
+    info!(
+        "Inserted {} new entity features into the database",
+        inserted
+    );
+
+    Ok(inserted)
 }
 
 /// Extracts and stores context features for all identified entities in PARALLEL.
