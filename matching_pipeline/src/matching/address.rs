@@ -26,8 +26,8 @@ use serde_json;
 // SQL query for inserting into entity_group
 const INSERT_ENTITY_GROUP_SQL: &str = "
     INSERT INTO public.entity_group
-    (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, created_at, updated_at, version)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)";
+    (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, pre_rl_confidence_score, created_at, updated_at, version)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1)";
 
 pub async fn find_matches(
     pool: &PgPool,
@@ -90,10 +90,10 @@ pub async fn find_matches(
             a.postal_code,
             a.country
         FROM
-            entity e
-            JOIN entity_feature ef ON e.id = ef.entity_id
-            JOIN location l ON ef.table_id = l.id AND ef.table_name = 'location'
-            JOIN address a ON a.location_id = l.id
+            public.entity e
+            JOIN public.entity_feature ef ON e.id = ef.entity_id
+            JOIN public.location l ON ef.table_id = l.id AND ef.table_name = 'location'
+            JOIN public.address a ON a.location_id = l.id
         WHERE
             a.address_1 IS NOT NULL AND a.address_1 != ''
             AND a.city IS NOT NULL AND a.city != ''
@@ -195,6 +195,20 @@ pub async fn find_matches(
                 let mut predicted_method_type_from_ml = MatchMethodType::Address;
                 let mut features_for_logging: Option<Vec<f64>> = None;
 
+                // Check if units are different
+                let unit1 = extract_unit(e1_orig_addr);
+                let unit2 = extract_unit(e2_orig_addr);
+                let has_different_units = !unit1.is_empty() && !unit2.is_empty() && unit1 != unit2;
+
+                if has_different_units {
+                    // Apply confidence penalty for different suites/units in the same building
+                    final_confidence_score *= 0.85;
+                    debug!(
+                        "Applied unit difference penalty for pair ({}, {}) with units '{}' and '{}'", 
+                        e1_id.0, e2_id.0, unit1, unit2
+                    );
+                }
+
                 if let Some(orchestrator_mutex) = reinforcement_orchestrator {
                     // Assuming extract_pair_context can use a non-transactional pool or connection reference
                     match MatchingOrchestrator::extract_pair_context(pool, e1_id, e2_id).await {
@@ -244,6 +258,7 @@ pub async fn find_matches(
                             &MatchMethodType::Address.as_str(),
                             &match_values_json,
                             &final_confidence_score,
+                            &(pre_rl_score.unwrap_or(1.0) as f64), // Convert the Option<f32> to f64
                             &now,
                             &now,
                         ],
@@ -500,4 +515,59 @@ fn normalize_address(address: &str) -> String {
         .join(" ")
         .trim()
         .to_string()
+}
+
+/// Extract unit or suite information from an address
+/// Returns the extracted unit/suite or an empty string if none is found
+fn extract_unit(address: &str) -> String {
+    let lower = address.to_lowercase();
+
+    // Common unit designators
+    let unit_patterns = [
+        "apt",
+        "apartment",
+        "suite",
+        "ste",
+        "unit",
+        "#",
+        "bldg",
+        "building",
+        "fl",
+        "floor",
+        "room",
+        "rm",
+    ];
+
+    for pattern in unit_patterns {
+        if let Some(idx) = lower.find(pattern) {
+            // Get text after the pattern
+            let after_pattern = &lower[idx..];
+
+            // Find the end of the unit designator (next comma or end of string)
+            if let Some(end_idx) = after_pattern.find(|c: char| c == ',' || c == ';') {
+                return after_pattern[0..end_idx].trim().to_string();
+            } else {
+                // Look for next whitespace after a non-whitespace
+                let mut found_non_space = false;
+                let mut end_idx = 0;
+
+                for (i, c) in after_pattern.char_indices() {
+                    if !c.is_whitespace() {
+                        found_non_space = true;
+                    } else if found_non_space {
+                        end_idx = i;
+                        break;
+                    }
+                }
+
+                if end_idx > 0 {
+                    return after_pattern[0..end_idx].trim().to_string();
+                } else {
+                    return after_pattern.trim().to_string();
+                }
+            }
+        }
+    }
+
+    String::new() // No unit found
 }

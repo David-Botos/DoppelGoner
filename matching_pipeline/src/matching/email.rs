@@ -32,6 +32,7 @@ async fn insert_single_entity_group_pair(
     method_type: &MatchMethodType,
     match_values: &MatchValues,
     confidence_score: f64,
+    pre_rl_confidence_score: f64, // Add the new parameter
 ) -> Result<EntityGroupId> {
     let mut conn = pool
         .get()
@@ -49,8 +50,8 @@ async fn insert_single_entity_group_pair(
 
     let insert_query = "
         INSERT INTO public.entity_group
-        (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, created_at, updated_at, version)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
+        (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, pre_rl_confidence_score, created_at, updated_at, version)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1)
     ";
 
     match tx
@@ -63,8 +64,9 @@ async fn insert_single_entity_group_pair(
                 &method_type.as_str(),
                 &match_values_json,
                 &confidence_score,
-                &now, // created_at
-                &now, // updated_at
+                &pre_rl_confidence_score, // Add the pre-RL confidence score
+                &now,                     // created_at
+                &now,                     // updated_at
             ],
         )
         .await
@@ -156,9 +158,9 @@ pub async fn find_matches(
         WHERE o.email IS NOT NULL AND o.email != ''
         UNION ALL
         SELECT 'service' as source, e.id as entity_id, s.email, s.name as entity_name
-        FROM entity e
-        JOIN entity_feature ef ON e.id = ef.entity_id
-        JOIN service s ON ef.table_id = s.id AND ef.table_name = 'service'
+        FROM public.entity e
+        JOIN public.entity_feature ef ON e.id = ef.entity_id
+        JOIN public.service s ON ef.table_id = s.id AND ef.table_name = 'service'
         WHERE s.email IS NOT NULL AND s.email != ''
     ";
     debug!("Executing email query for all entities...");
@@ -192,6 +194,17 @@ pub async fn find_matches(
     let mut entities_in_new_pairs: HashSet<EntityId> = HashSet::new();
     let mut confidence_scores_for_stats: Vec<f64> = Vec::new();
     let mut individual_transaction_errors = 0;
+
+    let mut email_frequency: HashMap<String, usize> = HashMap::new();
+    for (normalized_email, entities) in &email_map {
+        let count = entities.len();
+        email_frequency.insert(normalized_email.clone(), count);
+    }
+
+    info!(
+        "Calculated frequency for {} normalized emails",
+        email_frequency.len()
+    );
 
     for (normalized_shared_email, current_entity_map) in email_map {
         if current_entity_map.len() < 2 {
@@ -234,6 +247,38 @@ pub async fn find_matches(
                 let mut predicted_method_type_from_ml = MatchMethodType::Email;
                 let mut features_for_logging: Option<Vec<f64>> = None;
 
+                // Apply penalties for generic emails
+                if is_generic_organizational_email(&normalized_shared_email) {
+                    final_confidence_score *= 0.9;
+                    debug!(
+                        "Applied generic email penalty for pair ({}, {}) with email '{}'",
+                        e1_id.0, e2_id.0, normalized_shared_email
+                    );
+                }
+
+                // Apply weighting based on email rarity
+                let email_count = email_frequency
+                    .get(&normalized_shared_email)
+                    .cloned()
+                    .unwrap_or(1);
+                if email_count > 10 {
+                    // Significantly reduce confidence for very common emails (used by many entities)
+                    final_confidence_score *= 0.85;
+                    debug!(
+                        "Applied high frequency penalty for pair ({}, {}) with email '{}' used by {} entities", 
+                        e1_id.0, e2_id.0, normalized_shared_email, email_count
+                    );
+                } else if email_count > 5 {
+                    // Moderately reduce confidence for common emails
+                    final_confidence_score *= 0.92;
+                    debug!(
+                        "Applied moderate frequency penalty for pair ({}, {}) with email '{}' used by {} entities", 
+                        e1_id.0, e2_id.0, normalized_shared_email, email_count
+                    );
+                }
+
+                let pre_rl_confidence_score = final_confidence_score;
+
                 if let Some(orchestrator_mutex) = reinforcement_orchestrator {
                     match MatchingOrchestrator::extract_pair_context(pool, e1_id, e2_id).await {
                         Ok(features) => {
@@ -270,6 +315,7 @@ pub async fn find_matches(
                     &MatchMethodType::Email,
                     &match_values,
                     final_confidence_score,
+                    pre_rl_confidence_score,
                 )
                 .await
                 {
@@ -451,4 +497,15 @@ fn normalize_email(email: &str) -> String {
         return String::new();
     }
     format!("{}@{}", final_local_part, final_domain_part)
+}
+
+/// Detect if an email is a generic organizational email
+/// Returns true if the email starts with a common generic prefix
+fn is_generic_organizational_email(email: &str) -> bool {
+    // Conservative list of generic prefixes
+    let generic_prefixes = ["info@", "contact@", "office@", "admin@"];
+
+    generic_prefixes
+        .iter()
+        .any(|prefix| email.starts_with(prefix))
 }

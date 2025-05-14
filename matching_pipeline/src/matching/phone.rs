@@ -19,8 +19,8 @@ use crate::results::{AnyMatchResult, MatchMethodStats, PhoneMatchResult};
 // SQL query for inserting into entity_group
 const INSERT_ENTITY_GROUP_SQL: &str = "
     INSERT INTO public.entity_group
-    (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, created_at, updated_at, version)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)";
+    (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, pre_rl_confidence_score, created_at, updated_at, version)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1)";
 
 pub async fn find_matches(
     pool: &PgPool,
@@ -72,9 +72,9 @@ pub async fn find_matches(
     // 2. Fetch Phone Data for all entities
     let phone_query = "
         SELECT e.id as entity_id, p.number, p.extension
-        FROM entity e
-        JOIN entity_feature ef ON e.id = ef.entity_id
-        JOIN phone p ON ef.table_id = p.id AND ef.table_name = 'phone'
+        FROM public.entity e
+        JOIN public.entity_feature ef ON e.id = ef.entity_id
+        JOIN public.phone p ON ef.table_id = p.id AND ef.table_name = 'phone'
         WHERE p.number IS NOT NULL AND p.number != ''
     ";
     debug!("Executing phone query for all entities...");
@@ -170,6 +170,10 @@ pub async fn find_matches(
                 let mut predicted_method_type_from_ml = MatchMethodType::Phone;
                 let mut features_for_logging: Option<Vec<f64>> = None;
 
+                // put any penalties or bonuses here
+
+                let pre_rl_confidence = final_confidence_score;
+
                 if let Some(orchestrator_mutex) = reinforcement_orchestrator {
                     match MatchingOrchestrator::extract_pair_context(pool, e1_id, e2_id).await {
                         // Pass pool
@@ -221,6 +225,7 @@ pub async fn find_matches(
                             &MatchMethodType::Phone.as_str(),
                             &match_values_json,
                             &final_confidence_score,
+                            &pre_rl_confidence,
                             &now,
                             &now,
                         ],

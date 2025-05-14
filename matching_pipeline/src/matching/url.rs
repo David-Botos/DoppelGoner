@@ -11,18 +11,31 @@ use uuid::Uuid;
 use crate::config;
 use crate::db::{self, PgPool};
 use crate::models::{
-    ActionType, EntityGroupId, EntityId, MatchMethodType, MatchValues, NewSuggestedAction,
-    SuggestionStatus, UrlMatchValue,
+    ActionType,
+    EntityGroupId,
+    EntityId,
+    MatchMethodType,
+    MatchValues,
+    NewSuggestedAction,
+    SuggestionStatus,
+    UrlMatchValue, // Assuming UrlMatchValue in models.rs is updated to include matching_slug_count: Option<usize>
 };
 use crate::reinforcement::{self, MatchingOrchestrator};
-use crate::results::{AnyMatchResult, MatchMethodStats, UrlMatchResult}; // Removed PairMlResult as it's not used
+use crate::results::{AnyMatchResult, MatchMethodStats, UrlMatchResult};
 use serde_json;
 
 // SQL query for inserting into entity_group
 const INSERT_ENTITY_GROUP_SQL: &str = "
     INSERT INTO public.entity_group
-    (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, created_at, updated_at, version)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)";
+    (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, pre_rl_confidence_score, created_at, updated_at, version)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1)";
+
+// Confidence score tiers for URL matching
+const CONFIDENCE_DOMAIN_ONLY: f64 = 0.70; // Base match on just the domain
+const CONFIDENCE_DOMAIN_PLUS_ONE_SLUG: f64 = 0.80;
+const CONFIDENCE_DOMAIN_PLUS_TWO_SLUGS: f64 = 0.88;
+const CONFIDENCE_DOMAIN_PLUS_THREE_OR_MORE_SLUGS: f64 = 0.92; // For 3 or more matching slugs but not full path
+const CONFIDENCE_DOMAIN_FULL_PATH_MATCH: f64 = 0.96; // Domain and full path match
 
 /// List of common social media and URL shortening domains to ignore.
 fn is_ignored_domain(domain: &str) -> bool {
@@ -35,8 +48,7 @@ fn is_ignored_domain(domain: &str) -> bool {
         "instagram.com",
         "threads.net",
         "linkedin.com",
-        // Simplified youtube - consider more robust checking if subdomains like music.youtube.com are relevant
-        "youtube.com", // Covers www.youtube.com, m.youtube.com etc. after normalization
+        "youtube.com",
         "youtu.be",
         "tiktok.com",
         "bit.ly",
@@ -61,8 +73,7 @@ fn is_ignored_domain(domain: &str) -> bool {
         "discord.com",
         "discord.gg",
         "twitch.tv",
-        "googleusercontent.com", // Catch-all for user content
-        // Add other generic platform domains if necessary
+        "googleusercontent.com",
         "forms.gle",
         "docs.google.com",
         "drive.google.com",
@@ -86,9 +97,9 @@ fn is_ignored_domain(domain: &str) -> bool {
         .any(|&ignored| domain == ignored || domain.ends_with(&format!(".{}", ignored)))
 }
 
-/// Normalize a URL by extracting and cleaning the domain.
-/// Returns Option<(normalized_domain, original_url_str_if_valid_host)>
-fn normalize_url(url_str: &str) -> Option<(String, String)> {
+/// Normalize a URL, extract the domain and path slugs.
+/// Returns Option<(normalized_domain_str, path_slugs_vec, original_url_str)>
+fn normalize_url_with_slugs(url_str: &str) -> Option<(String, Vec<String>, String)> {
     let trimmed_url = url_str.trim();
     if trimmed_url.is_empty()
         || trimmed_url.starts_with("mailto:")
@@ -98,7 +109,6 @@ fn normalize_url(url_str: &str) -> Option<(String, String)> {
         return None;
     }
 
-    // Prepend scheme if missing, default to https for robust parsing
     let url_with_scheme = if !trimmed_url.contains("://") {
         format!("https://{}", trimmed_url)
     } else {
@@ -107,46 +117,59 @@ fn normalize_url(url_str: &str) -> Option<(String, String)> {
 
     match StdUrl::parse(&url_with_scheme) {
         Ok(parsed_url) => {
-            parsed_url.host_str().and_then(|host| {
+            let domain_opt = parsed_url.host_str().and_then(|host| {
                 let host_lower = host.to_lowercase();
-                // Remove www. prefix
                 let domain_candidate = host_lower.trim_start_matches("www.").to_string();
-
-                // Basic validation: must contain a dot, not be empty, and not be an IP address
                 if domain_candidate.is_empty()
                     || !domain_candidate.contains('.')
                     || is_ip_address(&domain_candidate)
                 {
                     None
                 } else {
-                    Some((domain_candidate, url_str.to_string())) // Return original URL for UrlMatchValue
+                    Some(domain_candidate)
                 }
+            });
+
+            domain_opt.map(|domain| {
+                let path_slugs: Vec<String> =
+                    parsed_url
+                        .path_segments()
+                        .map_or_else(Vec::new, |segments| {
+                            segments
+                                .filter(|s| !s.is_empty()) // Filter out empty segments (e.g. from trailing slashes)
+                                .map(str::to_string)
+                                .collect()
+                        });
+                (domain, path_slugs, url_str.to_string())
             })
         }
         Err(parse_err) => {
-            warn!("Failed to parse URL '{}' with scheme '{}' using 'url' crate: {}. Falling back to basic extraction.", url_str, url_with_scheme, parse_err);
-            // Fallback for URLs the `url` crate struggles with, but try to be stricter
+            warn!(
+                "Failed to parse URL '{}' with scheme '{}' using 'url' crate: {}. Falling back to basic extraction for domain only.",
+                url_str, url_with_scheme, parse_err
+            );
+            // Fallback for domain, slugs might be harder to get reliably here
             let without_scheme_or_auth = trimmed_url
                 .split("://")
                 .nth(1)
-                .unwrap_or(trimmed_url) // Remove scheme if present
+                .unwrap_or(trimmed_url)
                 .split('@')
                 .nth(1)
-                .unwrap_or_else(|| trimmed_url.split("://").nth(1).unwrap_or(trimmed_url)); // Remove user:pass@ if present
+                .unwrap_or_else(|| trimmed_url.split("://").nth(1).unwrap_or(trimmed_url));
 
             let domain_part = without_scheme_or_auth
                 .split('/')
                 .next()
-                .unwrap_or("") // Get part before first '/'
+                .unwrap_or("")
                 .split('?')
                 .next()
-                .unwrap_or("") // Get part before first '?'
+                .unwrap_or("")
                 .split('#')
                 .next()
-                .unwrap_or("") // Get part before first '#'
+                .unwrap_or("")
                 .split(':')
                 .next()
-                .unwrap_or(""); // Get part before first ':' (port)
+                .unwrap_or("");
 
             if domain_part.is_empty() || !domain_part.contains('.') || is_ip_address(domain_part) {
                 None
@@ -158,7 +181,8 @@ fn normalize_url(url_str: &str) -> Option<(String, String)> {
                 if normalized_domain.is_empty() {
                     None
                 } else {
-                    Some((normalized_domain, url_str.to_string()))
+                    // Fallback: no reliable slugs from this basic extraction
+                    Some((normalized_domain, Vec::new(), url_str.to_string()))
                 }
             }
         }
@@ -194,7 +218,7 @@ pub async fn find_matches(
     pipeline_run_id: &str,
 ) -> Result<AnyMatchResult> {
     info!(
-        "Starting pairwise URL matching (run ID: {}){}...",
+        "Starting pairwise URL matching with slug-based confidence (run ID: {}){}...",
         pipeline_run_id,
         if reinforcement_orchestrator.is_some() {
             " with ML guidance"
@@ -204,14 +228,11 @@ pub async fn find_matches(
     );
     let start_time = Instant::now();
 
-    // Get a connection from the pool. This connection will be used for all operations.
-    // No single overarching transaction will be used for the entire process.
     let mut conn = pool
         .get()
         .await
         .context("Failed to get DB connection for URL matching")?;
 
-    // 1. Fetch existing URL-matched pairs
     debug!("Fetching existing URL-matched pairs...");
     let existing_pairs_query = "
         SELECT entity_id_1, entity_id_2
@@ -237,18 +258,16 @@ pub async fn find_matches(
         existing_processed_pairs.len()
     );
 
-    // 2. Fetch URL Data for all entities
-    // Fetches from both 'organization' table and 'service' table via 'entity_feature'
     let url_query = "
         SELECT 'organization' as source_table, e.id as entity_id, o.url
-        FROM entity e
-        JOIN organization o ON e.organization_id = o.id
+        FROM public.entity e
+        JOIN public.organization o ON e.organization_id = o.id
         WHERE o.url IS NOT NULL AND o.url != '' AND o.url !~ '^\\s*$'
         UNION ALL
         SELECT 'service' as source_table, e.id as entity_id, s.url
-        FROM entity e
-        JOIN entity_feature ef ON e.id = ef.entity_id
-        JOIN service s ON ef.table_id = s.id AND ef.table_name = 'service'
+        FROM public.entity e
+        JOIN public.entity_feature ef ON e.id = ef.entity_id
+        JOIN public.service s ON ef.table_id = s.id AND ef.table_name = 'service'
         WHERE s.url IS NOT NULL AND s.url != '' AND s.url !~ '^\\s*$'
     ";
     debug!("Executing URL query for all entities...");
@@ -258,8 +277,8 @@ pub async fn find_matches(
         .context("Failed to query entities with URLs")?;
     info!("Found {} URL records across all entities.", url_rows.len());
 
-    // Map: normalized_domain -> {entity_id -> original_url_str}
-    let mut domain_map: HashMap<String, HashMap<EntityId, String>> = HashMap::new();
+    // Map: normalized_domain -> {entity_id -> (original_url_str, path_slugs_vec)}
+    let mut domain_map: HashMap<String, HashMap<EntityId, (String, Vec<String>)>> = HashMap::new();
     let mut ignored_urls_count = 0;
     let mut normalization_failures = 0;
 
@@ -267,7 +286,9 @@ pub async fn find_matches(
         let entity_id = EntityId(row.get("entity_id"));
         let url_str: String = row.get("url");
 
-        if let Some((normalized_domain, original_url_for_map)) = normalize_url(&url_str) {
+        if let Some((normalized_domain, path_slugs, original_url_for_map)) =
+            normalize_url_with_slugs(&url_str)
+        {
             if is_ignored_domain(&normalized_domain) {
                 trace!(
                     "Ignoring URL '{}' (domain: '{}') for entity {}",
@@ -281,7 +302,7 @@ pub async fn find_matches(
             domain_map
                 .entry(normalized_domain)
                 .or_default()
-                .insert(entity_id, original_url_for_map);
+                .insert(entity_id, (original_url_for_map, path_slugs));
         } else {
             trace!(
                 "Could not normalize URL '{}' for entity {}",
@@ -298,15 +319,12 @@ pub async fn find_matches(
         normalization_failures
     );
 
-    // 3. Database Operations (No transaction spanning all inserts)
-    debug!("Starting pairwise URL matching inserts (non-transactional for the whole batch).");
-
+    debug!("Starting pairwise URL matching inserts with slug-based confidence.");
     let now = Utc::now().naive_utc();
     let mut new_pairs_created_count = 0;
     let mut entities_in_new_pairs: HashSet<EntityId> = HashSet::new();
     let mut confidence_scores_for_stats: Vec<f64> = Vec::new();
 
-    // 4. Process domains and form pairs
     for (normalized_shared_domain, current_entity_map) in domain_map {
         if current_entity_map.len() < 2 {
             continue;
@@ -316,14 +334,28 @@ pub async fn find_matches(
 
         for i in 0..entities_sharing_domain.len() {
             for j in (i + 1)..entities_sharing_domain.len() {
-                let (entity_id1_obj, original_url1) = entities_sharing_domain[i];
-                let (entity_id2_obj, original_url2) = entities_sharing_domain[j];
+                let (entity_id1_obj, (original_url1, path_slugs1)) = entities_sharing_domain[i];
+                let (entity_id2_obj, (original_url2, path_slugs2)) = entities_sharing_domain[j];
 
-                let (e1_id, e1_orig_url, e2_id, e2_orig_url) =
+                let (e1_id, e1_orig_url, e1_slugs, e2_id, e2_orig_url, e2_slugs) =
                     if entity_id1_obj.0 < entity_id2_obj.0 {
-                        (entity_id1_obj, original_url1, entity_id2_obj, original_url2)
+                        (
+                            entity_id1_obj,
+                            original_url1,
+                            path_slugs1,
+                            entity_id2_obj,
+                            original_url2,
+                            path_slugs2,
+                        )
                     } else {
-                        (entity_id2_obj, original_url2, entity_id1_obj, original_url1)
+                        (
+                            entity_id2_obj,
+                            original_url2,
+                            path_slugs2,
+                            entity_id1_obj,
+                            original_url1,
+                            path_slugs1,
+                        )
                     };
 
                 if existing_processed_pairs.contains(&(e1_id.clone(), e2_id.clone())) {
@@ -333,15 +365,54 @@ pub async fn find_matches(
                     );
                     continue;
                 }
-                // Prevent self-matching if somehow an entity has multiple URLs leading to the same normalized domain
-                // This check is more robustly handled by the i < j loop and distinct entity_ids in current_entity_map
                 if e1_id == e2_id {
                     continue;
                 }
 
-                let mut final_confidence_score = 0.9; // Default for URL domain match
-                let mut predicted_method_type_from_ml = MatchMethodType::Url;
+                // Calculate matching slug count
+                let mut matching_slug_count = 0;
+                let min_slugs_len = e1_slugs.len().min(e2_slugs.len());
+                for k in 0..min_slugs_len {
+                    if e1_slugs[k] == e2_slugs[k] {
+                        matching_slug_count += 1;
+                    } else {
+                        break; // Slugs must match from the beginning of the path
+                    }
+                }
+
+                let is_full_path_match = matching_slug_count == e1_slugs.len()
+                    && matching_slug_count == e2_slugs.len()
+                    && !e1_slugs.is_empty(); // Ensure there's at least one slug for full path match relevance
+
+                // Determine confidence score based on slug match depth
+                let mut base_confidence_score = if is_full_path_match {
+                    CONFIDENCE_DOMAIN_FULL_PATH_MATCH
+                } else {
+                    match matching_slug_count {
+                        0 => CONFIDENCE_DOMAIN_ONLY,
+                        1 => CONFIDENCE_DOMAIN_PLUS_ONE_SLUG,
+                        2 => CONFIDENCE_DOMAIN_PLUS_TWO_SLUGS,
+                        _ => CONFIDENCE_DOMAIN_PLUS_THREE_OR_MORE_SLUGS, // 3 or more
+                    }
+                };
+
+                // If one path is empty and the other is not (e.g. domain.com vs domain.com/page1),
+                // and it's not a full path match, it's a domain-only match.
+                // Also, if both paths are empty (e.g. two entities point to just "domain.com"),
+                // it's effectively a full path match of an empty path, treat as strong.
+                if e1_slugs.is_empty() && e2_slugs.is_empty() {
+                    base_confidence_score = CONFIDENCE_DOMAIN_FULL_PATH_MATCH; // Both are root, strong match
+                } else if (e1_slugs.is_empty() != e2_slugs.is_empty()) && matching_slug_count == 0 {
+                    base_confidence_score = CONFIDENCE_DOMAIN_ONLY;
+                }
+
+                let mut final_confidence_score = base_confidence_score;
+                let mut predicted_method_type_from_ml = MatchMethodType::Url; // Default if ML not used or fails
                 let mut features_for_logging: Option<Vec<f64>> = None;
+
+                // put any bonuses or penalties here
+
+                let pre_rl_confidence = final_confidence_score;
 
                 if let Some(orchestrator_mutex) = reinforcement_orchestrator {
                     match MatchingOrchestrator::extract_pair_context(pool, e1_id, e2_id).await {
@@ -351,16 +422,26 @@ pub async fn find_matches(
                             match orchestrator_guard.predict_method_with_context(&features) {
                                 Ok((predicted_method, rl_conf)) => {
                                     predicted_method_type_from_ml = predicted_method;
+                                    // Here, you might decide how RL confidence (rl_conf) influences
+                                    // the base_confidence_score. For example, it could scale it,
+                                    // replace it, or be used as a weighted average.
+                                    // For now, let's assume the RL provides the final_confidence_score
+                                    // if it successfully predicts.
+                                    // This interaction needs careful design based on RL strategy.
+                                    // As a simple approach, let's use the RL confidence if available,
+                                    // otherwise stick to the rule-based one.
                                     final_confidence_score = rl_conf;
-                                    info!("ML guidance for URL pair ({}, {}), domain '{}': Predicted Method: {:?}, Confidence: {:.4}", e1_id.0, e2_id.0, normalized_shared_domain, predicted_method_type_from_ml, final_confidence_score);
+                                    info!("ML guidance for URL pair ({}, {}), domain '{}': Predicted Method: {:?}, RL Confidence: {:.4}. Rule-based confidence was: {:.4}", e1_id.0, e2_id.0, normalized_shared_domain, predicted_method_type_from_ml, final_confidence_score, base_confidence_score);
                                 }
                                 Err(e) => {
-                                    warn!("ML prediction failed for URL pair ({}, {}), domain '{}': {}. Using default confidence {:.2}.", e1_id.0, e2_id.0, normalized_shared_domain, e, final_confidence_score);
+                                    warn!("ML prediction failed for URL pair ({}, {}), domain '{}': {}. Using rule-based confidence {:.4}.", e1_id.0, e2_id.0, normalized_shared_domain, e, final_confidence_score);
+                                    // final_confidence_score remains base_confidence_score
                                 }
                             }
                         }
                         Err(e) => {
-                            warn!("Context extraction failed for URL pair ({}, {}), domain '{}': {}. Using default confidence {:.2}.", e1_id.0, e2_id.0, normalized_shared_domain, e, final_confidence_score);
+                            warn!("Context extraction failed for URL pair ({}, {}), domain '{}': {}. Using rule-based confidence {:.4}.", e1_id.0, e2_id.0, normalized_shared_domain, e, final_confidence_score);
+                            // final_confidence_score remains base_confidence_score
                         }
                     }
                 }
@@ -369,6 +450,7 @@ pub async fn find_matches(
                     original_url1: e1_orig_url.clone(),
                     original_url2: e2_orig_url.clone(),
                     normalized_shared_domain: normalized_shared_domain.clone(),
+                    matching_slug_count: matching_slug_count, // Store the count
                 });
                 let match_values_json = serde_json::to_value(&match_values).with_context(|| {
                     format!(
@@ -379,7 +461,6 @@ pub async fn find_matches(
 
                 let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
 
-                // Execute insert directly on the connection
                 let insert_result = conn
                     .execute(
                         INSERT_ENTITY_GROUP_SQL,
@@ -390,6 +471,7 @@ pub async fn find_matches(
                             &MatchMethodType::Url.as_str(),
                             &match_values_json,
                             &final_confidence_score,
+                            &pre_rl_confidence,
                             &now,
                             &now,
                         ],
@@ -405,8 +487,8 @@ pub async fn find_matches(
                         existing_processed_pairs.insert((e1_id.clone(), e2_id.clone()));
 
                         info!(
-                            "Created new URL pair group {} for ({}, {}) with shared domain '{}', confidence: {:.4}",
-                            new_entity_group_id.0, e1_id.0, e2_id.0, normalized_shared_domain, final_confidence_score
+                            "Created new URL pair group {} for ({}, {}) with shared domain '{}', {} matching slugs, confidence: {:.4}",
+                            new_entity_group_id.0, e1_id.0, e2_id.0, normalized_shared_domain, matching_slug_count, final_confidence_score
                         );
 
                         if let Some(orchestrator_mutex) = reinforcement_orchestrator {
@@ -414,14 +496,14 @@ pub async fn find_matches(
                             if let Err(e) = orchestrator_guard
                                 .log_match_result(
                                     pool,
-                                    e1_id, // Assuming EntityId is Clone or Copy
+                                    e1_id,
                                     e2_id,
-                                    &predicted_method_type_from_ml, // This is the method predicted by ML
-                                    final_confidence_score, // This is the confidence from ML (or default if ML failed)
-                                    true, // is_match (since we are creating a pair)
+                                    &MatchMethodType::Url, // Actual method used for this decision logic path
+                                    final_confidence_score,
+                                    true, // Assuming creation implies a "correct" match for RL logging at this stage
                                     features_for_logging.as_ref(),
-                                    Some(&MatchMethodType::Url), // actual_method_type (the method that made the decision)
-                                    Some(final_confidence_score), // actual_confidence (the confidence for this method)
+                                    Some(&predicted_method_type_from_ml), // Method predicted by ML
+                                    Some(final_confidence_score), // Using final_confidence_score also as ml_prediction_confidence for simplicity if RL overrode
                                 )
                                 .await
                             {
@@ -433,32 +515,35 @@ pub async fn find_matches(
                             let priority = if final_confidence_score
                                 < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD
                             {
-                                2
+                                2 // High priority for critical
                             } else {
-                                1
+                                1 // Medium priority for moderate
                             };
                             let details_json = serde_json::json!({
                                 "method_type": MatchMethodType::Url.as_str(),
                                 "matched_value": &normalized_shared_domain,
                                 "original_url1": e1_orig_url,
                                 "original_url2": e2_orig_url,
+                                "matching_slug_count": matching_slug_count,
                                 "entity_group_id": &new_entity_group_id.0,
-                                "rl_predicted_method": predicted_method_type_from_ml.as_str(), // Log what RL predicted
+                                "rule_based_confidence": base_confidence_score,
+                                "rl_predicted_method": predicted_method_type_from_ml.as_str(),
+                                "final_confidence": final_confidence_score,
                             });
                             let reason_message = format!(
-                                "Pair ({}, {}) matched by URL with low RL confidence ({:.4}). RL predicted: {:?}.",
-                                e1_id.0, e2_id.0, final_confidence_score, predicted_method_type_from_ml
+                                "Pair ({}, {}) matched by URL with confidence {:.4} ({} matching slugs). Rule-based: {:.2}. RL-predicted: {:?}.",
+                                e1_id.0, e2_id.0, final_confidence_score, matching_slug_count, base_confidence_score, predicted_method_type_from_ml
                             );
                             let suggestion = NewSuggestedAction {
                                 pipeline_run_id: Some(pipeline_run_id.to_string()),
                                 action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
-                                entity_id: None,
+                                entity_id: None, // Suggestion is for the pair/group
                                 group_id_1: Some(new_entity_group_id.0.clone()),
                                 group_id_2: None,
                                 cluster_id: None,
                                 triggering_confidence: Some(final_confidence_score),
                                 details: Some(details_json),
-                                reason_code: Some("LOW_RL_CONFIDENCE_PAIR".to_string()), // Or "LOW_URL_CONFIDENCE_PAIR"
+                                reason_code: Some("LOW_URL_MATCH_CONFIDENCE".to_string()),
                                 reason_message: Some(reason_message),
                                 priority,
                                 status: SuggestionStatus::PendingReview.as_str().to_string(),
@@ -466,14 +551,12 @@ pub async fn find_matches(
                                 reviewed_at: None,
                                 review_notes: None,
                             };
-                            // Pass the connection `conn` to insert_suggestion
                             if let Err(e) = db::insert_suggestion(&*conn, &suggestion).await {
                                 warn!("Failed to log suggestion for low confidence URL pair ({}, {}): {}. This operation was attempted on the main connection.", e1_id.0, e2_id.0, e);
                             }
                         }
                     }
                     Err(e) => {
-                        // Detailed error logging for the specific insert failure
                         let error_message = format!(
                             "Failed to insert URL pair group for ({}, {}) with shared domain '{}'",
                             e1_id.0, e2_id.0, normalized_shared_domain
@@ -482,6 +565,7 @@ pub async fn find_matches(
                             if db_err.constraint() == Some("uq_entity_pair_method") {
                                 debug!("{}: Pair already exists (DB constraint uq_entity_pair_method). Skipping.", error_message);
                                 existing_processed_pairs.insert((e1_id.clone(), e2_id.clone()));
+                            // Mark as processed
                             } else {
                                 warn!("{}: Database error: {:?}. SQLState: {:?}, Detail: {:?}, Hint: {:?}",
                                     error_message, db_err, db_err.code(), db_err.detail(), db_err.hint());
@@ -494,10 +578,8 @@ pub async fn find_matches(
             }
         }
     }
-    // No transaction to commit.
     debug!("Finished processing URL pairs.");
 
-    // 5. Calculate Statistics and Return
     let avg_confidence: f64 = if !confidence_scores_for_stats.is_empty() {
         confidence_scores_for_stats.iter().sum::<f64>() / confidence_scores_for_stats.len() as f64
     } else {
@@ -513,15 +595,16 @@ pub async fn find_matches(
             2.0
         } else {
             0.0
-        }, // Assuming pairs
+        },
     };
 
     let elapsed = start_time.elapsed();
     info!(
-        "Pairwise URL matching complete in {:.2?}: created {} new pairs, involving {} unique entities. Errors for individual pairs (if any) were logged above.",
+        "Pairwise URL matching with slug-based confidence complete in {:.2?}: created {} new pairs, involving {} unique entities. Avg confidence: {:.4}. Errors for individual pairs (if any) were logged above.",
         elapsed,
         method_stats.groups_created,
-        method_stats.entities_matched
+        method_stats.entities_matched,
+        method_stats.avg_confidence,
     );
     let url_result = UrlMatchResult {
         groups_created: method_stats.groups_created,
