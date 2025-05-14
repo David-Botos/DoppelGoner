@@ -138,7 +138,7 @@ async fn build_weighted_xgraph(
         let entity_id_2_str: String = row.get("entity_id_2");
         let confidence_score: Option<f64> = row.get("confidence_score");
 
-        let node_id = node_mapper.get_or_add_node(&mut xgraph_instance, &entity_group_id);
+        let _node_id = node_mapper.get_or_add_node(&mut xgraph_instance, &entity_group_id);
 
         if let Some(conf) = confidence_score {
             group_confidences.insert(entity_group_id.clone(), conf);
@@ -530,7 +530,7 @@ pub async fn process_clusters(
             );
             let verify_start = Instant::now();
             match verify_clusters(
-                &transaction, // Pass the transaction for logging suggestions
+                &transaction, // Pass the transaction for logging suggestions AND UPDATING SCORE
                 pool,         // Pass the pool for orchestrator's context extraction
                 &new_cluster_ids_for_verification,
                 orchestrator_ref,
@@ -572,9 +572,12 @@ async fn create_cluster_record(
         pair_count, entity_count
     );
 
+    // The average_coherence_score column is nullable and will be populated by verify_clusters.
+    // It will default to NULL upon insertion here.
+    // Explicitly listing columns for clarity and future-proofing.
     transaction.execute(
-        "INSERT INTO public.group_cluster (id, name, description, created_at, updated_at, entity_count, group_count)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)", // group_count here refers to number of pairs
+        "INSERT INTO public.group_cluster (id, name, description, created_at, updated_at, entity_count, group_count, average_coherence_score)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)", // group_count here refers to number of pairs, average_coherence_score is NULL initially
         &[&cluster_id.0, &cluster_name, &description, &now, &now, &entity_count, &pair_count],
     ).await.context("Failed to insert group_cluster")?;
     Ok(())
@@ -598,7 +601,7 @@ async fn update_entity_groups_with_cluster_id(
 }
 
 async fn verify_clusters(
-    transaction: &Transaction<'_>, // For logging suggestions
+    transaction: &Transaction<'_>, // For logging suggestions AND UPDATING SCORE
     pool: &PgPool,                 // For MatchingOrchestrator's DB needs
     new_cluster_ids: &[GroupClusterId],
     reinforcement_orchestrator_mutex: &Mutex<MatchingOrchestrator>,
@@ -638,6 +641,21 @@ async fn verify_clusters(
                 "No pairwise groups found for cluster {} during verification. Skipping.",
                 cluster_id.0
             );
+            // If no entities, we can't calculate a score, so update with NULL or skip.
+            // Let's ensure it's NULL if we can't calculate.
+            let update_null_score_query = "
+                UPDATE public.group_cluster
+                SET average_coherence_score = NULL
+                WHERE id = $1";
+            if let Err(e) = transaction
+                .execute(update_null_score_query, &[&cluster_id.0])
+                .await
+            {
+                warn!(
+                    "Failed to update average_coherence_score to NULL for empty cluster {}: {}",
+                    cluster_id.0, e
+                );
+            }
             continue;
         }
 
@@ -654,6 +672,20 @@ async fn verify_clusters(
                 cluster_id.0,
                 entities.len()
             );
+            // If less than 2 entities, score is not meaningful. Update with NULL.
+            let update_null_score_query = "
+                UPDATE public.group_cluster
+                SET average_coherence_score = NULL
+                WHERE id = $1";
+            if let Err(e) = transaction
+                .execute(update_null_score_query, &[&cluster_id.0])
+                .await
+            {
+                warn!(
+                    "Failed to update average_coherence_score to NULL for cluster {} with < 2 entities: {}",
+                    cluster_id.0, e
+                );
+            }
             continue;
         }
 
@@ -699,8 +731,10 @@ async fn verify_clusters(
 
         if entity_pairs_to_check.is_empty() && entities.len() >= 2 {
             // Handle case where sampling yielded no pairs but should have
-            entity_pairs_to_check.push((entities[0].clone(), entities[1].clone()));
-            // Fallback to first pair
+            // Fallback to first pair if possible
+            if entities.len() >= 2 {
+                entity_pairs_to_check.push((entities[0].clone(), entities[1].clone()));
+            }
         }
 
         debug!(
@@ -731,7 +765,7 @@ async fn verify_clusters(
                         }
                         Err(e) => warn!("Error during verification pair prediction for ({}, {}) in cluster {}: {}", entity1_id.0, entity2_id.0, cluster_id.0, e),
                     }
-                    drop(orchestrator_guard);
+                    // Removed: drop(orchestrator_guard); // lock guard drops automatically at end of scope
                 }
                 Err(e) => warn!(
                     "Error extracting context for ({}, {}) in cluster {}: {}",
@@ -740,68 +774,106 @@ async fn verify_clusters(
             }
         }
 
+        let avg_score_to_store: Option<f64>; // Use Option for clarity in update
+
         if verification_scores.is_empty() {
-            debug!("No verification scores obtained for cluster {}. Might be due to context extraction or prediction failures.", cluster_id.0);
-            continue;
-        }
-
-        let avg_score: f64 =
-            verification_scores.iter().sum::<f64>() / verification_scores.len() as f64;
-        debug!(
-            "Cluster {} - Avg internal pair confidence: {:.4} from {} scores.",
-            cluster_id.0,
-            avg_score,
-            verification_scores.len()
-        );
-
-        if avg_score < config::VERIFICATION_THRESHOLD {
-            info!("Cluster {} has low internal coherence (avg score: {:.4}, threshold: {}). Logging SUGGEST_SPLIT_CLUSTER.", cluster_id.0, avg_score, config::VERIFICATION_THRESHOLD);
-            let details_json = serde_json::json!({
-                "average_internal_pair_confidence": avg_score,
-                "entities_in_cluster_count": entities.len(),
-                "checked_pairs_count": verification_scores.len(),
-                "verification_threshold": config::VERIFICATION_THRESHOLD,
-                "verification_scores_sample": verification_scores.iter().take(5).copied().collect::<Vec<_>>(),
-            });
-            let reason_message = format!(
-                "Cluster {} ({} entities, {} pairs checked) has low average internal entity-pair confidence: {:.4}, below threshold of {}.",
-                cluster_id.0, entities.len(), verification_scores.len(), avg_score, config::VERIFICATION_THRESHOLD
-            );
-            let suggestion = NewSuggestedAction {
-                pipeline_run_id: Some(pipeline_run_id.to_string()),
-                action_type: ActionType::SuggestSplitCluster.as_str().to_string(),
-                entity_id: None,
-                group_id_1: None,
-                group_id_2: None,
-                cluster_id: Some(cluster_id.0.clone()),
-                triggering_confidence: Some(avg_score),
-                details: Some(details_json),
-                reason_code: Some("LOW_INTERNAL_CLUSTER_COHERENCE".to_string()),
-                reason_message: Some(reason_message),
-                priority: 1,
-                status: SuggestionStatus::PendingReview.as_str().to_string(),
-                reviewer_id: None,
-                reviewed_at: None,
-                review_notes: None,
-            };
-            match db::insert_suggestion(transaction, &suggestion).await {
-                Ok(id) => info!(
-                    "Logged SUGGEST_SPLIT_CLUSTER suggestion {} for cluster {}.",
-                    id, cluster_id.0
-                ),
-                Err(e) => warn!(
-                    "Failed to log SUGGEST_SPLIT_CLUSTER for cluster {}: {}",
-                    cluster_id.0, e
-                ),
-            }
+            debug!("No verification scores obtained for cluster {}. Storing NULL for average_coherence_score.", cluster_id.0);
+            avg_score_to_store = None;
         } else {
-            info!(
-                "Cluster {} passed verification (avg score: {:.4}, threshold: {}).",
+            let calculated_avg_score: f64 =
+                verification_scores.iter().sum::<f64>() / verification_scores.len() as f64;
+            avg_score_to_store = Some(calculated_avg_score);
+            debug!(
+                "Cluster {} - Avg internal pair confidence: {:.4} from {} scores. Storing this score.",
                 cluster_id.0,
-                avg_score,
-                config::VERIFICATION_THRESHOLD
+                calculated_avg_score,
+                verification_scores.len()
             );
         }
+
+        // Update the group_cluster table with the calculated average_coherence_score (or NULL)
+        // Ensure this uses the `transaction` object.
+        let update_score_query = "
+            UPDATE public.group_cluster
+            SET average_coherence_score = $1
+            WHERE id = $2";
+        if let Err(e) = transaction
+            .execute(update_score_query, &[&avg_score_to_store, &cluster_id.0])
+            .await
+        {
+            warn!(
+                "Failed to update average_coherence_score for cluster {}: {}",
+                cluster_id.0, e
+            );
+            // Decide on error handling: continue or propagate?
+            // Current pattern is to warn and continue for non-critical updates within loops.
+        } else {
+            if let Some(score_val) = avg_score_to_store {
+                info!(
+                    "Successfully stored average_coherence_score {:.4} for cluster {}.",
+                    score_val, cluster_id.0
+                );
+            } else {
+                info!(
+                    "Successfully stored NULL average_coherence_score for cluster {} (no scores calculated).",
+                    cluster_id.0
+                );
+            }
+        }
+
+        // Existing logic for checking threshold and logging suggestion (only if a score was calculated)
+        if let Some(calculated_avg_score) = avg_score_to_store {
+            // Check if a score was actually calculated
+            if calculated_avg_score < config::VERIFICATION_THRESHOLD {
+                info!("Cluster {} has low internal coherence (avg score: {:.4}, threshold: {}). Logging SUGGEST_SPLIT_CLUSTER.", cluster_id.0, calculated_avg_score, config::VERIFICATION_THRESHOLD);
+                let details_json = serde_json::json!({
+                    "average_internal_pair_confidence": calculated_avg_score, // Use the actual calculated score
+                    "entities_in_cluster_count": entities.len(),
+                    "checked_pairs_count": verification_scores.len(),
+                    "verification_threshold": config::VERIFICATION_THRESHOLD,
+                    "verification_scores_sample": verification_scores.iter().take(5).copied().collect::<Vec<_>>(),
+                });
+                let reason_message = format!(
+                    "Cluster {} ({} entities, {} pairs checked) has low average internal entity-pair confidence: {:.4}, below threshold of {}.",
+                    cluster_id.0, entities.len(), verification_scores.len(), calculated_avg_score, config::VERIFICATION_THRESHOLD
+                );
+                let suggestion = NewSuggestedAction {
+                    pipeline_run_id: Some(pipeline_run_id.to_string()),
+                    action_type: ActionType::SuggestSplitCluster.as_str().to_string(),
+                    entity_id: None,
+                    group_id_1: None,
+                    group_id_2: None,
+                    cluster_id: Some(cluster_id.0.clone()),
+                    triggering_confidence: Some(calculated_avg_score), // Use the actual calculated score
+                    details: Some(details_json),
+                    reason_code: Some("LOW_INTERNAL_CLUSTER_COHERENCE".to_string()),
+                    reason_message: Some(reason_message),
+                    priority: 1,
+                    status: SuggestionStatus::PendingReview.as_str().to_string(),
+                    reviewer_id: None,
+                    reviewed_at: None,
+                    review_notes: None,
+                };
+                match db::insert_suggestion(transaction, &suggestion).await {
+                    Ok(id) => info!(
+                        "Logged SUGGEST_SPLIT_CLUSTER suggestion {} for cluster {}.",
+                        id, cluster_id.0
+                    ),
+                    Err(e) => warn!(
+                        "Failed to log SUGGEST_SPLIT_CLUSTER for cluster {}: {}",
+                        cluster_id.0, e
+                    ),
+                }
+            } else {
+                info!(
+                    "Cluster {} passed verification (avg score: {:.4}, threshold: {}).",
+                    cluster_id.0,
+                    calculated_avg_score,
+                    config::VERIFICATION_THRESHOLD
+                );
+            }
+        }
+        // No "else" needed here if avg_score_to_store was None, as suggestion logic depends on a score.
     }
     info!("Finished verifying all new clusters.");
     Ok(())
