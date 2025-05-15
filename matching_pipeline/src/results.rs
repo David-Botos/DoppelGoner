@@ -514,7 +514,10 @@ fn print_report(stats: &PipelineStats) {
         "Total consolidated clusters formed: {}",
         stats.total_clusters
     );
-    println!("Total visualization edges calculated: {}", stats.total_visualization_edges);
+    println!(
+        "Total visualization edges calculated: {}",
+        stats.total_visualization_edges
+    );
     println!(
         "Total service matches identified: {}",
         stats.total_service_matches

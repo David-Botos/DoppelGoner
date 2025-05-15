@@ -1,134 +1,28 @@
 // src/reinforcement/orchestrator.rs
-use anyhow::{Context, Result}; // Added Context
+use anyhow::{Context, Result};
 use chrono::Utc;
 use log::{debug, info, warn};
 use uuid::Uuid;
 
 use super::confidence_tuner::ConfidenceTuner;
-use super::context_model::ContextModel;
-use super::FeedbackItem;
-// feature_extraction is used via a call in extract_pair_context, no direct use here
-// use super::feature_extraction::{extract_context_for_pair, extract_entity_features};
-use crate::db::{fetch_recent_feedback_items, PgPool};
+// ContextModel is removed for V1
+// use super::context_model::ContextModel;
+use super::feature_extraction; // For extract_context_for_pair
+use crate::db::{insert_match_decision_detail, PgPool}; // Assuming this is the main pool type
 use crate::models::{EntityId, MatchMethodType};
 use crate::reinforcement::feedback_processor;
+// feedback_processor and FeedbackItem are not directly used by orchestrator in V1 for logging,
+// but feedback_processor will use ConfidenceTuner.
 
 pub struct MatchingOrchestrator {
-    pub context_model: ContextModel,
+    // context_model: ContextModel, // Removed for V1
     pub confidence_tuner: ConfidenceTuner,
-}
-
-// This private helper function will now take the pool and other necessary details.
-async fn record_entity_feedback(
-    pool: &PgPool, // Accept the pool
-    entity1_id: &EntityId,
-    entity2_id: &EntityId,
-    method_used: &MatchMethodType, // Method ultimately applied
-    final_confidence_score: f64,   // Confidence of the applied match
-    was_correct: bool,
-    context_features: Option<&Vec<f64>>,
-    ml_predicted_method: Option<&MatchMethodType>, // Method suggested by ContextModel
-    ml_prediction_confidence: Option<f64>,         // Confidence of ContextModel's suggestion
-    context_model_version: u32,                    // Pass from orchestrator
-    confidence_tuner_version: u32,                 // Pass from orchestrator
-) -> Result<()> {
-    let conn = pool
-        .get()
-        .await
-        .context("Failed to get DB connection from pool in record_entity_feedback")?;
-    let decision_id = Uuid::new_v4().to_string();
-    let now = Utc::now().naive_utc();
-
-    // Insert into human_review_decisions (system's perspective)
-    conn.execute(
-        "INSERT INTO clustering_metadata.human_review_decisions
-        (id, reviewer_id, decision_type, entity_id, confidence, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6)",
-        &[
-            &decision_id,
-            &"ml_system",
-            &"match_assessment",
-            &entity1_id.0,
-            &final_confidence_score,
-            &now,
-        ],
-    )
-    .await
-    .context("Failed to insert into human_review_decisions")?; // Added context
-
-    // Insert into human_review_method_feedback
-    let confidence_adjustment = if was_correct { 0.05 } else { -0.05 };
-    conn.execute(
-        "INSERT INTO clustering_metadata.human_review_method_feedback
-        (id, decision_id, method_type, was_correct, confidence_adjustment, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6)",
-        &[
-            &Uuid::new_v4().to_string(),
-            &decision_id,
-            &method_used.as_str(),
-            &was_correct,
-            // Ensure the type is explicitly f64 for ToSql trait
-            &(confidence_adjustment as f64) as &(dyn tokio_postgres::types::ToSql + Sync),
-            &now,
-        ],
-    )
-    .await
-    .context("Failed to insert into human_review_method_feedback")?; // Added context
-
-    let snapshotted_features_json = context_features.map_or(serde_json::Value::Null, |features| {
-        serde_json::to_value(features).unwrap_or(serde_json::Value::Null)
-    });
-
-    let method_for_snapshot_str = ml_predicted_method.unwrap_or(method_used).as_str();
-
-    conn.execute(
-        "INSERT INTO clustering_metadata.entity_match_pairs
-        (decision_id, entity1_id, entity2_id, method_type, prediction_confidence, 
-         snapshotted_features, context_model_version, confidence_tuner_version, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        ON CONFLICT (decision_id) DO UPDATE SET
-            entity1_id = EXCLUDED.entity1_id,
-            entity2_id = EXCLUDED.entity2_id,
-            method_type = EXCLUDED.method_type,
-            prediction_confidence = EXCLUDED.prediction_confidence,
-            snapshotted_features = EXCLUDED.snapshotted_features,
-            context_model_version = EXCLUDED.context_model_version,
-            confidence_tuner_version = EXCLUDED.confidence_tuner_version,
-            created_at = EXCLUDED.created_at",
-        &[
-            &decision_id,
-            &entity1_id.0,
-            &entity2_id.0,
-            &method_for_snapshot_str,
-            &ml_prediction_confidence,
-            &snapshotted_features_json,
-            &(context_model_version as i32), // Use passed-in version
-            &(confidence_tuner_version as i32), // Use passed-in version
-            &now,
-        ],
-    )
-    .await
-    .context("Failed to insert into entity_match_pairs")?; // Added context
-
-    Ok(())
+    // Add a field to store the pool if orchestrator methods need to perform DB operations directly
+    // For V1, log_decision_snapshot will take the pool as an argument.
 }
 
 impl MatchingOrchestrator {
     pub async fn new(pool: &PgPool) -> Result<Self> {
-        let context_model = match ContextModel::load_from_db(pool).await {
-            Ok(model) => {
-                info!(
-                    "Loaded context model from database version {}",
-                    model.version
-                );
-                model
-            }
-            Err(e) => {
-                warn!("Could not load context model: {}. Creating new one.", e);
-                ContextModel::new()
-            }
-        };
-
         let confidence_tuner = match ConfidenceTuner::load_from_db(pool).await {
             Ok(tuner) => {
                 info!(
@@ -144,173 +38,171 @@ impl MatchingOrchestrator {
         };
 
         Ok(Self {
-            context_model,
+            // context_model, // Removed
             confidence_tuner,
         })
     }
 
-    pub async fn extract_pair_context(
-        pool: &PgPool,
-        entity1: &EntityId,
-        entity2: &EntityId,
-    ) -> Result<Vec<f64>> {
-        info!(
-            "Extracting context for entities {:?} and {:?}",
-            entity1, entity2
-        );
-        super::feature_extraction::extract_context_for_pair(pool, entity1, entity2).await
-    }
-
-    pub fn predict_method_with_context(
-        &self,
-        context_features: &Vec<f64>,
-    ) -> Result<(MatchMethodType, f64)> {
-        info!("Predicting matching method with pre-extracted context features");
-
-        let (method_name, context_confidence) =
-            match self.context_model.predict_best_method(context_features) {
-                Some((method, confidence)) => {
-                    info!(
-                        "Context model (v{}) predicts method '{}' with confidence {:.4}",
-                        self.context_model.version, method, confidence
-                    );
-                    (method, confidence)
-                }
-                None => {
-                    info!(
-                        "Context model (v{}) could not predict. Using default method (name).",
-                        self.context_model.version
-                    );
-                    ("name".to_string(), 0.5)
-                }
-            };
-
-        let confidence = self.confidence_tuner.select_confidence_with_context(
-            &method_name,
-            context_features,
-            context_confidence,
-        );
-
-        info!(
-            "Confidence tuner (v{}) selected confidence {:.4} for method '{}'",
-            self.confidence_tuner.version, confidence, method_name
-        );
-
-        let method_type = MatchMethodType::from_str(&method_name); // Use from_str for consistency
-
-        Ok((method_type, confidence))
-    }
-
-    pub async fn log_match_result(
-        &mut self,
-        pool: &PgPool, // Added pool parameter
+    /// Extracts the 31-element feature vector for a given entity pair.
+    pub async fn extract_pair_context_features(
+        pool: &PgPool, // Static method, takes pool
         entity1_id: &EntityId,
         entity2_id: &EntityId,
-        method_used: &MatchMethodType,
-        final_confidence_score: f64,
-        was_correct: bool,
-        context_features: Option<&Vec<f64>>,
-        ml_predicted_method: Option<&MatchMethodType>,
-        ml_prediction_confidence: Option<f64>,
+    ) -> Result<Vec<f64>> {
+        debug!(
+            "Orchestrator: Extracting context features for pair ({}, {})",
+            entity1_id.0, entity2_id.0
+        );
+        feature_extraction::extract_context_for_pair(pool, entity1_id, entity2_id)
+            .await
+            .context(format!(
+                "Failed to extract context for pair ({},{})",
+                entity1_id.0, entity2_id.0
+            ))
+    }
+
+    /// Gets a tuned confidence score from the ConfidenceTuner.
+    /// The `pre_rl_confidence_score` is passed for potential logging or future tuner enhancements
+    /// but is not directly used by the V1 `ConfidenceTuner::select_confidence` method.
+    pub fn get_tuned_confidence(
+        &self,
+        method_type: &MatchMethodType,
+        pre_rl_confidence_score: f64,
+        context_features: &[f64],
+    ) -> Result<f64> {
+        info!(
+            "Orchestrator (ConfidenceTuner v{}): Getting tuned confidence for method '{}', pre-RL score: {:.3}",
+            self.confidence_tuner.version, method_type.as_str(), pre_rl_confidence_score
+        );
+
+        if context_features.len() != 31 {
+            warn!(
+                "Orchestrator: Expected 31 context features for ConfidenceTuner, got {}. This might lead to suboptimal tuning.",
+                context_features.len()
+            );
+            // Proceeding, but this is a potential issue. The tuner might expect a fixed size.
+        }
+
+        let tuned_confidence = self.confidence_tuner.select_confidence(
+            method_type.as_str(),
+            context_features,
+            pre_rl_confidence_score, // Pass it along
+        );
+
+        info!(
+            "Orchestrator: Method '{}', Pre-RL confidence: {:.3}, Tuned confidence: {:.3}",
+            method_type.as_str(),
+            pre_rl_confidence_score,
+            tuned_confidence
+        );
+        Ok(tuned_confidence)
+    }
+
+    /// Logs the details of a match decision (after an entity_group is created).
+    /// This function is responsible for creating a snapshot in `match_decision_details`.
+    /// The ConfidenceTuner itself is updated separately by the feedback processing loop.
+    pub async fn log_decision_snapshot(
+        &self, // Takes &self to access tuner version
+        pool: &PgPool,
+        entity_group_id: &str,
+        pipeline_run_id: &str,
+        snapshotted_features: &Vec<f64>,
+        method_type_at_decision: &MatchMethodType,
+        pre_rl_confidence_at_decision: f64,
+        tuned_confidence_at_decision: f64,
+        // No `was_correct` here, as this is about snapshotting the decision, not immediate feedback.
     ) -> Result<()> {
-        let reward = if was_correct { 1.0 } else { 0.0 }; // Or -1.0 for incorrect, depends on strategy
+        let snapshot_features_json =
+            serde_json::to_value(snapshotted_features).unwrap_or(serde_json::Value::Null);
 
-        // Update tuner before potential version increment if it saves itself
-        self.confidence_tuner
-            .update(method_used.as_str(), final_confidence_score, reward)?;
-        // If ConfidenceTuner::update might save & increment version, and you want to log the version *before* this update for this specific call,
-        // you might fetch version numbers before calling update. For now, assume update doesn't auto-save/increment.
-
-        let context_model_ver = self.context_model.version;
         let confidence_tuner_ver = self.confidence_tuner.version;
 
-        // Call the refactored record_entity_feedback, now a free function or static method
-        match record_entity_feedback(
-            pool, // Pass the pool
-            entity1_id,
-            entity2_id,
-            method_used,
-            final_confidence_score,
-            was_correct,
-            context_features,
-            ml_predicted_method,
-            ml_prediction_confidence,
-            context_model_ver,    // Pass current version
-            confidence_tuner_ver, // Pass current version
+        // This uses a function from crate::db (which should now contain the merged DB logic)
+        match insert_match_decision_detail(
+            pool,
+            entity_group_id,
+            pipeline_run_id,
+            snapshot_features_json,
+            method_type_at_decision.as_str(),
+            pre_rl_confidence_at_decision,
+            tuned_confidence_at_decision,
+            confidence_tuner_ver,
         )
         .await
         {
-            Ok(_) => debug!("Recorded detailed entity feedback (with snapshot) for ML training"),
-            Err(e) => warn!(
-                "Failed to record detailed entity feedback (with snapshot): {}",
-                e
-            ),
+            Ok(_) => {
+                debug!(
+                "Orchestrator: Logged decision snapshot for entity_group_id: {}, method: {}, pre-RL conf: {:.3}, tuned conf: {:.3}, tuner_v: {}",
+                entity_group_id, method_type_at_decision.as_str(), pre_rl_confidence_at_decision, tuned_confidence_at_decision, confidence_tuner_ver
+            );
+            }
+            Err(e) => {
+                warn!("Failed to insert match decision detail: {}. This is non-critical and the pipeline will continue.", e);
+                // Return Ok() to prevent the pipeline from failing due to logging issues
+            }
         }
 
-        info!(
-            "Logged match result for method {}: entities {} and {}, correct={}, final_confidence={:.4}. RL Models: Context v{}, Tuner v{}",
-            method_used.as_str(),
-            entity1_id.0,
-            entity2_id.0,
-            was_correct,
-            final_confidence_score,
-            context_model_ver,
-            confidence_tuner_ver
-        );
         Ok(())
     }
 
-    // pub async fn save_models(&self, pool: &PgPool) -> Result<()> {
-    //     info!("Saving ML models to database. ContextModel v{}, ConfidenceTuner v{}", self.context_model.version, self.confidence_tuner.version);
-    //     let context_model_id = self.context_model.save_to_db(pool).await?;
-    //     let confidence_tuner_id = self.confidence_tuner.save_to_db(pool).await?;
-    //     info!(
-    //         "Saved models with IDs: context={}, confidence={}",
-    //         context_model_id, confidence_tuner_id
-    //     );
-    //     Ok(())
-    // }
-
-    pub async fn train_context_model(&mut self, pool: &PgPool) -> Result<()> {
+    /// Saves the ConfidenceTuner model to the database.
+    /// The ContextModel save is removed.
+    pub async fn save_models(&mut self, pool: &PgPool) -> Result<()> {
         info!(
-            "Manually training context model (current version: {}).",
-            self.context_model.version
-        );
-        self.context_model.train(pool).await?; // train() should increment version internally on success
-        info!(
-            "Context model training complete. New version: {}.",
-            self.context_model.version
-        );
-        Ok(())
-    }
-
-    pub fn get_confidence_stats(&self) -> String {
-        let stats = self.confidence_tuner.get_stats();
-        let mut output = format!(
-            "Confidence Tuner (v{}) Statistics:\n",
+            "Orchestrator: Saving ConfidenceTuner (v{}) to database.",
             self.confidence_tuner.version
         );
+        // The save_to_db method on ConfidenceTuner increments its version.
+        let confidence_tuner_id = self.confidence_tuner.save_to_db(pool).await?;
+        info!(
+            "Orchestrator: Saved ConfidenceTuner with new version {}. DB Record ID base: {}",
+            self.confidence_tuner.version, confidence_tuner_id
+        );
+        Ok(())
+    }
+
+    // Method for manually triggering ConfidenceTuner training/update cycle.
+    // This will be called by the main pipeline after feedback might have been ingested.
+    pub async fn process_feedback_and_update_tuner(&mut self, pool: &PgPool) -> Result<()> {
+        info!(
+            "Orchestrator: Starting process_feedback_and_update_tuner for ConfidenceTuner (v{}).",
+            self.confidence_tuner.version
+        );
+        feedback_processor::process_human_feedback_for_tuner(pool, &mut self.confidence_tuner)
+            .await
+            .context("Failed during feedback processing and tuner update cycle")?;
+        info!("Orchestrator: Completed feedback processing and tuner update. ConfidenceTuner is now at v{}.", self.confidence_tuner.version);
+        // Optionally save the tuner immediately after processing feedback
+        self.save_models(pool)
+            .await
+            .context("Failed to save ConfidenceTuner after feedback processing")?;
+        Ok(())
+    }
+
+    // Utility to get tuner stats - useful for reporting
+    pub fn get_confidence_tuner_stats(&self) -> String {
+        self.confidence_tuner.get_stats_display() // Assuming ConfidenceTuner has a display method
+    }
+}
+
+// Adding a display method to ConfidenceTuner for the orchestrator to use
+// This should ideally be in confidence_tuner.rs, but adding here for context if not already present.
+// If ConfidenceTuner has `get_stats() -> HashMap<String, Vec<(f64, f64, usize)>>`, we can format it.
+impl ConfidenceTuner {
+    pub fn get_stats_display(&self) -> String {
+        let stats = self.get_stats(); // Assuming this method exists
+        let mut output = format!("Confidence Tuner (v{}) Statistics:\n", self.version);
         for (method, values) in stats {
             output.push_str(&format!("\nMethod: {}\n", method));
-            output.push_str("  Confidence | Avg Reward | Trials\n");
-            output.push_str("  -----------|------------|-------\n");
+            output.push_str("  Target Confidence | Avg Reward | Trials\n");
+            output.push_str("  -----------------|------------|-------\n");
             for (confidence, reward, trials) in values {
                 output.push_str(&format!(
-                    "    {:.2}     |   {:.4}    |  {}\n",
+                    "        {:.3}       |   {:.4}   |  {}\n",
                     confidence, reward, trials
                 ));
             }
         }
         output
-    }
-
-    pub async fn extract_entity_features(
-        // This method seems less used by orchestrator directly for pair matching
-        &self, // but might be a utility.
-        pool: &PgPool,
-        entity_id: &EntityId,
-    ) -> Result<Vec<f64>> {
-        let conn = pool.get().await?;
-        super::feature_extraction::extract_entity_features(&conn, entity_id).await
     }
 }

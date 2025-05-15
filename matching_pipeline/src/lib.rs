@@ -1,4 +1,5 @@
 // src/lib.rs
+pub mod cluster_visualization;
 pub mod config;
 pub mod consolidate_clusters;
 pub mod db;
@@ -9,7 +10,6 @@ pub mod reinforcement;
 pub mod results;
 pub mod service_matching;
 pub mod utils;
-pub mod cluster_visualization;
 
 // Re-export common types for easier access
 pub use models::{

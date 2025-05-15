@@ -70,10 +70,6 @@ name = "dedupe"
 path = "src/main.rs"
 
 [[bin]]
-name = "train_rl"
-path = "src/bin/train_rl.rs"
-
-[[bin]]
 name = "identify_entities"
 path = "src/bin/identify_entities.rs"
 
@@ -82,20 +78,12 @@ name = "extract_context_features"
 path = "src/bin/extract_context_features.rs"
 
 [[bin]]
-name = "match_email"
-path = "src/bin/match_email.rs"
-
-[[bin]]
 name = "match_phone"
 path = "src/bin/match_phone.rs"
 
 [[bin]]
 name = "match_url"
 path = "src/bin/match_url.rs"
-
-[[bin]]
-name = "match_address"
-path = "src/bin/match_address.rs"
 
 [[bin]]
 name = "match_name"

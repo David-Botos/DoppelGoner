@@ -14,10 +14,16 @@ use tokio::{sync::Mutex, task::JoinHandle};
 use uuid::Uuid;
 
 use dedupe_lib::{
-    cluster_visualization, config, consolidate_clusters, db::{self, PgPool}, entity_organizations, matching, models::*, reinforcement::{self, MatchingOrchestrator}, results::{
+    cluster_visualization, config, consolidate_clusters,
+    db::{self, PgPool},
+    entity_organizations, matching,
+    models::*,
+    reinforcement::{self, MatchingOrchestrator},
+    results::{
         self, AddressMatchResult, AnyMatchResult, EmailMatchResult, GeospatialMatchResult,
         MatchMethodStats, NameMatchResult, PhoneMatchResult, PipelineStats, UrlMatchResult,
-    }, service_matching
+    },
+    service_matching,
 };
 
 #[tokio::main]
@@ -84,9 +90,17 @@ async fn run_pipeline(
     // Initialize the ML reinforcement_orchestrator
     info!("Initializing ML-guided matching reinforcement_orchestrator");
 
-    let run_id = Uuid::new_v4().to_string();
+    let run_id_uuid = Uuid::new_v4();
+    let run_id = run_id_uuid.to_string();
     let run_id_clone = run_id.clone();
     let run_timestamp = Utc::now().naive_utc();
+    let description = Some("Regular pipeline run".to_string()); // Default description
+
+    // Create initial pipeline_run record to satisfy foreign key constraints
+    info!("Creating initial pipeline_run record");
+    db::create_initial_pipeline_run(pool, &run_id, run_timestamp, description.as_deref())
+        .await
+        .context("Failed to create initial pipeline_run record")?;
 
     // Initialize more complete stats structure
     let mut stats = results::PipelineStats {
@@ -129,7 +143,7 @@ async fn run_pipeline(
         stats.total_entities,
         phase1_start.elapsed()
     );
-    info!("Pipeline progress: [1/6] phases (17%)"); // Updated progress
+    info!("Pipeline progress: [1/6] phases (17%)");
 
     // Phase 2: Context Feature Extraction
     info!("Phase 2: Context Feature Extraction");
@@ -149,7 +163,7 @@ async fn run_pipeline(
         "Context Feature Extraction complete in {:.2?}. Phase 2 complete.",
         phase2_duration
     );
-    info!("Pipeline progress: [2/6] phases (33%)"); // Updated progress
+    info!("Pipeline progress: [2/6] phases (33%)");
 
     // Now initialize the ML reinforcement_orchestrator as features should be available
     info!("Initializing ML-guided matching reinforcement_orchestrator");
@@ -168,8 +182,12 @@ async fn run_pipeline(
     let reinforcement_orchestrator = Arc::new(Mutex::new(reinforcement_orchestrator_instance));
 
     let phase3_start = Instant::now();
-    let (total_groups, method_stats_match) = 
-        run_matching_pipeline(pool, reinforcement_orchestrator.clone(), run_id_clone.clone()).await?;
+    let (total_groups, method_stats_match) = run_matching_pipeline(
+        pool,
+        reinforcement_orchestrator.clone(),
+        run_id_clone.clone(),
+    )
+    .await?;
     stats.total_groups = total_groups;
     stats.method_stats.extend(method_stats_match);
     let phase3_duration = phase3_start.elapsed();
@@ -179,7 +197,7 @@ async fn run_pipeline(
         "Created {} entity groups in {:.2?}. Phase 3 complete.",
         stats.total_groups, phase3_duration
     );
-    info!("Pipeline progress: [3/6] phases (50%)"); // Updated progress
+    info!("Pipeline progress: [3/6] phases (50%)");
 
     // Phase 4: Cluster consolidation
     info!("Phase 4: Cluster consolidation");
@@ -193,25 +211,27 @@ async fn run_pipeline(
         "Formed {} clusters in {:.2?}. Phase 4 complete.",
         stats.total_clusters, phase4_duration
     );
-    info!("Pipeline progress: [4/6] phases (67%)"); // Updated progress
+    info!("Pipeline progress: [4/6] phases (67%)");
 
     // NEW PHASE 5: Visualization edge calculation
     info!("Phase 5: Calculating entity relationship edges for cluster visualization");
     let phase5_start = Instant::now();
     cluster_visualization::ensure_visualization_tables_exist(pool).await?;
-    stats.total_visualization_edges = cluster_visualization::calculate_visualization_edges(
-        pool, &run_id_clone
-    ).await?;
+    stats.total_visualization_edges =
+        cluster_visualization::calculate_visualization_edges(pool, &run_id_clone).await?;
     let phase5_duration = phase5_start.elapsed();
-    phase_times.insert("visualization_edge_calculation".to_string(), phase5_duration);
+    phase_times.insert(
+        "visualization_edge_calculation".to_string(),
+        phase5_duration,
+    );
     stats.visualization_edge_calculation_time = phase5_duration.as_secs_f64();
     info!(
         "Calculated {} entity relationship edges for visualization in {:.2?}. Phase 5 complete.",
         stats.total_visualization_edges, phase5_duration
     );
-    info!("Pipeline progress: [5/6] phases (83%)"); // Updated progress
+    info!("Pipeline progress: [5/6] phases (83%)");
 
-    // Now PHASE 6: Service matching (was Phase 5)
+    // PHASE 6: Service matching
     info!("Phase 6: Service matching");
     let phase6_start = Instant::now();
     let service_match_stats_result = service_matching::semantic_geospatial::match_services(pool)
@@ -233,7 +253,7 @@ async fn run_pipeline(
         + stats.context_feature_extraction_time
         + stats.matching_time
         + stats.clustering_time
-        + stats.visualization_edge_calculation_time  // Added new timing field
+        + stats.visualization_edge_calculation_time
         + stats.service_matching_time;
 
     Ok(stats)
@@ -288,13 +308,23 @@ async fn identify_entities(pool: &PgPool) -> Result<usize> {
     Ok(total_entities_count as usize)
 }
 
+
 async fn run_matching_pipeline(
     pool: &PgPool,
-    reinforcement_orchestrator: Arc<Mutex<reinforcement::MatchingOrchestrator>>, // Correctly taking Arc
+    reinforcement_orchestrator: Arc<Mutex<reinforcement::MatchingOrchestrator>>,
     run_id: String,
 ) -> Result<(usize, Vec<MatchMethodStats>)> {
     info!("Parallelizing matching strategies...");
     let start_time_matching = Instant::now();
+
+    // Parse the run_id into a UUID type
+    // This will fix the type mismatch between String and PostgreSQL UUID
+    let run_id_uuid = match Uuid::parse_str(&run_id) {
+        Ok(uuid) => uuid,
+        Err(e) => {
+            return Err(anyhow::anyhow!("Failed to parse run_id as UUID: {}", e));
+        }
+    };
 
     // The vector of JoinHandles will hold tasks that resolve to Result<AnyMatchResult, anyhow::Error>
     let mut tasks: Vec<JoinHandle<Result<AnyMatchResult, anyhow::Error>>> = Vec::new();
@@ -302,16 +332,16 @@ async fn run_matching_pipeline(
     // --- Spawn Email Matching Task ---
     let pool_clone_email = pool.clone();
     let orchestrator_clone_email = reinforcement_orchestrator.clone();
-    let run_id_clone_email = run_id.clone();
+    let run_id_clone_email = run_id.clone(); // Keep using string for compatibility with existing API
     tasks.push(tokio::spawn(async move {
         info!("Starting email matching task...");
         let result = matching::email::find_matches(
             &pool_clone_email,
-            Some(&orchestrator_clone_email),
+            Some(orchestrator_clone_email),
             &run_id_clone_email,
         )
         .await
-        .context("Email matching task failed"); // context applied to Result<AnyMatchResult, _>
+        .context("Email matching task failed");
         info!(
             "Email matching task finished successfully: {:?}",
             result.as_ref().map(|r| r.groups_created())
@@ -367,7 +397,7 @@ async fn run_matching_pipeline(
         info!("Starting address matching task...");
         let result = matching::address::find_matches(
             &pool_clone_address,
-            Some(&orchestrator_clone_address),
+            Some(orchestrator_clone_address),
             &run_id_clone_address,
         )
         .await
@@ -399,20 +429,21 @@ async fn run_matching_pipeline(
         result
     }));
 
+    // --- Spawn Geospatial Matching Task ---
     let pool_clone_geo = pool.clone();
-    let orchestrator_clone_geo = reinforcement_orchestrator.clone(); // Pass the Arc<Mutex<...>>
+    let orchestrator_clone_geo = reinforcement_orchestrator.clone();
     let run_id_clone_geo = run_id.clone();
     tasks.push(tokio::spawn(async move {
         info!("Starting geospatial matching task...");
         let result = matching::geospatial::find_matches(
             &pool_clone_geo,
-            Some(&orchestrator_clone_geo),
+            Some(orchestrator_clone_geo),
             &run_id_clone_geo,
         )
         .await
         .context("Geospatial matching task failed");
         info!(
-            "Geospatial matching task finished: {:?}", // Log success or failure details
+            "Geospatial matching task finished: {:?}",
             result.as_ref().map(|r| r.groups_created())
         );
         result
@@ -508,6 +539,14 @@ async fn consolidate_clusters_helper(
 ) -> Result<usize> {
     // Get the unassigned group count before we start
     let conn = pool.get().await.context("Failed to get DB connection")?;
+
+    // Parse the run_id into a UUID type to fix the type mismatch
+    let run_id_uuid = match Uuid::parse_str(&run_id) {
+        Ok(uuid) => uuid,
+        Err(e) => {
+            return Err(anyhow::anyhow!("Failed to parse run_id as UUID: {}", e));
+        }
+    };
 
     let unassigned_query =
         "SELECT COUNT(*) FROM public.entity_group WHERE group_cluster_id IS NULL";

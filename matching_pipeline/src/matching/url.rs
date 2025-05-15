@@ -1,7 +1,7 @@
 // src/matching/url.rs
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use log::{debug, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -27,8 +27,9 @@ use serde_json;
 // SQL query for inserting into entity_group
 const INSERT_ENTITY_GROUP_SQL: &str = "
     INSERT INTO public.entity_group
-    (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, pre_rl_confidence_score, created_at, updated_at, version)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1)";
+(id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, 
+ pre_rl_confidence_score)
+VALUES ($1, $2, $3, $4, $5, $6, $7)";
 
 // Confidence score tiers for URL matching
 const CONFIDENCE_DOMAIN_ONLY: f64 = 0.70; // Base match on just the domain
@@ -36,6 +37,75 @@ const CONFIDENCE_DOMAIN_PLUS_ONE_SLUG: f64 = 0.80;
 const CONFIDENCE_DOMAIN_PLUS_TWO_SLUGS: f64 = 0.88;
 const CONFIDENCE_DOMAIN_PLUS_THREE_OR_MORE_SLUGS: f64 = 0.92; // For 3 or more matching slugs but not full path
 const CONFIDENCE_DOMAIN_FULL_PATH_MATCH: f64 = 0.96; // Domain and full path match
+
+async fn insert_url_entity_group_pair(
+    pool: &PgPool,
+    entity_id_1: &EntityId,
+    entity_id_2: &EntityId,
+    match_values: &MatchValues,
+    confidence_score: f64,
+    pre_rl_confidence_score: f64,
+) -> Result<EntityGroupId> {
+    let mut conn = pool
+        .get()
+        .await
+        .context("Failed to get DB connection from pool for URL insert")?;
+    let tx = conn
+        .transaction()
+        .await
+        .context("Failed to start transaction for URL entity_group insert")?;
+
+    let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
+    let match_values_json = serde_json::to_value(match_values)
+        .context("Failed to serialize match_values for URL insert")?;
+
+    match tx
+        .execute(
+            INSERT_ENTITY_GROUP_SQL,
+            &[
+                &new_entity_group_id.0,
+                &entity_id_1.0,
+                &entity_id_2.0,
+                &MatchMethodType::Url.as_str(),
+                &match_values_json,
+                &confidence_score,
+                &pre_rl_confidence_score,
+            ],
+        )
+        .await
+    {
+        Ok(_) => {
+            tx.commit()
+                .await
+                .context("Failed to commit transaction for URL entity_group insert")?;
+            Ok(new_entity_group_id)
+        }
+        Err(e) => {
+            let r_err = tx.rollback().await;
+            if let Err(rollback_err) = r_err {
+                error!("Failed to rollback transaction after URL insert error for pair ({}, {}): {}. Original error: {}",
+                       entity_id_1.0, entity_id_2.0, rollback_err, e);
+            } else {
+                if let Some(db_err) = e.as_db_error() {
+                    if db_err.constraint() == Some("uq_entity_pair_method") {
+                        debug!("URL pair ({}, {}) already exists (constraint violation). Rolled back transaction.", 
+                               entity_id_1.0, entity_id_2.0);
+                    } else {
+                        warn!("DB error inserting URL entity_group for pair ({}, {}): {:?}. Rolled back transaction.", 
+                              entity_id_1.0, entity_id_2.0, db_err);
+                    }
+                } else {
+                    warn!("Error inserting URL entity_group for pair ({}, {}): {}. Rolled back transaction.", 
+                          entity_id_1.0, entity_id_2.0, e);
+                }
+            }
+            Err(anyhow!(e).context(format!(
+                "DB error inserting URL entity_group for pair ({}, {})",
+                entity_id_1.0, entity_id_2.0
+            )))
+        }
+    }
+}
 
 /// List of common social media and URL shortening domains to ignore.
 fn is_ignored_domain(domain: &str) -> bool {
@@ -406,80 +476,79 @@ pub async fn find_matches(
                     base_confidence_score = CONFIDENCE_DOMAIN_ONLY;
                 }
 
+                // Initialize confidence score and related variables
                 let mut final_confidence_score = base_confidence_score;
                 let mut predicted_method_type_from_ml = MatchMethodType::Url; // Default if ML not used or fails
-                let mut features_for_logging: Option<Vec<f64>> = None;
+                let mut ml_prediction_confidence_for_logging: Option<f64> = None;
+                let pre_rl_confidence = base_confidence_score;
 
-                // put any bonuses or penalties here
+                // Extract features once and store them for later use
+                let features_for_rl = if reinforcement_orchestrator.is_some() {
+                    match MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id)
+                        .await
+                    {
+                        Ok(f) => Some(f),
+                        Err(e) => {
+                            warn!("Failed to extract context features for pair ({}, {}): {}. Proceeding without RL tuning for this pair.", 
+                                  e1_id.0, e2_id.0, e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
 
-                let pre_rl_confidence = final_confidence_score;
-
-                if let Some(orchestrator_mutex) = reinforcement_orchestrator {
-                    match MatchingOrchestrator::extract_pair_context(pool, e1_id, e2_id).await {
-                        Ok(features) => {
-                            features_for_logging = Some(features.clone());
-                            let orchestrator_guard = orchestrator_mutex.lock().await;
-                            match orchestrator_guard.predict_method_with_context(&features) {
-                                Ok((predicted_method, rl_conf)) => {
-                                    predicted_method_type_from_ml = predicted_method;
-                                    // Here, you might decide how RL confidence (rl_conf) influences
-                                    // the base_confidence_score. For example, it could scale it,
-                                    // replace it, or be used as a weighted average.
-                                    // For now, let's assume the RL provides the final_confidence_score
-                                    // if it successfully predicts.
-                                    // This interaction needs careful design based on RL strategy.
-                                    // As a simple approach, let's use the RL confidence if available,
-                                    // otherwise stick to the rule-based one.
-                                    final_confidence_score = rl_conf;
-                                    info!("ML guidance for URL pair ({}, {}), domain '{}': Predicted Method: {:?}, RL Confidence: {:.4}. Rule-based confidence was: {:.4}", e1_id.0, e2_id.0, normalized_shared_domain, predicted_method_type_from_ml, final_confidence_score, base_confidence_score);
-                                }
-                                Err(e) => {
-                                    warn!("ML prediction failed for URL pair ({}, {}), domain '{}': {}. Using rule-based confidence {:.4}.", e1_id.0, e2_id.0, normalized_shared_domain, e, final_confidence_score);
-                                    // final_confidence_score remains base_confidence_score
-                                }
+                // Apply RL tuning if orchestrator and features are available
+                if let (Some(orch_arc), Some(ref extracted_features)) = (
+                    reinforcement_orchestrator.as_ref(),
+                    features_for_rl.as_ref(),
+                ) {
+                    if !extracted_features.is_empty() {
+                        // Lock the orchestrator for getting the tuned confidence
+                        let orchestrator_guard = orch_arc.lock().await;
+                        match orchestrator_guard.get_tuned_confidence(
+                            &MatchMethodType::Url,
+                            pre_rl_confidence,
+                            extracted_features,
+                        ) {
+                            Ok(tuned_score) => {
+                                final_confidence_score = tuned_score;
+                                debug!(
+                                    "Got tuned confidence score: {:.4} for URL pair ({}, {})",
+                                    tuned_score, e1_id.0, e2_id.0
+                                );
+                            }
+                            Err(e) => {
+                                warn!("Failed to get tuned confidence for pair ({}, {}), method {}: {}. Using pre-RL score.", 
+                                      e1_id.0, e2_id.0, MatchMethodType::Url.as_str(), e);
                             }
                         }
-                        Err(e) => {
-                            warn!("Context extraction failed for URL pair ({}, {}), domain '{}': {}. Using rule-based confidence {:.4}.", e1_id.0, e2_id.0, normalized_shared_domain, e, final_confidence_score);
-                            // final_confidence_score remains base_confidence_score
-                        }
+                        // Release the orchestrator lock
+                        drop(orchestrator_guard);
                     }
                 }
 
+                // Create match values
                 let match_values = MatchValues::Url(UrlMatchValue {
                     original_url1: e1_orig_url.clone(),
                     original_url2: e2_orig_url.clone(),
                     normalized_shared_domain: normalized_shared_domain.clone(),
-                    matching_slug_count: matching_slug_count, // Store the count
+                    matching_slug_count,
                 });
-                let match_values_json = serde_json::to_value(&match_values).with_context(|| {
-                    format!(
-                        "Failed to serialize URL MatchValues for pair ({}, {})",
-                        e1_id.0, e2_id.0
-                    )
-                })?;
 
-                let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
-
-                let insert_result = conn
-                    .execute(
-                        INSERT_ENTITY_GROUP_SQL,
-                        &[
-                            &new_entity_group_id.0,
-                            &e1_id.0,
-                            &e2_id.0,
-                            &MatchMethodType::Url.as_str(),
-                            &match_values_json,
-                            &final_confidence_score,
-                            &pre_rl_confidence,
-                            &now,
-                            &now,
-                        ],
-                    )
-                    .await;
-
-                match insert_result {
-                    Ok(_) => {
+                // Insert the entity group using our helper function
+                match insert_url_entity_group_pair(
+                    pool,
+                    e1_id,
+                    e2_id,
+                    &match_values,
+                    final_confidence_score,
+                    pre_rl_confidence,
+                )
+                .await
+                {
+                    Ok(new_entity_group_id) => {
+                        // Successfully created entity group
                         new_pairs_created_count += 1;
                         entities_in_new_pairs.insert(e1_id.clone());
                         entities_in_new_pairs.insert(e2_id.clone());
@@ -491,26 +560,53 @@ pub async fn find_matches(
                             new_entity_group_id.0, e1_id.0, e2_id.0, normalized_shared_domain, matching_slug_count, final_confidence_score
                         );
 
-                        if let Some(orchestrator_mutex) = reinforcement_orchestrator {
-                            let mut orchestrator_guard = orchestrator_mutex.lock().await;
-                            if let Err(e) = orchestrator_guard
-                                .log_match_result(
-                                    pool,
-                                    e1_id,
-                                    e2_id,
-                                    &MatchMethodType::Url, // Actual method used for this decision logic path
-                                    final_confidence_score,
-                                    true, // Assuming creation implies a "correct" match for RL logging at this stage
-                                    features_for_logging.as_ref(),
-                                    Some(&predicted_method_type_from_ml), // Method predicted by ML
-                                    Some(final_confidence_score), // Using final_confidence_score also as ml_prediction_confidence for simplicity if RL overrode
-                                )
-                                .await
-                            {
-                                warn!("Failed to log URL match result to entity_match_pairs for ({},{}): {}", e1_id.0, e2_id.0, e);
+                        // Log decision in RL system if features were extracted
+                        if let (Some(orch_arc), Some(ref extracted_features)) = (
+                            reinforcement_orchestrator.as_ref(),
+                            features_for_rl.as_ref(),
+                        ) {
+                            if !extracted_features.is_empty() {
+                                // Lock orchestrator for logging decision
+                                let orchestrator_guard = orch_arc.lock().await;
+
+                                let log_result = orchestrator_guard
+                                    .log_decision_snapshot(
+                                        pool,
+                                        &new_entity_group_id.0,
+                                        pipeline_run_id,
+                                        extracted_features,
+                                        &MatchMethodType::Url,
+                                        pre_rl_confidence,
+                                        final_confidence_score,
+                                    )
+                                    .await;
+
+                                match log_result {
+                                    Ok(_) => {
+                                        debug!("Successfully logged decision snapshot for URL entity_group {}", 
+                                               new_entity_group_id.0);
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to log decision snapshot for entity_group {}: {}", 
+                                              new_entity_group_id.0, e);
+
+                                        debug!(
+                                            "Decision snapshot failure details - entity_group_id: {}, pipeline_run_id: {}, method: {}, scores: {:.4}/{:.4}",
+                                            new_entity_group_id.0,
+                                            pipeline_run_id,
+                                            MatchMethodType::Url.as_str(),
+                                            pre_rl_confidence,
+                                            final_confidence_score
+                                        );
+                                    }
+                                }
+
+                                // Release orchestrator lock
+                                drop(orchestrator_guard);
                             }
                         }
 
+                        // Create suggestion for low confidence matches
                         if final_confidence_score < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
                             let priority = if final_confidence_score
                                 < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD
@@ -519,6 +615,7 @@ pub async fn find_matches(
                             } else {
                                 1 // Medium priority for moderate
                             };
+
                             let details_json = serde_json::json!({
                                 "method_type": MatchMethodType::Url.as_str(),
                                 "matched_value": &normalized_shared_domain,
@@ -529,11 +626,14 @@ pub async fn find_matches(
                                 "rule_based_confidence": base_confidence_score,
                                 "rl_predicted_method": predicted_method_type_from_ml.as_str(),
                                 "final_confidence": final_confidence_score,
+                                "ml_prediction_confidence": ml_prediction_confidence_for_logging,
                             });
+
                             let reason_message = format!(
                                 "Pair ({}, {}) matched by URL with confidence {:.4} ({} matching slugs). Rule-based: {:.2}. RL-predicted: {:?}.",
                                 e1_id.0, e2_id.0, final_confidence_score, matching_slug_count, base_confidence_score, predicted_method_type_from_ml
                             );
+
                             let suggestion = NewSuggestedAction {
                                 pipeline_run_id: Some(pipeline_run_id.to_string()),
                                 action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
@@ -551,41 +651,66 @@ pub async fn find_matches(
                                 reviewed_at: None,
                                 review_notes: None,
                             };
-                            if let Err(e) = db::insert_suggestion(&*conn, &suggestion).await {
-                                warn!("Failed to log suggestion for low confidence URL pair ({}, {}): {}. This operation was attempted on the main connection.", e1_id.0, e2_id.0, e);
+
+                            // Use a separate connection and transaction for suggestion
+                            match pool.get().await {
+                                Ok(mut temp_conn_sugg) => {
+                                    match temp_conn_sugg.transaction().await {
+                                        Ok(sugg_tx) => {
+                                            match db::insert_suggestion(&sugg_tx, &suggestion).await
+                                            {
+                                                Ok(_) => {
+                                                    if let Err(commit_err) = sugg_tx.commit().await
+                                                    {
+                                                        error!("Failed to commit suggestion transaction: {}", commit_err);
+                                                    } else {
+                                                        debug!("Successfully inserted review suggestion for low-confidence URL match");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to log suggestion for low confidence URL pair ({}, {}): {}", 
+                                                          e1_id.0, e2_id.0, e);
+
+                                                    if let Err(rollback_err) =
+                                                        sugg_tx.rollback().await
+                                                    {
+                                                        error!("Failed to rollback suggestion transaction: {}", rollback_err);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(tx_err) => {
+                                            warn!("Failed to start transaction for URL suggestion: {}", tx_err);
+                                        }
+                                    }
+                                }
+                                Err(conn_err) => {
+                                    warn!(
+                                        "Failed to get DB connection for URL suggestion: {}",
+                                        conn_err
+                                    );
+                                }
                             }
                         }
                     }
                     Err(e) => {
-                        let error_message = format!(
-                            "Failed to insert URL pair group for ({}, {}) with shared domain '{}'",
-                            e1_id.0, e2_id.0, normalized_shared_domain
-                        );
-                        if let Some(db_err) = e.as_db_error() {
-                            if db_err.constraint() == Some("uq_entity_pair_method") {
-                                debug!("{}: Pair already exists (DB constraint uq_entity_pair_method). Skipping.", error_message);
-                                existing_processed_pairs.insert((e1_id.clone(), e2_id.clone()));
-                            // Mark as processed
-                            } else {
-                                warn!("{}: Database error: {:?}. SQLState: {:?}, Detail: {:?}, Hint: {:?}",
-                                    error_message, db_err, db_err.code(), db_err.detail(), db_err.hint());
-                            }
-                        } else {
-                            warn!("{}: Non-database error: {}", error_message, e);
-                        }
+                        // Entity group creation failed, already logged in helper function
                     }
                 }
             }
         }
     }
+
     debug!("Finished processing URL pairs.");
 
+    // Calculate average confidence for statistics
     let avg_confidence: f64 = if !confidence_scores_for_stats.is_empty() {
         confidence_scores_for_stats.iter().sum::<f64>() / confidence_scores_for_stats.len() as f64
     } else {
         0.0
     };
 
+    // Prepare method statistics
     let method_stats = MatchMethodStats {
         method_type: MatchMethodType::Url,
         groups_created: new_pairs_created_count,
@@ -598,14 +723,16 @@ pub async fn find_matches(
         },
     };
 
+    // Log summary and return result
     let elapsed = start_time.elapsed();
     info!(
-        "Pairwise URL matching with slug-based confidence complete in {:.2?}: created {} new pairs, involving {} unique entities. Avg confidence: {:.4}. Errors for individual pairs (if any) were logged above.",
+        "Pairwise URL matching with slug-based confidence complete in {:.2?}: created {} new pairs, involving {} unique entities. Avg confidence: {:.4}",
         elapsed,
         method_stats.groups_created,
         method_stats.entities_matched,
         method_stats.avg_confidence,
     );
+
     let url_result = UrlMatchResult {
         groups_created: method_stats.groups_created,
         stats: method_stats,

@@ -1,19 +1,30 @@
+// src/reinforcement/types.rs
 use serde::{Deserialize, Serialize};
 
+// TrainingExample might be obsolete for V1 if ConfidenceTuner is updated directly via rewards.
+// Kept for now, but review its necessity based on the final ConfidenceTuner update mechanism.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainingExample {
-    pub features: Vec<f64>,
-    pub best_method: String,
-    pub confidence: f64,
+    pub features: Vec<f64>,     // The 31-element feature vector
+    pub method_type: String,    // The method that generated the pre_rl_score
+    pub pre_rl_confidence: f64, // The confidence score from the heuristic method
+    pub tuned_confidence: f64,  // The confidence score output by the tuner for this instance
+    pub reward: f64,            // Typically 1.0 for correct, 0.0 or -1.0 for incorrect
 }
 
+// Represents a feedback item fetched from the database for tuner updates.
+// This structure aligns with the new `clustering_metadata.human_feedback` table
+// and the necessary details from `clustering_metadata.match_decision_details`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FeedbackItem {
-    pub entity_id1: String,
-    pub entity_id2: String,
-    pub method_type: String,
-    pub confidence: f64,
-    pub was_correct: bool,
+pub struct HumanFeedbackDataForTuner {
+    pub feedback_id: uuid::Uuid, // From human_feedback.id
+    pub entity_group_id: String, // From human_feedback.entity_group_id
+    pub is_match_correct: bool,  // From human_feedback.is_match_correct
+
+    // Details from the original decision, fetched from match_decision_details
+    pub method_type_at_decision: String,
+    pub snapshotted_features: Vec<f64>,
+    pub tuned_confidence_at_decision: f64, // The confidence score the tuner originally outputted
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +35,7 @@ pub struct FeatureMetadata {
     pub max_value: f64,
 }
 
+// ConfidenceClass can still be useful for categorizing or analyzing confidence scores.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ConfidenceClass {
     VeryHigh, // 0.95-1.0
@@ -55,22 +67,22 @@ impl ConfidenceClass {
     }
 }
 
-// Add a struct to hold model performance metrics
+// Struct to hold model performance metrics (can be used for ConfidenceTuner evaluation)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMetrics {
-    pub accuracy: f64,
-    pub precision: f64,
-    pub recall: f64,
-    pub f1_score: f64,
-    pub sample_count: usize,
+    pub accuracy: Option<f64>, // Overall accuracy based on rewards
+    pub average_reward: Option<f64>,
+    pub trials_per_method_arm: Option<serde_json::Value>, // JSON representation of tuner stats
+    pub sample_count: usize,                              // Number of feedback items processed
 }
 
-// Add a utility struct for tracking ML experiment results
+// Utility struct for tracking ML experiment results (can be used for ConfidenceTuner versions)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExperimentResult {
     pub experiment_id: String,
+    pub model_name: String, // e.g., "ConfidenceTuner"
     pub model_version: u32,
-    pub parameters: serde_json::Value,
+    pub parameters: serde_json::Value, // e.g., tuner's epsilon, arm definitions
     pub metrics: ModelMetrics,
-    pub created_at: String,
+    pub created_at: String, // ISO 8601 timestamp
 }

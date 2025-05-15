@@ -753,25 +753,8 @@ async fn verify_clusters(
             );
 
             let context_features_result =
-                MatchingOrchestrator::extract_pair_context(pool, &entity1_id, &entity2_id).await;
-
-            match context_features_result {
-                Ok(features) => {
-                    let orchestrator_guard = reinforcement_orchestrator_mutex.lock().await;
-                    match orchestrator_guard.predict_method_with_context(&features) {
-                        Ok((_method, confidence)) => {
-                            verification_scores.push(confidence);
-                            debug!("Pair ({}, {}) in cluster {} - predicted confidence: {:.4}", entity1_id.0, entity2_id.0, cluster_id.0, confidence);
-                        }
-                        Err(e) => warn!("Error during verification pair prediction for ({}, {}) in cluster {}: {}", entity1_id.0, entity2_id.0, cluster_id.0, e),
-                    }
-                    // Removed: drop(orchestrator_guard); // lock guard drops automatically at end of scope
-                }
-                Err(e) => warn!(
-                    "Error extracting context for ({}, {}) in cluster {}: {}",
-                    entity1_id.0, entity2_id.0, cluster_id.0, e
-                ),
-            }
+                MatchingOrchestrator::extract_pair_context_features(pool, &entity1_id, &entity2_id)
+                    .await;
         }
 
         let avg_score_to_store: Option<f64>; // Use Option for clarity in update

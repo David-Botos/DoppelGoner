@@ -31,87 +31,83 @@ struct GroupClusterRecord {
 /// Ensures the tables needed for visualization edge weights exist
 pub async fn ensure_visualization_tables_exist(pool: &PgPool) -> Result<()> {
     let client = pool.get().await.context("Failed to get DB connection")?;
-    
-    // Define the edge table if it doesn't exist yet
-    let create_table_sql = "
-        CREATE TABLE IF NOT EXISTS clustering_metadata.cluster_entity_edges (
-            id TEXT PRIMARY KEY NOT NULL,
-            cluster_id TEXT NOT NULL REFERENCES public.group_cluster(id),
-            entity_id_1 TEXT NOT NULL REFERENCES public.entity(id),
-            entity_id_2 TEXT NOT NULL REFERENCES public.entity(id),
-            edge_weight DOUBLE PRECISION NOT NULL,
-            details JSONB,
-            pipeline_run_id TEXT REFERENCES clustering_metadata.pipeline_run(id),
-            created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            CONSTRAINT check_entity_order CHECK (entity_id_1 < entity_id_2)
-        )
-    ";
-    
-    client.execute(create_table_sql, &[]).await
-        .context("Failed to create cluster_entity_edges table")?;
-    
+
     // Create indices for performance
     let index_sqls = [
         "CREATE INDEX IF NOT EXISTS idx_cluster_entity_edges_cluster_id 
          ON clustering_metadata.cluster_entity_edges(cluster_id)",
-         
         "CREATE INDEX IF NOT EXISTS idx_cluster_entity_edges_entity_pairs 
-         ON clustering_metadata.cluster_entity_edges(entity_id_1, entity_id_2)"
+         ON clustering_metadata.cluster_entity_edges(entity_id_1, entity_id_2)",
     ];
-    
+
     for sql in &index_sqls {
-        client.execute(*sql, &[]).await
+        client
+            .execute(*sql, &[])
+            .await
             .context(format!("Failed to create index with SQL: {}", sql))?;
     }
-    
+
     Ok(())
 }
 
 /// Main function to calculate edge weights between entities within each cluster
 /// These edge weights will be used for frontend visualization
-pub async fn calculate_visualization_edges(
-    pool: &PgPool,
-    pipeline_run_id: &str,
-) -> Result<usize> {
-    info!("Starting entity edge weight calculation for cluster visualization (run ID: {})...", pipeline_run_id);
+pub async fn calculate_visualization_edges(pool: &PgPool, pipeline_run_id: &str) -> Result<usize> {
+    info!(
+        "Starting entity edge weight calculation for cluster visualization (run ID: {})...",
+        pipeline_run_id
+    );
     let start_time = Instant::now();
 
-    let mut conn = pool.get().await
+    let mut conn = pool
+        .get()
+        .await
         .context("Failed to get DB connection for calculate_visualization_edges")?;
-    let transaction = conn.transaction().await
+    let transaction = conn
+        .transaction()
+        .await
         .context("Failed to start transaction for calculate_visualization_edges")?;
 
     // Clean up existing edges for this run
-    transaction.execute(
-        "DELETE FROM public.visualization_entity_edges WHERE pipeline_run_id = $1",
-        &[&pipeline_run_id]
-    ).await.context("Failed to clean up existing edges")?;
+    transaction
+        .execute(
+            "DELETE FROM public.visualization_entity_edges WHERE pipeline_run_id = $1",
+            &[&pipeline_run_id],
+        )
+        .await
+        .context("Failed to clean up existing edges")?;
 
     // Fetch all clusters
     let clusters = fetch_clusters(&transaction).await?;
-    info!("Processing {} clusters for visualization edge calculation", clusters.len());
-    
+    info!(
+        "Processing {} clusters for visualization edge calculation",
+        clusters.len()
+    );
+
     let mut total_edges = 0;
-    
+
     for cluster in &clusters {
         let edges_count = process_cluster_for_visualization(
-            &transaction, 
-            &GroupClusterId(cluster.id.clone()), 
-            pipeline_run_id
-        ).await?;
-        
+            &transaction,
+            &GroupClusterId(cluster.id.clone()),
+            pipeline_run_id,
+        )
+        .await?;
+
         total_edges += edges_count;
     }
 
-    transaction.commit().await
+    transaction
+        .commit()
+        .await
         .context("Failed to commit cluster visualization edge transaction")?;
-        
+
     info!(
         "Cluster visualization edge calculation finished in {:.2?}. {} edges created.",
         start_time.elapsed(),
         total_edges
     );
-    
+
     Ok(total_edges)
 }
 
@@ -121,40 +117,52 @@ async fn process_cluster_for_visualization(
     cluster_id: &GroupClusterId,
     pipeline_run_id: &str,
 ) -> Result<usize> {
-    debug!("Processing cluster {} for visualization edges", cluster_id.0);
-    
+    debug!(
+        "Processing cluster {} for visualization edges",
+        cluster_id.0
+    );
+
     // 1. Get all unique entities in this cluster
     let entities = fetch_entities_in_cluster(transaction, cluster_id).await?;
     if entities.len() < 2 {
-        debug!("Cluster {} has fewer than 2 entities, skipping visualization edge calculation", cluster_id.0);
+        debug!(
+            "Cluster {} has fewer than 2 entities, skipping visualization edge calculation",
+            cluster_id.0
+        );
         return Ok(0);
     }
-    
-    debug!("Found {} entities in cluster {}", entities.len(), cluster_id.0);
-    
+
+    debug!(
+        "Found {} entities in cluster {}",
+        entities.len(),
+        cluster_id.0
+    );
+
     // 2. Get RL weight based on human feedback
     let rl_weight = get_rl_weight_from_feedback(transaction).await?;
-    debug!("Using RL confidence weight of {:.2} based on human feedback", rl_weight);
-    
+    debug!(
+        "Using RL confidence weight of {:.2} based on human feedback",
+        rl_weight
+    );
+
     // 3. For each entity pair, calculate edge weight
     let mut edges_created = 0;
     for i in 0..entities.len() {
         for j in (i + 1)..entities.len() {
             let entity1_id = &entities[i];
             let entity2_id = &entities[j];
-            
+
             // Ensure consistent ordering (entity_id_1 < entity_id_2)
             let (source_id, target_id) = if entity1_id.0 < entity2_id.0 {
                 (entity1_id, entity2_id)
             } else {
                 (entity2_id, entity1_id)
             };
-            
+
             // Find all matching methods between these entities
-            let matching_methods = fetch_entity_matching_methods(
-                transaction, source_id, target_id
-            ).await?;
-            
+            let matching_methods =
+                fetch_entity_matching_methods(transaction, source_id, target_id).await?;
+
             if !matching_methods.is_empty() {
                 let edge_id = create_visualization_edge(
                     transaction,
@@ -164,26 +172,32 @@ async fn process_cluster_for_visualization(
                     &matching_methods,
                     rl_weight,
                     pipeline_run_id,
-                ).await?;
-                
+                )
+                .await?;
+
                 if !edge_id.is_empty() {
                     edges_created += 1;
                 }
             }
         }
     }
-    
-    debug!("Created {} visualization edges for cluster {}", edges_created, cluster_id.0);
+
+    debug!(
+        "Created {} visualization edges for cluster {}",
+        edges_created, cluster_id.0
+    );
     Ok(edges_created)
 }
 
 /// Fetch all clusters from the database
 async fn fetch_clusters(transaction: &Transaction<'_>) -> Result<Vec<GroupClusterRecord>> {
     let query = "SELECT id, name, entity_count, average_coherence_score FROM public.group_cluster";
-    
-    let rows = transaction.query(query, &[]).await
+
+    let rows = transaction
+        .query(query, &[])
+        .await
         .context("Failed to fetch clusters")?;
-    
+
     let mut clusters = Vec::with_capacity(rows.len());
     for row in rows {
         clusters.push(GroupClusterRecord {
@@ -193,7 +207,7 @@ async fn fetch_clusters(transaction: &Transaction<'_>) -> Result<Vec<GroupCluste
             average_coherence_score: row.get("average_coherence_score"),
         });
     }
-    
+
     Ok(clusters)
 }
 
@@ -210,16 +224,18 @@ async fn fetch_entities_in_cluster(
         SELECT DISTINCT entity_id_2 as entity_id FROM public.entity_group 
         WHERE group_cluster_id = $1
     ";
-    
-    let rows = transaction.query(query, &[&cluster_id.0]).await
+
+    let rows = transaction
+        .query(query, &[&cluster_id.0])
+        .await
         .context("Failed to fetch entities in cluster")?;
-    
+
     let mut entities = Vec::with_capacity(rows.len());
     for row in rows {
         let entity_id: String = row.get("entity_id");
         entities.push(EntityId(entity_id));
     }
-    
+
     Ok(entities)
 }
 
@@ -235,10 +251,12 @@ async fn fetch_entity_matching_methods(
         FROM public.entity_group
         WHERE entity_id_1 = $1 AND entity_id_2 = $2
     ";
-    
-    let rows = transaction.query(query, &[&entity1_id.0, &entity2_id.0]).await
+
+    let rows = transaction
+        .query(query, &[&entity1_id.0, &entity2_id.0])
+        .await
         .context("Failed to fetch entity matching methods")?;
-    
+
     let mut methods = Vec::with_capacity(rows.len());
     for row in rows {
         methods.push(EntityGroupRecord {
@@ -249,7 +267,7 @@ async fn fetch_entity_matching_methods(
             match_values: row.get("match_values"),
         });
     }
-    
+
     Ok(methods)
 }
 
@@ -264,14 +282,14 @@ async fn get_rl_weight_from_feedback(transaction: &Transaction<'_>) -> Result<f6
         FROM clustering_metadata.human_review_method_feedback
         WHERE reviewer_id != 'ml_system'
     ";
-    
+
     // This might fail if the table doesn't exist yet, so we need to handle that
     let result = transaction.query_opt(query, &[]).await;
     match result {
         Ok(Some(row)) => {
             let correct_count: i64 = row.get("correct_count");
             let incorrect_count: i64 = row.get("incorrect_count");
-            
+
             // Calculate weight based on ML system accuracy
             if correct_count + incorrect_count > 0 {
                 let accuracy = correct_count as f64 / (correct_count + incorrect_count) as f64;
@@ -282,7 +300,7 @@ async fn get_rl_weight_from_feedback(transaction: &Transaction<'_>) -> Result<f6
                 // No feedback yet
                 Ok(0.6) // Balanced default
             }
-        },
+        }
         _ => {
             // Table might not exist or query had an issue
             debug!("Could not query human feedback, using default RL weight");
@@ -303,24 +321,26 @@ async fn create_visualization_edge(
 ) -> Result<String> {
     // Calculate edge weight
     let pre_rl_weight = 1.0 - rl_weight;
-    
+
     // For each matching method, calculate its contribution
     let mut method_details = Vec::new();
     let mut method_confidences = Vec::new();
-    
+
     for method in matching_methods {
         // Default to the RL confidence if pre_rl is missing
-        let pre_rl_conf = method.pre_rl_confidence_score
+        let pre_rl_conf = method
+            .pre_rl_confidence_score
             .unwrap_or_else(|| method.confidence_score.unwrap_or(0.0));
-            
+
         // Default to pre_rl if RL is missing
-        let rl_conf = method.confidence_score
+        let rl_conf = method
+            .confidence_score
             .unwrap_or_else(|| method.pre_rl_confidence_score.unwrap_or(0.0));
-        
+
         // Combined confidence
         let combined_confidence = (pre_rl_weight * pre_rl_conf) + (rl_weight * rl_conf);
         method_confidences.push(combined_confidence);
-        
+
         // Store details for JSONB
         method_details.push(json!({
             "method_type": method.method_type,
@@ -329,7 +349,7 @@ async fn create_visualization_edge(
             "combined_confidence": combined_confidence
         }));
     }
-    
+
     // Calculate aggregate edge weight using probabilistic combination
     // This ensures multiple weak methods don't produce a stronger edge than one strong method
     let edge_weight = if method_confidences.is_empty() {
@@ -337,9 +357,11 @@ async fn create_visualization_edge(
     } else {
         // 1 - product of (1 - confidence)
         // Similar approach as used in consolidate_clusters.rs for edge weight calculation
-        1.0 - method_confidences.iter().fold(1.0, |acc, &conf| acc * (1.0 - conf.max(0.0).min(1.0)))
+        1.0 - method_confidences
+            .iter()
+            .fold(1.0, |acc, &conf| acc * (1.0 - conf.max(0.0).min(1.0)))
     };
-    
+
     // Store the edge
     let edge_id = Uuid::new_v4().to_string();
     let details_json = json!({
@@ -347,21 +369,24 @@ async fn create_visualization_edge(
         "rl_weight_factor": rl_weight,
         "method_count": matching_methods.len()
     });
-    
-    transaction.execute(
-        "INSERT INTO public.visualization_entity_edges
+
+    transaction
+        .execute(
+            "INSERT INTO public.visualization_entity_edges
          (id, cluster_id, entity_id_1, entity_id_2, edge_weight, details, pipeline_run_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        &[
-            &edge_id,
-            &cluster_id.0,
-            &entity1_id.0,
-            &entity2_id.0,
-            &edge_weight,
-            &details_json,
-            &pipeline_run_id,
-        ],
-    ).await.context("Failed to insert visualization entity edge")?;
-    
+            &[
+                &edge_id,
+                &cluster_id.0,
+                &entity1_id.0,
+                &entity2_id.0,
+                &edge_weight,
+                &details_json,
+                &pipeline_run_id,
+            ],
+        )
+        .await
+        .context("Failed to insert visualization entity edge")?;
+
     Ok(edge_id)
 }

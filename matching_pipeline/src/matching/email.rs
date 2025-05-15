@@ -3,6 +3,7 @@ use anyhow::{anyhow, Context, Result}; // Added anyhow for error creation
 use chrono::Utc;
 use log::{debug, error, info, warn}; // Added error log level
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -24,49 +25,47 @@ use crate::reinforcement::MatchingOrchestrator;
 use crate::results::{AnyMatchResult, EmailMatchResult, MatchMethodStats}; // Removed PairMlResult as it's part of orchestrator logic now
 use serde_json;
 
-// Helper function to insert a single entity group pair in its own transaction
+// SQL for inserting entity_group, now includes new confirmed_status and nullable review fields
+const INSERT_ENTITY_GROUP_SQL: &str = "
+    INSERT INTO public.entity_group
+(id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, 
+ pre_rl_confidence_score)
+VALUES ($1, $2, $3, $4, $5, $6, $7)";
+
+// Helper function to insert a single entity group pair.
 async fn insert_single_entity_group_pair(
     pool: &PgPool,
     entity_id_1: &EntityId,
     entity_id_2: &EntityId,
     method_type: &MatchMethodType,
     match_values: &MatchValues,
-    confidence_score: f64,
-    pre_rl_confidence_score: f64, // Add the new parameter
+    final_confidence_score: f64,  // This is the tuned score
+    pre_rl_confidence_score: f64, // The original heuristic score
 ) -> Result<EntityGroupId> {
     let mut conn = pool
         .get()
         .await
-        .context("Failed to get DB connection from pool for single insert")?;
+        .context("Email: Failed to get DB connection for single insert")?;
     let tx = conn
         .transaction()
         .await
-        .context("Failed to start transaction for single entity_group insert")?;
+        .context("Email: Failed to start transaction for single entity_group insert")?;
 
     let new_entity_group_id = EntityGroupId(Uuid::new_v4().to_string());
-    let now = Utc::now().naive_utc();
     let match_values_json = serde_json::to_value(match_values)
-        .context("Failed to serialize match_values for single insert")?;
-
-    let insert_query = "
-        INSERT INTO public.entity_group
-        (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, pre_rl_confidence_score, created_at, updated_at, version)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1)
-    ";
+        .context("Email: Failed to serialize match_values for single insert")?;
 
     match tx
         .execute(
-            insert_query,
+            INSERT_ENTITY_GROUP_SQL,
             &[
                 &new_entity_group_id.0,
                 &entity_id_1.0,
                 &entity_id_2.0,
                 &method_type.as_str(),
                 &match_values_json,
-                &confidence_score,
-                &pre_rl_confidence_score, // Add the pre-RL confidence score
-                &now,                     // created_at
-                &now,                     // updated_at
+                &final_confidence_score,  // Stored in confidence_score column
+                &pre_rl_confidence_score, // Stored in pre_rl_confidence_score column
             ],
         )
         .await
@@ -74,18 +73,17 @@ async fn insert_single_entity_group_pair(
         Ok(_) => {
             tx.commit()
                 .await
-                .context("Failed to commit transaction for single entity_group insert")?;
+                .context("Email: Failed to commit transaction for single entity_group insert")?;
             Ok(new_entity_group_id)
         }
         Err(e) => {
-            // Attempt to rollback, though it might also fail if connection is broken
             let r_err = tx.rollback().await;
             if let Err(rollback_err) = r_err {
-                error!("Failed to rollback transaction after insert error for pair ({}, {}), method {}: {}. Original error: {}",
+                error!("Email: Failed to rollback transaction after insert error for pair ({}, {}), method {}: {}. Original error: {}",
                        entity_id_1.0, entity_id_2.0, method_type.as_str(), rollback_err, e);
             } else {
                 error!(
-                    "Rolled back transaction for pair ({}, {}), method {}. Insert error: {}",
+                    "Email: Rolled back transaction for pair ({}, {}), method {}. Insert error: {}",
                     entity_id_1.0,
                     entity_id_2.0,
                     method_type.as_str(),
@@ -93,7 +91,7 @@ async fn insert_single_entity_group_pair(
                 );
             }
             Err(anyhow!(e).context(format!(
-                "DB error inserting entity_group for pair ({}, {}), method {}",
+                "Email: DB error inserting entity_group for pair ({}, {}), method {}",
                 entity_id_1.0,
                 entity_id_2.0,
                 method_type.as_str()
@@ -103,54 +101,34 @@ async fn insert_single_entity_group_pair(
 }
 
 pub async fn find_matches(
-    pool: &PgPool, // Use the passed-in pool
-    reinforcement_orchestrator: Option<&Mutex<MatchingOrchestrator>>,
+    pool: &PgPool,
+    reinforcement_orchestrator_option: Option<Arc<Mutex<MatchingOrchestrator>>>,
     pipeline_run_id: &str,
 ) -> Result<AnyMatchResult> {
     info!(
-        "Starting pairwise email matching (run ID: {}){}...",
+        "Starting V1 pairwise email matching (run ID: {}){}...",
         pipeline_run_id,
-        if reinforcement_orchestrator.is_some() {
-            " with ML guidance"
+        if reinforcement_orchestrator_option.is_some() {
+            " with RL confidence tuning"
         } else {
-            ""
+            " (RL tuner not provided)"
         }
     );
     let start_time = Instant::now();
 
-    // Get a connection for initial reads (fetching existing pairs, all emails)
-    // This connection is not used for the iterative inserts.
     let mut initial_read_conn = pool
         .get()
         .await
-        .context("Failed to get DB connection for initial email matching reads")?;
+        .context("Email: Failed to get DB connection for initial reads")?;
 
-    debug!("Fetching existing email-matched pairs...");
-    let existing_pairs_query = "
-        SELECT entity_id_1, entity_id_2
-        FROM public.entity_group
-        WHERE method_type = $1";
-    let existing_pair_rows =
-        initial_read_conn // Use the dedicated connection for reads
-            .query(existing_pairs_query, &[&MatchMethodType::Email.as_str()])
-            .await
-            .context("Failed to query existing email-matched pairs")?;
-
-    let mut existing_processed_pairs: HashSet<(EntityId, EntityId)> = HashSet::new();
-    for row in existing_pair_rows {
-        let id1: String = row.get("entity_id_1");
-        let id2: String = row.get("entity_id_2");
-        if id1 < id2 {
-            existing_processed_pairs.insert((EntityId(id1), EntityId(id2)));
-        } else {
-            existing_processed_pairs.insert((EntityId(id2), EntityId(id1)));
-        }
-    }
+    let existing_processed_pairs: HashSet<(EntityId, EntityId)> =
+        fetch_existing_pairs(&*initial_read_conn, MatchMethodType::Email).await?;
     info!(
-        "Found {} existing email-matched pairs.",
+        "Email: Found {} existing email-matched pairs.",
         existing_processed_pairs.len()
     );
 
+    // Fetch email data (same as before)
     let email_query = "
         SELECT 'organization' as source, e.id as entity_id, o.email, o.name as entity_name
         FROM entity e
@@ -163,18 +141,15 @@ pub async fn find_matches(
         JOIN public.service s ON ef.table_id = s.id AND ef.table_name = 'service'
         WHERE s.email IS NOT NULL AND s.email != ''
     ";
-    debug!("Executing email query for all entities...");
-    let email_rows = initial_read_conn // Use the dedicated connection for reads
+    let email_rows = initial_read_conn
         .query(email_query, &[])
         .await
-        .context("Failed to query entities with emails")?;
+        .context("Email: Failed to query entities with emails")?;
     info!(
-        "Found {} email records across all entities.",
+        "Email: Found {} email records across all entities.",
         email_rows.len()
     );
-
-    // Drop the initial_read_conn to return it to the pool before starting loops
-    drop(initial_read_conn);
+    drop(initial_read_conn); // Release connection
 
     let mut email_map: HashMap<String, HashMap<EntityId, String>> = HashMap::new();
     for row in &email_rows {
@@ -188,29 +163,17 @@ pub async fn find_matches(
                 .insert(entity_id, email);
         }
     }
-    info!("Processed {} unique normalized emails.", email_map.len());
+    let email_frequency = calculate_email_frequency(&email_map);
 
     let mut new_pairs_created_count = 0;
     let mut entities_in_new_pairs: HashSet<EntityId> = HashSet::new();
     let mut confidence_scores_for_stats: Vec<f64> = Vec::new();
     let mut individual_transaction_errors = 0;
 
-    let mut email_frequency: HashMap<String, usize> = HashMap::new();
-    for (normalized_email, entities) in &email_map {
-        let count = entities.len();
-        email_frequency.insert(normalized_email.clone(), count);
-    }
-
-    info!(
-        "Calculated frequency for {} normalized emails",
-        email_frequency.len()
-    );
-
     for (normalized_shared_email, current_entity_map) in email_map {
         if current_entity_map.len() < 2 {
             continue;
         }
-
         let entities_sharing_email: Vec<_> = current_entity_map.iter().collect();
 
         for i in 0..entities_sharing_email.len() {
@@ -236,68 +199,45 @@ pub async fn find_matches(
                     };
 
                 if existing_processed_pairs.contains(&(e1_id.clone(), e2_id.clone())) {
-                    debug!(
-                        "Pair ({}, {}) already processed by email method. Skipping.",
-                        e1_id.0, e2_id.0
-                    );
                     continue;
                 }
 
-                let mut final_confidence_score = 1.0;
-                let mut predicted_method_type_from_ml = MatchMethodType::Email;
-                let mut features_for_logging: Option<Vec<f64>> = None;
-
-                // Apply penalties for generic emails
+                let mut pre_rl_confidence_score = 1.0; // Base for email
                 if is_generic_organizational_email(&normalized_shared_email) {
-                    final_confidence_score *= 0.9;
-                    debug!(
-                        "Applied generic email penalty for pair ({}, {}) with email '{}'",
-                        e1_id.0, e2_id.0, normalized_shared_email
-                    );
+                    pre_rl_confidence_score *= 0.9;
                 }
-
-                // Apply weighting based on email rarity
                 let email_count = email_frequency
                     .get(&normalized_shared_email)
                     .cloned()
                     .unwrap_or(1);
                 if email_count > 10 {
-                    // Significantly reduce confidence for very common emails (used by many entities)
-                    final_confidence_score *= 0.85;
-                    debug!(
-                        "Applied high frequency penalty for pair ({}, {}) with email '{}' used by {} entities", 
-                        e1_id.0, e2_id.0, normalized_shared_email, email_count
-                    );
+                    pre_rl_confidence_score *= 0.85;
                 } else if email_count > 5 {
-                    // Moderately reduce confidence for common emails
-                    final_confidence_score *= 0.92;
-                    debug!(
-                        "Applied moderate frequency penalty for pair ({}, {}) with email '{}' used by {} entities", 
-                        e1_id.0, e2_id.0, normalized_shared_email, email_count
-                    );
+                    pre_rl_confidence_score *= 0.92;
                 }
 
-                let pre_rl_confidence_score = final_confidence_score;
+                let mut final_confidence_score = pre_rl_confidence_score; // Default to pre-RL
+                let mut features_for_snapshot: Option<Vec<f64>> = None;
 
-                if let Some(orchestrator_mutex) = reinforcement_orchestrator {
-                    match MatchingOrchestrator::extract_pair_context(pool, e1_id, e2_id).await {
-                        Ok(features) => {
-                            features_for_logging = Some(features.clone());
-                            let orchestrator_guard = orchestrator_mutex.lock().await;
-                            match orchestrator_guard.predict_method_with_context(&features) {
-                                Ok((predicted_method, rl_conf)) => {
-                                    predicted_method_type_from_ml = predicted_method;
-                                    final_confidence_score = rl_conf;
-                                    info!("ML guidance for pair ({}, {}): Predicted Method: {:?}, Confidence: {:.4}", e1_id.0, e2_id.0, predicted_method_type_from_ml, final_confidence_score);
+                if let Some(ro_arc) = reinforcement_orchestrator_option.as_ref() {
+                    match MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id).await {
+                        Ok(features_vec) => {
+                            if !features_vec.is_empty() {
+                                features_for_snapshot = Some(features_vec.clone());
+                                let orchestrator_guard = ro_arc.lock().await;
+                                match orchestrator_guard.get_tuned_confidence(
+                                    &MatchMethodType::Email,
+                                    pre_rl_confidence_score,
+                                    &features_vec,
+                                ) {
+                                    Ok(tuned_score) => final_confidence_score = tuned_score,
+                                    Err(e) => warn!("Email: Failed to get tuned confidence for ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e),
                                 }
-                                Err(e) => {
-                                    warn!("ML prediction failed for email pair ({}, {}): {}. Using default confidence.", e1_id.0, e2_id.0, e);
-                                }
+                            } else {
+                                warn!("Email: Extracted features vector is empty for pair ({}, {}). Using pre-RL score.", e1_id.0, e2_id.0);
                             }
                         }
-                        Err(e) => {
-                            warn!("Context extraction failed for email pair ({}, {}): {}. Using default confidence.", e1_id.0, e2_id.0, e);
-                        }
+                        Err(e) => warn!("Email: Failed to extract features for ({}, {}): {}. Using pre-RL score.", e1_id.0, e2_id.0, e),
                     }
                 }
 
@@ -307,7 +247,6 @@ pub async fn find_matches(
                     normalized_shared_email: normalized_shared_email.clone(),
                 });
 
-                // Perform the insert in its own transaction
                 match insert_single_entity_group_pair(
                     pool,
                     e1_id,
@@ -324,54 +263,60 @@ pub async fn find_matches(
                         entities_in_new_pairs.insert(e1_id.clone());
                         entities_in_new_pairs.insert(e2_id.clone());
                         confidence_scores_for_stats.push(final_confidence_score);
-                        existing_processed_pairs.insert((e1_id.clone(), e2_id.clone()));
+                        // existing_processed_pairs.insert((e1_id.clone(), e2_id.clone())); // Already handled by initial fetch
 
-                        info!(
-                            "SUCCESS: Created new email pair group {} for ({}, {}) with shared email '{}', confidence: {:.4}",
-                            new_entity_group_id.0, e1_id.0, e2_id.0, normalized_shared_email, final_confidence_score
-                        );
-
-                        if let Some(orchestrator_mutex) = reinforcement_orchestrator {
-                            let mut orchestrator_guard = orchestrator_mutex.lock().await;
+                        if let (Some(ro_arc), Some(ref features)) = (
+                            reinforcement_orchestrator_option.as_ref(),
+                            features_for_snapshot.as_ref(),
+                        ) {
+                            let orchestrator_guard = ro_arc.lock().await;
                             if let Err(e) = orchestrator_guard
-                                .log_match_result(
+                                .log_decision_snapshot(
                                     pool,
-                                    e1_id,
-                                    e2_id,
-                                    &predicted_method_type_from_ml,
+                                    &new_entity_group_id.0,
+                                    pipeline_run_id,
+                                    features,
+                                    &MatchMethodType::Email,
+                                    pre_rl_confidence_score,
                                     final_confidence_score,
-                                    true,
-                                    features_for_logging.as_ref(),
-                                    Some(&predicted_method_type_from_ml),
-                                    Some(final_confidence_score),
                                 )
                                 .await
                             {
-                                warn!("Failed to log email match result to entity_match_pairs for ({},{}): {}", e1_id.0, e2_id.0, e);
+                                warn!(
+                                    "Email: Failed to log decision snapshot for {}: {}",
+                                    new_entity_group_id.0, e
+                                );
                             }
                         }
 
                         if final_confidence_score < config::MODERATE_LOW_SUGGESTION_THRESHOLD {
-                            let priority = if final_confidence_score
-                                < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD
-                            {
-                                2
-                            } else {
-                                1
-                            };
+                            // ... (suggestion logging logic, ensure it uses a connection from pool for db::insert_suggestion)
+                            let mut temp_conn_for_suggestion = pool
+                                .get()
+                                .await
+                                .context("Email: Failed to get temp conn for suggestion")?;
+                            let suggestion_tx = temp_conn_for_suggestion
+                                .transaction()
+                                .await
+                                .context("Email: Failed to start suggestion tx")?;
+                            // ... (construct suggestion, details_json should not include rl_predicted_method)
                             let details_json = serde_json::json!({
                                 "method_type": MatchMethodType::Email.as_str(),
                                 "matched_value": &normalized_shared_email,
                                 "original_email1": e1_orig_email,
                                 "original_email2": e2_orig_email,
                                 "entity_group_id": &new_entity_group_id.0,
-                                "rl_predicted_method": predicted_method_type_from_ml.as_str(),
+                                "pre_rl_confidence": pre_rl_confidence_score,
                             });
                             let reason_message = format!(
-                                "Pair ({}, {}) matched by Email with low RL confidence ({:.4}). RL predicted: {:?}.",
-                                e1_id.0, e2_id.0, final_confidence_score, predicted_method_type_from_ml
+                                "Pair ({}, {}) matched by Email with low tuned confidence ({:.4}). Pre-RL: {:.2}.",
+                                e1_id.0, e2_id.0, final_confidence_score, pre_rl_confidence_score
                             );
                             let suggestion = NewSuggestedAction {
+                                // ...
+                                reason_message: Some(reason_message),
+                                details: Some(details_json),
+                                // ...
                                 pipeline_run_id: Some(pipeline_run_id.to_string()),
                                 action_type: ActionType::ReviewEntityInGroup.as_str().to_string(),
                                 entity_id: None,
@@ -379,46 +324,34 @@ pub async fn find_matches(
                                 group_id_2: None,
                                 cluster_id: None,
                                 triggering_confidence: Some(final_confidence_score),
-                                details: Some(details_json),
-                                reason_code: Some("LOW_RL_CONFIDENCE_PAIR".to_string()),
-                                reason_message: Some(reason_message),
-                                priority,
+                                reason_code: Some("LOW_TUNED_CONFIDENCE_PAIR".to_string()),
+                                priority: if final_confidence_score
+                                    < config::CRITICALLY_LOW_SUGGESTION_THRESHOLD
+                                {
+                                    2
+                                } else {
+                                    1
+                                },
                                 status: SuggestionStatus::PendingReview.as_str().to_string(),
                                 reviewer_id: None,
                                 reviewed_at: None,
                                 review_notes: None,
                             };
-                            // For suggestions, we might want to collect them and insert them in a batch
-                            // or handle them outside the critical path of pair insertion if they also fail.
-                            // For now, attempting to insert it directly. This also needs a transaction or separate handling.
-                            // This example will use a temporary connection for simplicity, but batching is better.
-                            let mut temp_conn_for_suggestion = pool
-                                .get()
-                                .await
-                                .context("Failed to get temp conn for suggestion")?;
-                            let suggestion_tx = temp_conn_for_suggestion
-                                .transaction()
-                                .await
-                                .context("Failed to start suggestion tx")?;
                             if let Err(e) = db::insert_suggestion(&suggestion_tx, &suggestion).await
                             {
-                                warn!("Failed to log suggestion for low confidence email pair ({}, {}): {}. Suggestion details: {:?}", e1_id.0, e2_id.0, e, suggestion);
-                                // Decide if suggestion failure should stop the pair processing. Probably not.
-                                // Attempt to rollback suggestion_tx but continue.
-                                if let Err(s_rb_err) = suggestion_tx.rollback().await {
-                                    error!("Failed to rollback suggestion_tx: {}", s_rb_err);
-                                }
+                                warn!("Email: Failed to log suggestion: {}", e);
+                                let _ = suggestion_tx.rollback().await; // Attempt rollback
                             } else {
-                                if let Err(s_commit_err) = suggestion_tx.commit().await {
-                                    error!("Failed to commit suggestion_tx: {}", s_commit_err);
-                                }
+                                suggestion_tx
+                                    .commit()
+                                    .await
+                                    .context("Email: Failed to commit suggestion tx")?;
                             }
                         }
                     }
                     Err(e) => {
                         individual_transaction_errors += 1;
-                        // Error is already logged by insert_single_entity_group_pair
-                        // We continue to the next pair
+                        // Error already logged by insert_single_entity_group_pair
                     }
                 }
             }
@@ -427,12 +360,12 @@ pub async fn find_matches(
 
     if individual_transaction_errors > 0 {
         warn!(
-            "Encountered {} errors during individual email pair transaction attempts.",
+            "Email: {} errors during individual pair transaction attempts.",
             individual_transaction_errors
         );
     }
 
-    let avg_confidence: f64 = if !confidence_scores_for_stats.is_empty() {
+    let avg_confidence = if !confidence_scores_for_stats.is_empty() {
         confidence_scores_for_stats.iter().sum::<f64>() / confidence_scores_for_stats.len() as f64
     } else {
         0.0
@@ -450,21 +383,16 @@ pub async fn find_matches(
         },
     };
 
-    let elapsed = start_time.elapsed();
     info!(
-        "Pairwise email matching complete in {:.2?}: created {} new pairs ({} individual transaction errors), involving {} unique entities.",
-        elapsed,
+        "Email matching complete in {:.2?}: {} new pairs, {} unique entities.",
+        start_time.elapsed(),
         method_stats.groups_created,
-        individual_transaction_errors,
         method_stats.entities_matched
     );
-
-    let email_specific_result = EmailMatchResult {
+    Ok(AnyMatchResult::Email(EmailMatchResult {
         groups_created: method_stats.groups_created,
         stats: method_stats,
-    };
-
-    Ok(AnyMatchResult::Email(email_specific_result))
+    }))
 }
 
 // normalize_email function remains the same
@@ -473,39 +401,63 @@ fn normalize_email(email: &str) -> String {
     if !email_trimmed.contains('@') {
         return email_trimmed;
     }
-
     let parts: Vec<&str> = email_trimmed.splitn(2, '@').collect();
     if parts.len() != 2 {
         return email_trimmed;
     }
-
     let (local_part_full, domain_part) = (parts[0], parts[1]);
     let local_part_no_plus = local_part_full.split('+').next().unwrap_or("").to_string();
-
     let final_local_part = if domain_part == "gmail.com" || domain_part == "googlemail.com" {
         local_part_no_plus.replace('.', "")
     } else {
         local_part_no_plus
     };
-
     let final_domain_part = match domain_part {
         "googlemail.com" => "gmail.com",
         _ => domain_part,
     };
-
     if final_local_part.is_empty() {
-        return String::new();
+        String::new()
+    } else {
+        format!("{}@{}", final_local_part, final_domain_part)
     }
-    format!("{}@{}", final_local_part, final_domain_part)
 }
 
-/// Detect if an email is a generic organizational email
-/// Returns true if the email starts with a common generic prefix
 fn is_generic_organizational_email(email: &str) -> bool {
-    // Conservative list of generic prefixes
-    let generic_prefixes = ["info@", "contact@", "office@", "admin@"];
-
-    generic_prefixes
+    ["info@", "contact@", "office@", "admin@"]
         .iter()
         .any(|prefix| email.starts_with(prefix))
+}
+
+// Helper to fetch existing pairs for a given method type (can be moved to a shared db utility)
+async fn fetch_existing_pairs(
+    conn: &impl tokio_postgres::GenericClient,
+    method_type: MatchMethodType,
+) -> Result<HashSet<(EntityId, EntityId)>> {
+    let query = "SELECT entity_id_1, entity_id_2 FROM public.entity_group WHERE method_type = $1";
+    let rows = conn
+        .query(query, &[&method_type.as_str()])
+        .await
+        .with_context(|| format!("Failed to query existing {:?}-matched pairs", method_type))?;
+
+    let mut existing_pairs = HashSet::new();
+    for row in rows {
+        let id1_str: String = row.get("entity_id_1");
+        let id2_str: String = row.get("entity_id_2");
+        if id1_str < id2_str {
+            existing_pairs.insert((EntityId(id1_str), EntityId(id2_str)));
+        } else {
+            existing_pairs.insert((EntityId(id2_str), EntityId(id1_str)));
+        }
+    }
+    Ok(existing_pairs)
+}
+fn calculate_email_frequency(
+    email_map: &HashMap<String, HashMap<EntityId, String>>,
+) -> HashMap<String, usize> {
+    let mut freq = HashMap::new();
+    for (normalized_email, entities) in email_map {
+        freq.insert(normalized_email.clone(), entities.len());
+    }
+    freq
 }

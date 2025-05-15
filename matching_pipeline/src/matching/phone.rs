@@ -19,8 +19,9 @@ use crate::results::{AnyMatchResult, MatchMethodStats, PhoneMatchResult};
 // SQL query for inserting into entity_group
 const INSERT_ENTITY_GROUP_SQL: &str = "
     INSERT INTO public.entity_group
-    (id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, pre_rl_confidence_score, created_at, updated_at, version)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1)";
+(id, entity_id_1, entity_id_2, method_type, match_values, confidence_score, 
+ pre_rl_confidence_score)
+VALUES ($1, $2, $3, $4, $5, $6, $7)";
 
 pub async fn find_matches(
     pool: &PgPool,
@@ -174,27 +175,38 @@ pub async fn find_matches(
 
                 let pre_rl_confidence = final_confidence_score;
 
-                if let Some(orchestrator_mutex) = reinforcement_orchestrator {
-                    match MatchingOrchestrator::extract_pair_context(pool, e1_id, e2_id).await {
-                        // Pass pool
-                        Ok(features) => {
-                            features_for_logging = Some(features.clone());
-                            let orchestrator_guard = orchestrator_mutex.lock().await;
-                            match orchestrator_guard.predict_method_with_context(&features) {
-                                Ok((predicted_method, rl_conf)) => {
-                                    predicted_method_type_from_ml = predicted_method;
-                                    final_confidence_score = rl_conf;
-                                    info!("ML guidance for phone pair ({}, {}): Predicted Method: {:?}, Confidence: {:.4}", e1_id.0, e2_id.0, predicted_method_type_from_ml, final_confidence_score);
-                                }
-                                Err(e) => {
-                                    warn!("ML prediction failed for phone pair ({}, {}): {}. Using base confidence {:.2}.", e1_id.0, e2_id.0, e, base_confidence);
-                                    // final_confidence_score remains base_confidence
-                                }
-                            }
-                        }
+                let features = if reinforcement_orchestrator.is_some() {
+                    match MatchingOrchestrator::extract_pair_context_features(pool, e1_id, e2_id)
+                        .await
+                    {
+                        Ok(f) => Some(f),
                         Err(e) => {
-                            warn!("Context extraction failed for phone pair ({}, {}): {}. Using base confidence {:.2}.", e1_id.0, e2_id.0, e, base_confidence);
-                            // final_confidence_score remains base_confidence
+                            warn!("Failed to extract context features for pair ({}, {}): {}. Proceeding without RL tuning for this pair.", e1_id.0, e2_id.0, e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                if let (Some(orch_arc), Some(ref extracted_features)) =
+                    (reinforcement_orchestrator.as_ref(), features.as_ref())
+                {
+                    if !extracted_features.is_empty() {
+                        // Ensure features were actually extracted
+                        let orchestrator_guard = orch_arc.lock().await;
+                        match orchestrator_guard.get_tuned_confidence(
+                            &MatchMethodType::Phone, // Specific to the strategy
+                            pre_rl_confidence,
+                            extracted_features,
+                        ) {
+                            Ok(tuned_score) => {
+                                final_confidence_score = tuned_score;
+                                // Log or use the tuned_score
+                            }
+                            Err(e) => {
+                                warn!("Failed to get tuned confidence for pair ({}, {}), method {}: {}. Using pre-RL score.", e1_id.0, e2_id.0, MatchMethodType::Phone.as_str(), e);
+                            }
                         }
                     }
                 }
@@ -226,8 +238,6 @@ pub async fn find_matches(
                             &match_values_json,
                             &final_confidence_score,
                             &pre_rl_confidence,
-                            &now,
-                            &now,
                         ],
                     )
                     .await;
@@ -245,23 +255,28 @@ pub async fn find_matches(
                             new_entity_group_id.0, e1_id.0, e2_id.0, normalized_shared_phone, final_confidence_score
                         );
 
-                        if let Some(orchestrator_mutex) = reinforcement_orchestrator {
-                            let mut orchestrator_guard = orchestrator_mutex.lock().await;
-                            if let Err(e) = orchestrator_guard
-                                .log_match_result(
-                                    pool,
-                                    e1_id, // Clone or ensure EntityId is Copy
-                                    e2_id,
-                                    &predicted_method_type_from_ml,
-                                    final_confidence_score,
-                                    true,
-                                    features_for_logging.as_ref(),
-                                    Some(&predicted_method_type_from_ml),
-                                    Some(final_confidence_score),
-                                )
-                                .await
-                            {
-                                warn!("Failed to log phone match result to entity_match_pairs for ({},{}): {}", e1_id.0, e2_id.0, e);
+                        if let (Some(orch_arc), Some(ref extracted_features)) =
+                            (reinforcement_orchestrator.as_ref(), features.as_ref())
+                        {
+                            if !extracted_features.is_empty() {
+                                let orchestrator_guard = orch_arc.lock().await; // Re-lock if necessary, or pass the guard
+                                if let Err(e) = orchestrator_guard
+                                    .log_decision_snapshot(
+                                        pool,
+                                        &new_entity_group_id.0, // ID of the just-created entity_group
+                                        pipeline_run_id,
+                                        extracted_features,
+                                        &MatchMethodType::Phone, // Specific to the strategy
+                                        pre_rl_confidence,
+                                        final_confidence_score, // The tuned score that was stored
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        "Failed to log decision snapshot for entity_group {}: {}",
+                                        new_entity_group_id.0, e
+                                    );
+                                }
                             }
                         }
 

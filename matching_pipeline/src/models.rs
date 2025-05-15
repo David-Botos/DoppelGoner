@@ -150,7 +150,7 @@ pub struct EntityGroup {
 
     /// RL-derived confidence score for the match between entity_id_1 and entity_id_2.
     pub confidence_score: Option<f64>,
-    
+
     /// Pre-RL confidence score calculated by the matching method before RL adjustment
     pub pre_rl_confidence_score: Option<f64>,
 
@@ -166,7 +166,6 @@ pub struct EntityGroup {
     /// When this group was last updated
     pub updated_at: NaiveDateTime,
 }
-
 
 // GroupEntity struct is removed as per the refactoring plan.
 // The relationship is now directly entity_id_1 and entity_id_2 in EntityGroup.
@@ -608,7 +607,7 @@ pub struct NewSuggestedAction {
 // --- Struct for cluster_formation_edges table ---
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterFormationEdge {
-    pub id: Uuid,
+    pub id: String,
     pub pipeline_run_id: String,
     pub source_group_id: String, // EntityGroupId (pair ID)
     pub target_group_id: String, // EntityGroupId (pair ID)

@@ -25,7 +25,7 @@ fn candle_device() -> Result<Device> {
 }
 
 pub async fn match_services(pool: &PgPool) -> Result<ServiceMatchResult> {
-    let mut conn = pool
+    let conn = pool
         .get()
         .await
         .context("Failed to get DB connection for service matching")?;
