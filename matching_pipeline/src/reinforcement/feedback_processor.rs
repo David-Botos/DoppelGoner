@@ -182,7 +182,8 @@ pub async fn process_human_feedback_for_tuner(
                     continue; // Skip marking as processed if tuner update fails
                 }
 
-                if let Err(e) = mark_human_feedback_as_processed(&client, feedback_record.id.to_string()).await
+                if let Err(e) =
+                    mark_human_feedback_as_processed(&client, feedback_record.id.to_string()).await
                 {
                     warn!(
                         "Failed to mark feedback item {} as processed after tuner update: {}",

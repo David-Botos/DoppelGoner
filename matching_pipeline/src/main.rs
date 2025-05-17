@@ -308,7 +308,6 @@ async fn identify_entities(pool: &PgPool) -> Result<usize> {
     Ok(total_entities_count as usize)
 }
 
-
 async fn run_matching_pipeline(
     pool: &PgPool,
     reinforcement_orchestrator: Arc<Mutex<reinforcement::MatchingOrchestrator>>,

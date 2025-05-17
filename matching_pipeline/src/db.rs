@@ -209,14 +209,13 @@ pub async fn insert_suggestion(
         )
         .await
         .context("Failed to insert suggested_action")?;
-    
+
     // Get the ID as a string first
     let id_str: String = row.get(0);
-    
+
     // Parse the string into a Uuid
-    let id = Uuid::parse_str(&id_str)
-        .context("Failed to parse returned ID string as UUID")?;
-    
+    let id = Uuid::parse_str(&id_str).context("Failed to parse returned ID string as UUID")?;
+
     Ok(id)
 }
 
@@ -235,18 +234,13 @@ pub async fn update_suggestion_review(
         UPDATE clustering_metadata.suggested_actions
          SET status = $1, reviewer_id = $2, reviewed_at = CURRENT_TIMESTAMP, review_notes = $3
          WHERE id = $4";
-    
+
     // Convert UUID to string for the query
     let suggestion_id_str = suggestion_id.to_string();
-    
+
     conn.execute(
         UPDATE_SUGGESTION_SQL,
-        &[
-            &new_status,
-            &reviewer_id,
-            &review_notes,
-            &suggestion_id_str,
-        ],
+        &[&new_status, &reviewer_id, &review_notes, &suggestion_id_str],
     )
     .await
     .context("Failed to update suggested_action review")
@@ -275,14 +269,13 @@ pub async fn insert_cluster_formation_edge(
         )
         .await
         .context("Failed to insert cluster_formation_edge")?;
-    
+
     // Get the ID as a string first
     let id_str: String = row.get(0);
-    
+
     // Parse the string into a Uuid
-    let id = Uuid::parse_str(&id_str)
-        .context("Failed to parse returned ID string as UUID")?;
-    
+    let id = Uuid::parse_str(&id_str).context("Failed to parse returned ID string as UUID")?;
+
     Ok(id)
 }
 
@@ -373,14 +366,14 @@ pub async fn insert_match_decision_detail(
                     tx.commit()
                         .await
                         .context("Failed to commit match_decision_detail transaction")?;
-                    
+
                     // Get the ID as a string first
                     let id_str: String = row.get(0);
-                    
+
                     // Parse the string into a Uuid
                     let id = Uuid::parse_str(&id_str)
                         .context("Failed to parse returned ID string as UUID")?;
-                    
+
                     Ok(id)
                 }
                 Err(e) => {
@@ -427,14 +420,13 @@ pub async fn insert_human_feedback(
         )
         .await
         .context("Failed to insert human_feedback")?;
-    
+
     // Get the ID as a string first
     let id_str: String = row.get(0);
-    
+
     // Parse the string into a Uuid
-    let id = Uuid::parse_str(&id_str)
-        .context("Failed to parse returned ID string as UUID")?;
-    
+    let id = Uuid::parse_str(&id_str).context("Failed to parse returned ID string as UUID")?;
+
     Ok(id)
 }
 
@@ -478,7 +470,7 @@ pub async fn mark_human_feedback_as_processed(
 ) -> Result<u64> {
     // Convert UUID to string for the query
     let feedback_id_str = feedback_id.to_string();
-    
+
     let rows_affected = client
         .execute(
             "UPDATE clustering_metadata.human_feedback
@@ -493,10 +485,7 @@ pub async fn mark_human_feedback_as_processed(
         ))?;
 
     if rows_affected == 1 {
-        debug!(
-            "Marked human feedback ID {} as processed.",
-            feedback_id_str
-        );
+        debug!("Marked human feedback ID {} as processed.", feedback_id_str);
     } else if rows_affected == 0 {
         warn!(
             "Human feedback ID {} was already processed or does not exist.",
